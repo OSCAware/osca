@@ -1,0 +1,33 @@
+# 笼子层：运行时强制执行，模型永不读取（设计公理 A5）。
+# 与 AGENT.md 的「劝告层」相对：模型被注入或被替换时，本文件仍然有效。
+policy_version: 1
+
+permissions:              # 按 pipeline 步骤的工具白名单
+  - step: 取数
+    allow: [CON-001.拉取费用明细, CON-001.拉取检修计划期]
+  - step: 生成报警候选
+    allow: []
+  - step: 裁决
+    allow: []
+  - step: 成文
+    allow: []             # 成文步骤调不动任何 Connector
+
+egress:
+  allow_domains: []       # 默认全禁，白名单放行
+
+data:
+  redact: [身份证号, 手机号]     # 注入剧集前脱敏
+  scope: 数据不出集团合并库
+
+approvals:
+  - action: 终稿发送管理层
+    approver: 专家
+
+budgets:
+  per_episode: {max_tokens: 200k, max_tool_calls: 30}
+
+kill_switch:              # 账本健康度即安全信号（设计公理 A10）
+  - when: 近30天 overruled/confirmed > 0.3
+    do: 挂起全部 watcher 并通知操作者
+  - when: 回放红灯率 > 20%
+    do: 同上

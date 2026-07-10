@@ -1,0 +1,27 @@
+case_id: C-0102
+captured_at: 2026-07-10 17:03
+capture_source: 报告终审界面 diff 监听
+report: 2026-06 月度诊断报告草稿 v1
+
+input:
+  单位名称: XX新能源
+  费用科目: 咨询费
+  统计周期: 2026-06
+  环比涨幅: 210
+  绝对金额: 36.8万
+  检修期上下文: null
+  当时生效判断集: [J-0405]
+
+agent_draft: |
+  【异动5】XX新能源咨询费6月环比+210%（36.8万元），依 J-0405 进正文。
+  待核实：是否存在集中采购外部咨询。
+expert_final: |
+  （整条删除）
+expert_remark: "又来。咨询费按项目里程碑付款，单月看没有意义——看年不看月。"
+
+distillation:
+  status: distilled
+  batch: D-2026-07-26
+  resulted_in: J-0423
+  note: 连续第 3 次删除同类月度咨询费报警（前两次见 2026-04 / 2026-05 报告）；
+        王工 2026-07-28 一句话确认新规则，J-0405 改 status: superseded。

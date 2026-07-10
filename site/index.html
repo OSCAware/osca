@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Oscaware — 让 AI 工作流程，随人的反馈不断进化</title>
+<meta name="description" content="Oscaware 以 OSCA 定义、贡献账本和蒸馏机制，让 AI 工作流程随人的反馈不断进化——越用越顺手，始终贴合当下环境。" />
+<link rel="icon" href="favicon.svg" type="image/svg+xml" />
+<meta property="og:type" content="website" />
+<meta property="og:locale" content="zh_CN" />
+<meta property="og:site_name" content="Oscaware" />
+<meta property="og:title" content="Oscaware — 让 AI 工作流程，随人的反馈不断进化" />
+<meta property="og:description" content="用文本定义 AI 认知工作流程（OSCA），随人的反馈不断进化——越用越顺手，始终贴合当下环境。" />
+<meta property="og:url" content="https://oscaware.com/" />
+<meta property="og:image" content="https://oscaware.com/og.png" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="Oscaware — 让 AI 工作流程，随人的反馈不断进化" />
+<meta name="twitter:description" content="用文本定义 AI 认知工作流程（OSCA），随人的反馈不断进化——越用越顺手，始终贴合当下环境。" />
+<meta name="twitter:image" content="https://oscaware.com/og.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&family=Geist+Mono:wght@100..900&display=swap" rel="stylesheet" />
+<script>
+/* 尽早应用主题偏好，避免首屏闪烁 */
+(function () {
+  try {
+    var saved = localStorage.getItem("oscaware-theme");
+    var preference = saved === "light" || saved === "dark" ? saved : "auto";
+    var dark = matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = preference === "auto" ? (dark ? "dark" : "light") : preference;
+    document.documentElement.dataset.themePreference = preference;
+  } catch (e) {}
+})();
+</script>
+<style>
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+  --accent: #017aff;
+  --bg: #ffffff;
+  --fg: #000000;
+  --muted: rgba(0, 0, 0, 0.58);
+  --soft: rgba(0, 0, 0, 0.055);
+  --line: rgba(0, 0, 0, 0.16);
+  --line-strong: #000000;
+  --panel: #ffffff;
+  --inverse-bg: #000000;
+  --inverse-fg: #ffffff;
+  --header: rgba(255, 255, 255, 0.92);
+  --font-geist-sans: "Geist";
+  --font-geist-mono: "Geist Mono";
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #000000;
+  --fg: #ffffff;
+  --muted: rgba(255, 255, 255, 0.62);
+  --soft: rgba(255, 255, 255, 0.075);
+  --line: rgba(255, 255, 255, 0.2);
+  --line-strong: #ffffff;
+  --panel: #000000;
+  --inverse-bg: #ffffff;
+  --inverse-fg: #000000;
+  --header: rgba(0, 0, 0, 0.9);
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 82px; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei", sans-serif; transition: background-color 180ms ease, color 180ms ease; }
+a { color: inherit; text-decoration: none; }
+button { color: inherit; font: inherit; }
+img { max-width: 100%; }
+::selection { background: var(--accent); color: #ffffff; }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
+
+.section-shell { width: min(100% - 48px, 1320px); margin-inline: auto; }
+.site-header { position: sticky; top: 0; z-index: 40; height: 82px; padding: 0 max(24px, calc((100vw - 1320px) / 2)); display: flex; align-items: center; gap: 28px; background: var(--header); border-bottom: 1px solid var(--line); backdrop-filter: blur(18px); }
+.brand { display: flex; align-items: center; flex: 0 0 auto; }
+.brand img { width: 178px; height: auto; display: block; }
+:root[data-theme="dark"] .brand, :root[data-theme="dark"] .footer-brand img { background: #ffffff; border-radius: 3px; padding: 7px 10px; }
+.nav-links { display: flex; gap: clamp(16px, 2vw, 30px); margin-left: auto; font-size: 14px; font-weight: 600; }
+.nav-links a { position: relative; padding: 28px 0; }
+.nav-links a::after { content: ""; position: absolute; left: 0; right: 100%; bottom: 20px; height: 2px; background: var(--accent); transition: right 160ms ease; }
+.nav-links a:hover::after { right: 0; }
+.header-actions { display: flex; align-items: center; gap: 10px; }
+.theme-toggle, .menu-toggle { border: 1px solid var(--line); background: var(--bg); min-height: 40px; cursor: pointer; }
+.theme-toggle { display: flex; align-items: center; gap: 8px; border-radius: 99px; padding: 0 12px; font-size: 12px; font-weight: 700; }
+.theme-dot { width: 13px; height: 13px; border: 4px solid var(--fg); border-radius: 50%; background: var(--bg); }
+.nav-github { font-size: 13px; font-weight: 700; padding: 12px 5px; color: var(--muted); }
+.nav-github:hover { color: var(--accent); }
+.contact-button { background: var(--accent); color: #ffffff; padding: 12px 16px; font-size: 13px; font-weight: 700; }
+.menu-toggle { display: none; width: 42px; padding: 0 10px; }
+.menu-toggle span { display: block; height: 2px; margin: 5px 0; background: currentColor; }
+
+.hero { position: relative; min-height: calc(100vh - 82px); display: grid; grid-template-columns: 1.22fr .78fr; align-items: center; gap: 70px; padding-block: 88px 120px; }
+.eyebrow, .section-index { font-family: var(--font-geist-mono), monospace; font-size: 12px; font-weight: 700; letter-spacing: .13em; }
+.eyebrow { color: var(--accent); display: flex; align-items: center; gap: 10px; margin: 0 0 28px; }
+.eyebrow span { width: 7px; height: 7px; background: var(--accent); border-radius: 50%; animation: pulse 2s infinite; }
+.hero h1 { max-width: 900px; margin: 0; font-size: clamp(54px, 6.9vw, 106px); line-height: .97; letter-spacing: -.07em; font-weight: 700; }
+.hero h1 em { color: var(--accent); font-style: normal; }
+.hero-subtitle { margin: 30px 0 0; color: var(--muted); font-size: clamp(18px, 2vw, 25px); }
+.hero-actions { display: flex; gap: 12px; margin-top: 42px; }
+.button { min-height: 52px; padding: 0 22px; display: inline-flex; align-items: center; justify-content: center; gap: 30px; font-size: 14px; font-weight: 750; border: 1px solid var(--fg); }
+.button b { font-size: 18px; }
+.button-primary { background: var(--accent); color: #ffffff; border-color: var(--accent); }
+a.button-primary, a.open-button { cursor: pointer; }
+.button-secondary { background: var(--bg); transition: background-color 160ms ease, color 160ms ease; }
+.button-secondary:hover { background: var(--fg); color: var(--bg); }
+.flow-visual { position: relative; height: 430px; border: 1px solid var(--line); border-right: 0; }
+.flow-label { position: absolute; left: 38px; top: 50px; color: var(--muted); font: 700 11px var(--font-geist-mono), monospace; letter-spacing: .12em; }
+.flow-line { position: absolute; height: 3px; background: var(--fg); }
+.flow-line i { position: absolute; top: 50%; width: 15px; height: 15px; margin-top: -7px; background: var(--bg); border: 3px solid var(--fg); border-radius: 50%; }
+.flow-line-a { left: 38px; right: 0; top: 145px; }
+.flow-line-a i:nth-child(1) { left: 9%; }.flow-line-a i:nth-child(2) { left: 42%; }.flow-line-a i:nth-child(3) { left: 78%; }
+.feedback-chip { position: absolute; left: 42%; top: 204px; transform: translateX(-50%); display: flex; align-items: center; gap: 16px; background: var(--accent); color: #ffffff; padding: 14px 18px; }
+.feedback-chip span { font: 700 9px var(--font-geist-mono), monospace; letter-spacing: .12em; }.feedback-chip strong { font-size: 18px; }
+.feedback-chip::before { content: ""; position: absolute; width: 2px; height: 62px; left: 50%; bottom: 100%; background: var(--accent); }
+.flow-junction { position: absolute; top: 141px; left: 42%; width: 11px; height: 11px; background: var(--accent); border-radius: 50%; transform: translateX(-50%); }
+.flow-line-b { left: 42%; right: 9%; top: 285px; background: var(--accent); transform: rotate(8deg); transform-origin: left; }
+.flow-line-b i { border-color: var(--accent); }.flow-line-b i:first-child { left: 38%; }.flow-line-b i:last-child { right: 0; }
+.flow-output { position: absolute; right: 5%; bottom: 42px; color: var(--accent); font: 700 12px var(--font-geist-mono), monospace; letter-spacing: .1em; }
+.scroll-cue { position: absolute; bottom: 28px; left: 0; display: flex; align-items: center; gap: 15px; font: 650 10px var(--font-geist-mono), monospace; letter-spacing: .1em; color: var(--muted); }
+.scroll-cue b { color: var(--accent); font-size: 18px; }
+.formula-bar { display: flex; align-items: stretch; justify-content: center; min-height: 78px; background: var(--fg); color: var(--bg); border-top: 1px solid var(--fg); border-bottom: 1px solid var(--fg); }
+.formula-bar > * { display: flex; align-items: center; padding: 0 clamp(10px, 2vw, 30px); border-right: 1px solid color-mix(in srgb, var(--bg) 25%, transparent); }
+.formula-bar span { color: var(--accent); font: 800 13px var(--font-geist-mono), monospace; letter-spacing: .08em; }.formula-bar a { font-weight: 700; }.formula-bar a:hover { color: var(--accent); }
+
+.problem { min-height: 88vh; display: grid; grid-template-columns: 1fr 4fr; gap: 40px; align-items: center; padding-block: 120px; }
+.section-index { color: var(--accent); margin: 0; align-self: start; }
+.problem-copy > p { max-width: 960px; margin: 0 0 65px; color: var(--muted); font-size: clamp(20px, 2.2vw, 31px); line-height: 1.5; }.problem-copy > p span { color: var(--fg); }
+.problem-copy h2 { max-width: 1100px; margin: 0; font-size: clamp(36px, 5vw, 72px); line-height: 1.13; letter-spacing: -.05em; }
+.definition, .example, .operation, .people, .governance { padding-block: 120px; border-top: 1px solid var(--line); }
+.section-heading { display: flex; flex-direction: column; gap: 22px; margin-bottom: 70px; }.section-heading h2 { margin: 0; font-size: clamp(42px, 5.5vw, 78px); line-height: 1; letter-spacing: -.055em; }
+.definition blockquote { max-width: 1160px; margin: 0 auto 90px; font-size: clamp(29px, 3.5vw, 50px); line-height: 1.35; letter-spacing: -.035em; font-weight: 620; }
+.definition-grid { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 2px solid var(--line-strong); border-left: 1px solid var(--line); }
+.definition-card { min-height: 360px; padding: 28px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); display: flex; flex-direction: column; transition: background-color 160ms ease; }.definition-card:hover { background: var(--soft); }
+.card-top { display: flex; justify-content: space-between; color: var(--accent); font: 700 11px var(--font-geist-mono), monospace; }.card-top code { font: inherit; border: 1px solid var(--accent); padding: 5px 7px; }
+.definition-card h3 { margin: auto 0 18px; font-size: 29px; }.definition-card p { margin: 0; color: var(--muted); font-size: 16px; line-height: 1.65; }
+
+.ledger-intro { margin: 90px 0 22px; display: flex; align-items: center; gap: 12px; color: var(--accent); font: 700 11px var(--font-geist-mono), monospace; letter-spacing: .12em; }
+.ledger-intro::before { content: ""; width: 26px; height: 1px; background: var(--accent); }
+.ledger-card { border: 1px solid var(--line); border-top: 2px solid var(--line-strong); background: var(--panel); }
+.ledger-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 24px; border-bottom: 1px solid var(--line); }
+.ledger-head .ledger-lab { color: var(--muted); font: 700 11px var(--font-geist-mono), monospace; letter-spacing: .12em; }
+.ledger-head .ledger-id { color: var(--accent); font: 700 13px var(--font-geist-mono), monospace; border: 1px solid var(--accent); padding: 4px 9px; }
+.ledger-body { margin: 0; padding: 28px 24px; font-size: clamp(18px, 2vw, 25px); line-height: 1.55; letter-spacing: -.02em; }
+.ledger-meta { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--line); }
+.ledger-meta div { padding: 16px 24px; border-right: 1px solid var(--line); }
+.ledger-meta div:last-child { border-right: 0; }
+.ledger-meta .k { color: var(--muted); font: 700 10px var(--font-geist-mono), monospace; letter-spacing: .1em; margin-bottom: 6px; }
+.ledger-meta .v { font-size: 17px; font-weight: 700; }
+.ledger-meta .v.hot { color: var(--accent); }
+.ledger-foot { padding: 15px 24px; border-top: 1px solid var(--line); color: var(--muted); font: 650 12px var(--font-geist-mono), monospace; }
+.ledger-foot a { color: var(--accent); border-bottom: 1px solid currentColor; }
+
+.split-heading { flex-direction: row; align-items: end; justify-content: space-between; }.split-heading > p { margin: 0; color: var(--muted); font: 700 11px var(--font-geist-mono), monospace; letter-spacing: .1em; }
+.split-heading > div { display: flex; flex-direction: column; gap: 22px; }
+.example-steps { display: grid; grid-template-columns: repeat(3, 1fr); position: relative; border-top: 3px solid var(--fg); }.example-steps::after { content: ""; position: absolute; top: 70px; left: 8%; right: 8%; border-top: 2px dashed var(--line); z-index: -1; }
+.example-step { min-height: 350px; padding: 25px 30px 35px; border-right: 1px solid var(--line); }.example-step:first-child { border-left: 1px solid var(--line); }.step-number { color: var(--accent); font: 800 42px var(--font-geist-mono), monospace; }
+.step-node { width: 18px; height: 18px; margin: 24px 0 55px; border: 4px solid var(--accent); background: var(--bg); border-radius: 50%; }.example-step h3 { font-size: 24px; margin: 0 0 15px; }.example-step p { color: var(--muted); line-height: 1.65; margin: 0; }
+.example-result { margin-top: 22px; padding: 55px; background: var(--accent); color: #ffffff; display: flex; align-items: end; justify-content: space-between; gap: 60px; }.example-result p { margin: 0; font-size: clamp(34px, 4.4vw, 64px); font-weight: 760; letter-spacing: -.05em; }.example-result p em { display: block; font-style: normal; }.example-result > span { max-width: 430px; line-height: 1.65; }.example-result strong { color: #000000; background: #ffffff; padding: 2px 5px; }
+.human-quote { position: relative; margin: 0 0 70px; padding: 55px 70px; border: 2px solid var(--accent); color: var(--accent); font-size: clamp(24px, 3vw, 42px); line-height: 1.45; font-weight: 650; }.human-quote > span { position: absolute; left: 18px; top: 5px; font-size: 70px; }
+.guarantee-grid { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--line); border-left: 1px solid var(--line); }.guarantee-grid article { min-height: 250px; padding: 24px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }.guarantee-grid article > span { color: var(--accent); font: 700 11px var(--font-geist-mono), monospace; }.guarantee-grid h3 { margin: 68px 0 16px; font-size: 23px; }.guarantee-grid sup { margin-left: 7px; padding: 3px 6px; background: var(--accent); color: #ffffff; font: 600 9px var(--font-geist-sans), sans-serif; }.guarantee-grid p { color: var(--muted); line-height: 1.55; margin: 0; }
+.evolve-note { max-width: 970px; margin: 70px auto 0; text-align: center; font-size: clamp(21px, 2.5vw, 34px); line-height: 1.5; }.evolve-note b { color: var(--accent); }
+.people-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }.people-grid article { position: relative; min-height: 330px; padding: 28px; border: 1px solid var(--line); }.people-grid article > span { color: var(--accent); font: 700 11px var(--font-geist-mono), monospace; }.people-grid h3 { margin: 100px 0 18px; font-size: 27px; }.people-grid p { max-width: 340px; color: var(--muted); line-height: 1.65; }.people-grid i { position: absolute; right: 25px; top: 23px; color: var(--accent); font-size: 22px; font-style: normal; transition: transform 160ms ease; }.people-grid article:hover i { transform: translate(4px, -4px); }
+.governance-list { border-top: 2px solid var(--fg); }.governance-list article { min-height: 108px; display: grid; grid-template-columns: 100px 1.5fr 2fr 30px; align-items: center; gap: 20px; border-bottom: 1px solid var(--line); }.governance-list article > span { color: var(--accent); font: 700 12px var(--font-geist-mono), monospace; }.governance-list h3 { font-size: 22px; }.governance-list p { color: var(--muted); }.governance-list b { color: var(--accent); font-size: 11px; }
+.open-section { background: #000000; color: #ffffff; }.open-inner { padding-block: 120px; }.open-inner .section-index { color: #017aff; }.open-inner h2 { margin: 22px 0 80px; font-size: clamp(50px, 7vw, 96px); letter-spacing: -.065em; }
+.osca-letters { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid rgba(255,255,255,.3); border-left: 1px solid rgba(255,255,255,.3); }.osca-letters > div { min-height: 250px; padding: 25px; border-right: 1px solid rgba(255,255,255,.3); border-bottom: 1px solid rgba(255,255,255,.3); display: flex; flex-direction: column; justify-content: space-between; }.osca-letters b { color: #017aff; font: 650 clamp(70px, 8vw, 112px) var(--font-geist-mono), monospace; line-height: 1; }.osca-letters span { display: flex; flex-direction: column; gap: 7px; font-size: 16px; }.osca-letters strong { font: 700 11px var(--font-geist-mono), monospace; color: rgba(255,255,255,.55); text-transform: uppercase; letter-spacing: .1em; }
+.open-bottom { margin-top: 55px; display: flex; align-items: end; justify-content: space-between; gap: 60px; }.open-bottom p { max-width: 780px; margin: 0; color: rgba(255,255,255,.66); font-size: 18px; line-height: 1.75; }.open-button { border-color: #017aff; background: #017aff; color: #ffffff; flex: 0 0 auto; }
+footer { min-height: 240px; padding: 55px max(24px, calc((100vw - 1320px) / 2)); display: flex; justify-content: space-between; gap: 50px; border-top: 1px solid var(--line); }.footer-brand img { width: 190px; }.footer-brand p { color: var(--muted); }.footer-meta { display: grid; grid-template-columns: repeat(2, auto); gap: 20px 50px; align-content: start; color: var(--muted); font: 650 12px var(--font-geist-mono), monospace; }.footer-meta a:hover { color: var(--accent); }
+
+[data-reveal] { opacity: 0; transform: translateY(24px); transition: opacity 650ms ease, transform 650ms ease; }
+[data-reveal].is-visible { opacity: 1; transform: translateY(0); }
+@keyframes pulse { 50% { opacity: .35; transform: scale(.75); } }
+
+@media (max-width: 1050px) {
+  .nav-links { position: fixed; inset: 82px 0 auto; display: none; flex-direction: column; gap: 0; padding: 20px 24px 30px; background: var(--bg); border-bottom: 1px solid var(--line); }.nav-links.is-open { display: flex; }.nav-links a { padding: 14px 0; font-size: 20px; }.nav-links a::after { display: none; }
+  .nav-github, .contact-button { display: none; }.menu-toggle { display: block; }.header-actions { margin-left: auto; }
+  .hero { grid-template-columns: 1fr; min-height: auto; }.flow-visual { max-width: 650px; width: 100%; justify-self: end; }
+  .problem { grid-template-columns: 1fr; }.problem .section-index { margin-bottom: 20px; }
+  .definition-grid, .people-grid { grid-template-columns: 1fr; }.definition-card { min-height: 300px; }.definition-card h3 { margin-top: 90px; }
+  .guarantee-grid, .osca-letters { grid-template-columns: repeat(2, 1fr); }
+  .ledger-meta { grid-template-columns: repeat(2, 1fr); }.ledger-meta div:nth-child(2) { border-right: 0; }.ledger-meta div:nth-child(1), .ledger-meta div:nth-child(2) { border-bottom: 1px solid var(--line); }
+}
+
+@media (max-width: 720px) {
+  .section-shell { width: min(100% - 32px, 1320px); }.site-header { height: 70px; padding-inline: 16px; gap: 12px; }.brand img { width: 142px; }.nav-links { top: 70px; }
+  .theme-toggle { padding-inline: 10px; }.theme-dot { width: 11px; height: 11px; border-width: 3px; }
+  .hero { min-height: calc(100svh - 70px); padding-block: 64px 96px; gap: 15px; }.hero h1 { font-size: clamp(49px, 15vw, 68px); line-height: 1.02; }.hero h1 br { display: none; }.hero-subtitle { font-size: 18px; line-height: 1.5; }.hero-actions { flex-direction: column; }.button { width: 100%; justify-content: space-between; }
+  .flow-visual { height: 300px; margin-top: 25px; background-size: 40px 40px; }.flow-line-a { left: 20px; top: 105px; }.flow-label { left: 20px; top: 25px; }.feedback-chip { top: 165px; }.feedback-chip::before { height: 60px; }.flow-junction { top: 101px; }.flow-line-b { top: 230px; }.flow-output { bottom: 5px; }.scroll-cue { bottom: 25px; }
+  .formula-bar { flex-wrap: wrap; padding: 12px 8px; }.formula-bar > * { min-height: 35px; border: 0; padding-inline: 7px; font-size: 12px; }
+  .problem { min-height: auto; padding-block: 90px; }.problem-copy > p { margin-bottom: 45px; }.problem-copy h2 { font-size: 38px; }
+  .definition, .example, .operation, .people, .governance { padding-block: 90px; }.section-heading { margin-bottom: 50px; }.section-heading h2 { font-size: 48px; }.split-heading { align-items: start; flex-direction: column; }
+  .definition blockquote { font-size: 27px; margin-bottom: 60px; }.definition-card { min-height: 280px; }
+  .ledger-intro { margin-top: 60px; }.ledger-body { padding: 22px 18px; }.ledger-head, .ledger-meta div, .ledger-foot { padding-inline: 18px; }
+  .example-steps { grid-template-columns: 1fr; }.example-steps::after { top: 55px; bottom: 40px; left: 36px; right: auto; border: 0; border-left: 2px dashed var(--line); }.example-step { min-height: auto; padding: 25px 25px 45px 70px; border-left: 1px solid var(--line); }.step-node { position: absolute; left: 28px; margin-top: 18px; }.example-step h3 { margin-top: 30px; }.example-result { padding: 35px 25px; flex-direction: column; align-items: start; }.example-result p { font-size: 38px; }
+  .human-quote { padding: 50px 25px 35px; font-size: 24px; }.guarantee-grid { grid-template-columns: 1fr; }.guarantee-grid article { min-height: 210px; }.guarantee-grid h3 { margin-top: 50px; }
+  .people-grid article { min-height: 280px; }.people-grid h3 { margin-top: 80px; }
+  .governance-list article { grid-template-columns: 45px 1fr 15px; padding-block: 22px; }.governance-list article p { grid-column: 2; margin: 0; }.governance-list article b { grid-column: 3; grid-row: 1; }
+  .open-inner { padding-block: 90px; }.open-inner h2 { margin-bottom: 55px; }.osca-letters { grid-template-columns: 1fr 1fr; }.osca-letters > div { min-height: 190px; }.open-bottom { align-items: stretch; flex-direction: column; }
+  footer { flex-direction: column; padding: 45px 16px; }.footer-meta { grid-template-columns: 1fr; gap: 15px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+  [data-reveal] { opacity: 1; transform: none; }
+}
+</style>
+</head>
+<body>
+<header class="site-header">
+  <a class="brand" href="#top" aria-label="Oscaware 首页">
+    <img src="logo01.svg" alt="Oscaware" width="178" />
+  </a>
+  <nav class="nav-links" id="nav-links" aria-label="主导航">
+    <a href="#what">是什么</a>
+    <a href="#example">例子</a>
+    <a href="#how">怎么运转</a>
+    <a href="#people">为谁</a>
+    <a href="#open">开放</a>
+  </nav>
+  <div class="header-actions">
+    <button class="theme-toggle" type="button" id="theme-toggle" aria-label="切换主题" title="切换主题">
+      <span class="theme-dot" aria-hidden="true"></span>
+      <span id="theme-label">自动</span>
+    </button>
+    <a class="nav-github" href="https://github.com/OSCAware/osca" target="_blank" rel="noopener">GitHub ↗</a>
+    <a class="contact-button" href="#contact">联系我们</a>
+    <button class="menu-toggle" type="button" id="menu-toggle" aria-label="打开菜单" aria-expanded="false" aria-controls="nav-links">
+      <span></span>
+      <span></span>
+    </button>
+  </div>
+</header>
+
+<main id="top">
+  <section class="hero section-shell" aria-labelledby="hero-title">
+    <div class="hero-copy" data-reveal>
+      <p class="eyebrow"><span></span> OSCAWARE / OPEN SOURCE</p>
+      <h1 id="hero-title">让 AI 工作流程，<br /><em>随人的反馈</em>不断进化。</h1>
+      <p class="hero-subtitle">越用越顺手——因为它始终贴合你当下的环境。</p>
+      <div class="hero-actions">
+        <a class="button button-primary" href="https://github.com/OSCAware/osca" target="_blank" rel="noopener">查看 OSCA 规范 <b>↗</b></a>
+        <a class="button button-secondary" href="#contact">联系我们 <b>→</b></a>
+      </div>
+    </div>
+
+    <div class="flow-visual" role="img" aria-label="反馈进入流程并改变后续路径的示意图" data-reveal>
+      <div class="flow-label flow-label-a">AI WORKFLOW</div>
+      <div class="flow-line flow-line-a"><i></i><i></i><i></i></div>
+      <div class="feedback-chip"><span>HUMAN</span><strong>反馈</strong></div>
+      <div class="flow-junction"></div>
+      <div class="flow-line flow-line-b"><i></i><i></i></div>
+      <div class="flow-output">NEW PATH <b>↗</b></div>
+    </div>
+
+    <a class="scroll-cue" href="#problem"><span>SCROLL TO EXPLORE</span><b>↓</b></a>
+  </section>
+
+  <div class="formula-bar">
+    <span>OSCAWARE</span><b>＝</b>
+    <a href="#what">OSCA 定义</a><b>＋</b>
+    <a href="#what">贡献账本</a><b>＋</b>
+    <a href="#what">蒸馏机制</a>
+  </div>
+
+  <section class="problem section-shell" id="problem">
+    <p class="section-index">01 / WHY</p>
+    <div class="problem-copy" data-reveal>
+      <p>今天落地在组织里的 AI，多半是问答机器人和零散的单步小技能：<span>被动、碎片、没人爱用，也不改变工作结果。</span></p>
+      <h2>缺的不是更强的模型，而是没有人把「怎么干才对」带进去，也没有东西把它留下来。</h2>
+    </div>
+  </section>
+
+  <section class="definition section-shell" id="what">
+    <div class="section-heading" data-reveal>
+      <p class="section-index">02 / WHAT</p>
+      <h2>Oscaware 是什么</h2>
+    </div>
+    <blockquote data-reveal>
+      Oscaware 是一套 AI 认知工作流程的定义（OSCA）、一本由人类专家持续供给的贡献账本，和一套在运行中把人的反馈变成流程调整的蒸馏机制。
+    </blockquote>
+    <div class="definition-grid">
+      <article class="definition-card" data-reveal>
+        <div class="card-top"><span>01</span><code>O/S/C/A</code></div>
+        <h3>OSCA 定义</h3>
+        <p>一份纯文本，写清一项工作的四个答案：目标、步骤、接口、时机。放进运行框架，它就是一个能干活的 AI Agent。</p>
+      </article>
+      <article class="definition-card" data-reveal>
+        <div class="card-top"><span>02</span><code>LEDGER</code></div>
+        <h3>贡献账本</h3>
+        <p>反馈沉淀成的条目集。每条写明：谁给的、依据什么案例、被验证过几次。</p>
+      </article>
+      <article class="definition-card" data-reveal>
+        <div class="card-top"><span>03</span><code>DISTILL</code></div>
+        <h3>蒸馏机制</h3>
+        <p>把零散反馈变成账本条目的工序。归纳交给 AI，拍板永远在人。</p>
+      </article>
+    </div>
+
+    <p class="ledger-intro" data-reveal>账本条目长这样 · 运维诊断公开样例包中的一条真实条目</p>
+    <article class="ledger-card" data-reveal aria-label="贡献账本条目示例 J-0417">
+      <div class="ledger-head">
+        <span class="ledger-lab">贡献账本 · 条目（JUDGMENT）</span>
+        <span class="ledger-id">J-0417</span>
+      </div>
+      <p class="ledger-body">差旅费异动若与该单位检修计划期重叠，视为正常波动，正文不报——除非涨幅同时超过该单位近三年检修期同科目峰值。</p>
+      <div class="ledger-meta">
+        <div><div class="k">AUTHOR 作者</div><div class="v">王工</div></div>
+        <div><div class="k">CONFIRMED 被确认</div><div class="v">× 6</div></div>
+        <div><div class="k">OVERRULED 被推翻</div><div class="v">0</div></div>
+        <div><div class="k">TRUST 信任</div><div class="v hot">high</div></div>
+      </div>
+      <p class="ledger-foot">出自公开样例包 <a href="https://github.com/OSCAware/osca/blob/main/examples/oper-diagnosis.osca/judgments/J-0417.yaml" target="_blank" rel="noopener">examples/oper-diagnosis.osca/judgments/J-0417.yaml</a></p>
+    </article>
+  </section>
+
+  <section class="example section-shell" id="example">
+    <div class="section-heading split-heading" data-reveal>
+      <div><p class="section-index">03 / EXAMPLE</p><h2>一个例子看懂账本</h2></div>
+      <p>超市生鲜 / 一条账本条目怎样长出来</p>
+    </div>
+    <div class="example-steps">
+      <article class="example-step" data-reveal>
+        <span class="step-number">01</span>
+        <div class="step-node" aria-hidden="true"></div>
+        <h3>系统照常规办</h3>
+        <p>这个月新上 10 个品，系统把它们排进临期打折和过期报废流程，并向店长确认。</p>
+      </article>
+      <article class="example-step" data-reveal>
+        <span class="step-number">02</span>
+        <div class="step-node" aria-hidden="true"></div>
+        <h3>店长给一条反馈</h3>
+        <p>「不对，其中 2 个要退回供货商。」</p>
+      </article>
+      <article class="example-step" data-reveal>
+        <span class="step-number">03</span>
+        <div class="step-node" aria-hidden="true"></div>
+        <h3>入账，下月自动生效</h3>
+        <p>从此这 2 个品自动走退供流程，不用再说第二遍。</p>
+      </article>
+    </div>
+    <div class="example-result" data-reveal>
+      <p>一条反馈，<em>改了流程本身。</em></p>
+      <span>知识库是你去查它；<strong>账本是它自己生效</strong>——条件命中就出手。</span>
+    </div>
+  </section>
+
+  <section class="operation section-shell" id="how">
+    <div class="section-heading split-heading" data-reveal>
+      <div><p class="section-index">04 / HOW</p><h2>怎么运转</h2></div>
+      <p>RUN × FEEDBACK × EVOLVE</p>
+    </div>
+    <blockquote class="human-quote" data-reveal>
+      <span aria-hidden="true">“</span>
+      关键位置要站人——不是因为人比 AI 更会判断，而是因为只有人知道外面的世界变了，并能把这个变化，用一条反馈带进流水线。
+    </blockquote>
+    <div class="guarantee-grid">
+      <article data-reveal><span>01</span><h3>放进来就能跑</h3><p>一份文本，就是一个正常运行的 AI Agent。</p></article>
+      <article data-reveal><span>02</span><h3>能互相调用</h3><p>Agent 之间可以互相调用、互相组合。</p></article>
+      <article data-reveal><span>03</span><h3>能与人协作</h3><p>该问人的时候问人；该人拍板的，永远人拍板。</p></article>
+      <article data-reveal><span>04</span><h3>能进化<sup>最重要</sup></h3><p>根据人的反馈，不断调整自己。</p></article>
+    </div>
+    <p class="evolve-note" data-reveal><b>进化是中性词：</b>不承诺越用越好，只承诺越用越顺手——因为它始终在贴合当下的环境。</p>
+  </section>
+
+  <section class="people section-shell" id="people">
+    <div class="section-heading" data-reveal><p class="section-index">05 / FOR WHOM</p><h2>为真正懂工作的人而做</h2></div>
+    <div class="people-grid">
+      <article data-reveal><span>01</span><h3>一线专家</h3><p>不用学任何新东西：照常干活、照常改稿。你的经验被记下、记你的名。</p><i aria-hidden="true">↗</i></article>
+      <article data-reveal><span>02</span><h3>服务商与交付团队</h3><p>一套能续费的交付模式：客户的账本越用越厚，服务越做越深。</p><i aria-hidden="true">↗</i></article>
+      <article data-reveal><span>03</span><h3>组织与管理者</h3><p>可控、可审计、真落地；换模型不报废。</p><i aria-hidden="true">↗</i></article>
+    </div>
+  </section>
+
+  <section class="governance section-shell">
+    <div class="section-heading split-heading" data-reveal>
+      <div><p class="section-index">06 / TRUST</p><h2>信任写进机制里</h2></div><p>可控 · 可审计 · 归你所有</p>
+    </div>
+    <div class="governance-list">
+      <article data-reveal><span>01</span><h3>每条结论可追溯</h3><p>追到谁定的、凭什么、当时的案例。</p><b aria-hidden="true">●</b></article>
+      <article data-reveal><span>02</span><h3>账本是纯文本</h3><p>可打印、可签名、归你所有。</p><b aria-hidden="true">●</b></article>
+      <article data-reveal><span>03</span><h3>权限由系统硬管</h3><p>不靠 AI 自觉；不可逆操作永远人拍板。</p><b aria-hidden="true">●</b></article>
+      <article data-reveal><span>04</span><h3>换模型有体检单</h3><p>逐条重验账本，明明白白列出哪些还灵、哪些要补。</p><b aria-hidden="true">●</b></article>
+    </div>
+  </section>
+
+  <section class="open-section" id="open">
+    <div class="open-inner section-shell" data-reveal>
+      <p class="section-index">07 / OPEN STANDARD</p>
+      <h2>OSCA 是开放规范。</h2>
+      <div class="osca-letters">
+        <div><b>O</b><span><strong>Object</strong>目标是什么</span></div>
+        <div><b>S</b><span><strong>Structure</strong>分几步走</span></div>
+        <div><b>C</b><span><strong>Connector</strong>数据从哪来</span></div>
+        <div><b>A</b><span><strong>Aware</strong>什么时候动手</span></div>
+      </div>
+      <div class="open-bottom">
+        <p>规范文本以 CC BY 4.0 开放，配套工具与样例以 Apache-2.0 开源。我们正在把它开放出来；基于同一套机制构建你自己的平台，是这条路的方向。</p>
+        <a class="button open-button" href="https://github.com/OSCAware/osca" target="_blank" rel="noopener">在 GitHub 上查看 <b>↗</b></a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer id="contact">
+  <div class="footer-brand"><img src="logo01.svg" alt="Oscaware" width="190" /><p>让 AI 工作流程，随人的反馈不断进化。</p></div>
+  <div class="footer-meta">
+    <span>联系邮箱 / 待发布</span>
+    <a href="https://github.com/OSCAware/osca" target="_blank" rel="noopener">GitHub ↗</a>
+    <span>备案号 / 待定</span>
+    <span>© 2026 Oscaware</span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var names = { auto: "自动", light: "浅色", dark: "深色" };
+  var order = { auto: "light", light: "dark", dark: "auto" };
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+  var toggle = document.getElementById("theme-toggle");
+  var label = document.getElementById("theme-label");
+
+  function pref() {
+    var p = root.dataset.themePreference;
+    return p === "light" || p === "dark" || p === "auto" ? p : "auto";
+  }
+  function apply(p) {
+    root.dataset.theme = p === "auto" ? (media.matches ? "dark" : "light") : p;
+    root.dataset.themePreference = p;
+    if (label) label.textContent = names[p];
+    if (toggle) toggle.setAttribute("aria-label", "主题：" + names[p] + "，点击切换为" + names[order[p]]);
+  }
+  apply(pref());
+  media.addEventListener("change", function () { if (pref() === "auto") apply("auto"); });
+  if (toggle) {
+    toggle.addEventListener("click", function () {
+      var next = order[pref()];
+      try {
+        if (next === "auto") localStorage.removeItem("oscaware-theme");
+        else localStorage.setItem("oscaware-theme", next);
+      } catch (e) {}
+      apply(next);
+    });
+  }
+
+  var menuBtn = document.getElementById("menu-toggle");
+  var nav = document.getElementById("nav-links");
+  if (menuBtn && nav) {
+    function closeMenu(focusBtn) {
+      nav.classList.remove("is-open");
+      menuBtn.setAttribute("aria-expanded", "false");
+      menuBtn.setAttribute("aria-label", "打开菜单");
+      if (focusBtn) menuBtn.focus();
+    }
+    menuBtn.addEventListener("click", function () {
+      var open = nav.classList.toggle("is-open");
+      menuBtn.setAttribute("aria-expanded", open ? "true" : "false");
+      menuBtn.setAttribute("aria-label", open ? "关闭菜单" : "打开菜单");
+      if (open) { var first = nav.querySelector("a"); if (first) first.focus(); }
+    });
+    nav.querySelectorAll("a").forEach(function (a) {
+      a.addEventListener("click", function () { closeMenu(false); });
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && nav.classList.contains("is-open")) closeMenu(true);
+    });
+  }
+
+  var targets = document.querySelectorAll("[data-reveal]");
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches || !("IntersectionObserver" in window)) {
+    targets.forEach(function (t) { t.classList.add("is-visible"); });
+  } else {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add("is-visible"); io.unobserve(e.target); }
+      });
+    }, { threshold: 0.12 });
+    targets.forEach(function (t) { io.observe(t); });
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+case_id: C-0088
+captured_at: 2026-06-09 15:12
+capture_source: 报告终审界面 diff 监听
+report: 2026-05 月度诊断报告草稿 v1
+
+input:
+  单位名称: XX燃机
+  费用科目: 差旅费
+  统计周期: 2026-05
+  环比涨幅: 38
+  绝对金额: 19.4万
+  检修期上下文: {处于检修期: true, 近三年检修期峰值涨幅: 55}
+  当时生效判断集: []
+
+agent_draft: |
+  【异动4】XX燃机差旅费5月环比+38%（19.4万元），涨幅偏高，
+  待核实：是否存在异常报销。建议经营部关注。
+expert_final: |
+  （整条删除）
+expert_remark: "五月大修，人都驻场，正常。"
+
+distillation:
+  status: distilled
+  batch: D-2026-07-12
+  resulted_in: J-0417
+  note: 与 C-0091、C-0094 聚类归纳，构成「检修期常态波动」主分支的证据。

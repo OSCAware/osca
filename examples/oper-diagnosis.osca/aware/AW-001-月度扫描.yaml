@@ -1,0 +1,33 @@
+aware_id: AW-001
+name: 月度扫描
+enabled: true
+
+# ── 触发原语:逐条编译注册进运行时触发表;可被多个 Aware 共享(自动去重) ──
+triggers:
+  - id: T1
+    kind: schedule
+    schedule: "每月9日 09:00"          # 财务关账次日
+  - id: T2
+    kind: watch
+    uses: CON-001.拉取费用明细
+    every: 24h
+    state_key: 当月关账状态
+    emit_when: "old.已关账 == false && new.已关账 == true"   # 提前关账也能醒
+  - id: T3
+    kind: event
+    source: 人工触发(操作者控制台按钮)
+
+# ── 闸门:trigger 命中 ≠ 唤醒;此处裁决。装载时做编译期校验 ──
+gate:
+  combine: any                        # any | all | sequence
+  precondition: "CON-001.拉取费用明细(当月) 返回非空"
+  debounce: 72h                       # T1/T2 同一账期先后命中,只跑一次
+  on_fail: 顺延24小时重试,连续3次失败通知操作者,不通知专家
+
+then: STR-001
+budget: {max_steps: 40, max_minutes: 15, max_tokens: 200k}
+
+discretion: |
+  两种情况允许计划外唤醒(有界主动):操作者手动触发(T3);上期「待核实」
+  项被专家标记「持续跟踪」且本期数据已可取——只扫跟踪项,不跑全量。
+  除此之外不得自行唤醒。缰绳放长的决定权在人,不在本文件。

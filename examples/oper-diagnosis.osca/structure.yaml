@@ -1,0 +1,37 @@
+# 组合骨架 —— 刻意保持薄。
+# 纪律：流程只描述「什么喂给什么」，一切「怎么裁」留给判断层。
+# 如果你发现自己想在这里写 if/else，停下——那是一条该进 judgments/ 的判断。
+
+structure_id: STR-001
+pipeline:
+
+  - step: 取数
+    performer: connector          # 确定性执行，模型不参与
+    uses: CON-001                 # connectors/财务系统.yaml
+    produces: 原始费用明细集
+
+  - step: 生成报警候选
+    performer: agent
+    input: 原始费用明细集
+    produces: {ref: OBJ-002, cardinality: "0..n"}
+    note: 只按 OBJ-002 的 schema 和阈值机械生成候选，不做任何裁决
+
+  - step: 裁决
+    performer: agent + judgments
+    input: {ref: OBJ-002}
+    process: 对每条候选做判断签名匹配，命中则依判断裁决，未命中标注「无既有判断可依」
+    produces: 已裁决报警集
+
+  - step: 成文
+    performer: agent
+    input: 已裁决报警集
+    produces: {ref: OBJ-001}
+    note: 遵守 OBJ-001 的 quality_bar，尤其是三行纪律和「已核实/待核实」措辞
+
+  - step: 专家终审          # ← 飞轮的采集点在这里
+    performer: human(王工)
+    process: 专家在草稿上直接修改；diff 由采集器自动落入 cases/
+    produces: 终稿（发出）+ cases（副产品）
+
+# 嵌套预留：若未来「生成报警候选」拆成按业务线的子 agent，
+# 在此处以 sub_agent 引用其独立的 .osca 包，本文件不膨胀。

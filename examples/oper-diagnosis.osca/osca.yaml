@@ -1,0 +1,9 @@
+format: osca
+format_version: "0.2"
+package_id: demo-group-oper-diagnosis
+name: 示例集团经营诊断
+entry: AGENT.md
+requires:
+  runtime: ">=0.2"
+  bindings: [FINANCE_DB]        # loader 装载时与部署环境比对,缺失即报错
+integrity: indexes/checksums.txt # osca pack 时生成;交付件可对包签名

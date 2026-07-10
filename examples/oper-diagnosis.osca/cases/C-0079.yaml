@@ -1,0 +1,16 @@
+case_id: C-0079
+captured_at: 2026-03-30 14:20
+capture_source: 建包访谈（口述转录）
+kind: 口述                # 账本纪律第 3 条：专家主动口述的规则也要落 case，作为出生证据
+
+input:
+  访谈问题: 什么样的费用异动，是您一定要让管理层看到的？
+  当时生效判断集: []
+
+expert_remark: "咨询费只要单期超过 20 万，不管什么原因，先放进正文让领导看到。"
+
+distillation:
+  status: distilled
+  batch: 建包访谈 D-2026-03-30
+  resulted_in: J-0405
+  note: 建包期口述规则；后经真实使用被修正（见 C-0102 → J-0423 的取代链）。

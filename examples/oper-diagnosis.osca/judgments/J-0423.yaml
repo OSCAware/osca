@@ -1,0 +1,38 @@
+judgment_id: J-0423
+status: active
+supersedes: J-0405        # 旧判断「咨询费超20万一律正文报告」被本判断取代。
+                          # J-0405 文件不删除，其 status 已改为 superseded。
+
+# 这是一条「负判断」的示例——它不产生动作，它压制动作。
+# 负判断恰恰是专家推翻 agent 时最自然的产出，价值不低于正向规则。
+
+signature:
+  object: OBJ-002
+  aware: AW-001
+  guard: "费用科目 == 咨询费 && 单位名称 in 集团级科技类单位"
+
+body: |
+  科技类单位的咨询费异动不做单月裁决——该科目按项目里程碑付款，
+  单月环比天然剧烈波动，逐月报警是噪音。改为：仅当滚动四个季度
+  累计值偏离年度预算 ±15% 时才进正文。
+  （取代 J-0405 的「金额一刀切」逻辑：王工原话「咨询费看年不看月」。）
+
+evidence:
+  - C-0102      # 王工连续第3次删除同类月度咨询费报警时的 diff + 嘟囔记录
+
+meta:
+  author: 王工
+  distilled_by: D-2026-07-26
+  confirmed_at: 2026-07-28
+  confirmed: 1
+  overruled: 0
+  trust: provisional      # 新判断默认 provisional，confirmed≥5 才升 high
+
+expiry:
+  - 咨询费付款方式改为按月均摊
+  - 年度预算编制口径变更
+
+replay:
+  - given: C-0102.input
+    without_this_judgment: 月度咨询费报警进正文（J-0405 逻辑）
+    with_this_judgment: 压制月度报警；季度滚动检查通过则完全不出现

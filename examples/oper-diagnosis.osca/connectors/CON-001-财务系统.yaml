@@ -1,0 +1,35 @@
+connector_id: CON-001
+name: 财务系统（只读）
+kind: sql_readonly           # 确定性执行：模型只能调用，不能改写查询逻辑
+
+# ── 为什么是确定性的（设计意图，给读包的人看）──
+rationale: |
+  取数是 LLM 最不可靠、又最没有判断含量的一层（NL2SQL 硬骨头）。
+  所以查询逻辑全部固化为具名接口，模型按名调用、按类型消费结果。
+  模型永远不写 SQL，永远不猜数。
+
+# ── 接口清单：输入输出全部引用 objects/ 的类型 ──
+interfaces:
+
+  - name: 拉取费用明细
+    params:
+      统计周期: {type: string, format: "YYYY-MM", required: true}
+      费用科目: {type: enum, ref: "OBJ-002.schema.费用科目", required: false}
+    returns: 原始费用明细集      # 供 STR-001 第一步消费
+    impl: sql/fee_detail.sql    # 真代码放这里，工程侧维护
+    freshness: 每月8日财务关账后可用；8日前调用必须在报告中标注「未关账口径」
+
+  - name: 拉取检修计划期
+    params:
+      单位名称: {type: string, required: true}
+      年份区间: {type: string, format: "YYYY-YYYY"}
+    returns: {ref: "OBJ-002.schema.检修期上下文"}
+    impl: sql/overhaul_schedule.sql
+    born: 2026-07-14
+    born_reason: J-0417 生效后新增——判断层需要检修期上下文才能裁决
+    # ↑ 注意这一行：Connector 是被判断层倒逼着长出来的。
+    #   这是健康信号——接口应答判断的需要，而不是反过来。
+
+permissions:
+  write: forbidden             # 呼应 AGENT.md 边界#2
+  scope: 仅集团合并报表库，不触碰单体账套

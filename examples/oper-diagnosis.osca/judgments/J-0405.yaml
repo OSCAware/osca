@@ -1,0 +1,28 @@
+judgment_id: J-0405
+status: superseded        # 已被 J-0423 取代。按账本纪律不删除，原样留档、可回放。
+
+signature:
+  object: OBJ-002
+  aware: AW-001
+  guard: "费用科目 == 咨询费 && 绝对金额 > 20"
+
+body: |
+  咨询费单期绝对金额超过 20 万元，一律进正文报告。
+
+evidence:
+  - C-0079      # 建包访谈期的口述规则（kind: 口述）
+
+meta:
+  author: 王工
+  distilled_by: 建包访谈 D-2026-03-30
+  confirmed_at: 2026-03-30
+  confirmed: 2
+  overruled: 3            # 连续三个月被专家删除 → 触发重审，蒸馏出 J-0423
+  trust: provisional      # 冻结于被取代时
+
+expiry:
+  - 已由 J-0423 取代（2026-07-28）：咨询费改按滚动四季度对预算偏离裁决
+
+replay:
+  - given: C-0102.input
+    with_this_judgment: 月度咨询费报警进正文（该输出被专家整条删除——本判断因此被取代）

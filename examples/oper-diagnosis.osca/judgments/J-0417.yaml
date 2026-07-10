@@ -1,0 +1,43 @@
+judgment_id: J-0417
+status: active
+supersedes: null
+
+# ── 签名：我对什么生效（类型系统的落地处）──
+signature:
+  object: OBJ-002                  # 费用异动报警
+  aware: AW-001                    # 月度扫描情境下
+  guard: "费用科目 == 差旅费 && 环比涨幅 > 30 && 检修期上下文 != null"
+
+# ── 函数体：判断本身（自然语言，带除非子句）──
+body: |
+  差旅费异动若与该单位检修计划期重叠，视为正常波动，正文不报——
+  除非涨幅同时超过该单位近三年检修期同科目峰值。
+  被本判断压下的项落附录，注明「检修期常态波动（J-0417）」。
+
+# ── 出生证据：引用 cases/，不内联（保持本文件短）──
+evidence:
+  - C-0091      # 2026-07 王工删除 +45% 报警的原始 diff
+  - C-0094      # 2026-07 王工保留 +85% 报警并加注的原始 diff
+
+# ── 元数据：信任分 ──
+meta:
+  author: 王工
+  distilled_by: 蒸馏批次 D-2026-07-12    # 由哪次蒸馏归纳、王工哪次点头确认
+  confirmed_at: 2026-07-14
+  confirmed: 6                     # 后续使用中被默认接受次数（采集器自动累加）
+  overruled: 0
+  trust: high                      # 规则：confirmed≥5 且 overruled==0 → high
+
+# ── 失效条件：防腐烂 ──
+expiry:
+  - 该单位检修排期制度变更（检修期数据源：CON-001.拉取检修计划期）
+  - 集团差旅报销口径调整
+  - overruled ≥ 2 时自动降级为 review 状态，进入蒸馏队列重审
+
+# ── 回放断言：本判断的单元测试 ──
+replay:
+  - given: C-0091.input
+    without_this_judgment: 报警出现在正文
+    with_this_judgment: 报警落附录并注明 J-0417
+  - given: C-0094.input
+    with_this_judgment: 报警保留在正文，标注「超检修期常态」
