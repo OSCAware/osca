@@ -42,6 +42,19 @@ next-env.d.ts
 /outputs/
 /work/
 
+# osca 交付件与部署产物，不入库
+*.osca.zip
+/deploy/
+
+# python (cli)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+/cli/dist/
+
 # local-only working docs —阶段性讨论文件，仅本地保留，不推送仓库
 /Core_docs/
 

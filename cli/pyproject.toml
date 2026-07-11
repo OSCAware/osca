@@ -1,0 +1,37 @@
+[project]
+name = "osca-cli"
+version = "0.1.0"
+description = "OSCA 包工具：lint / pack / load —— 账本纪律的机器化"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Oscaware" }]
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+osca = "osca_cli.main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/osca_cli"]
+
+[tool.ruff]
+line-length = 120  # 诊断消息为中文长句，100 列放不下
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,5 +1,8 @@
 object_id: OBJ-002
 name: 费用异动报警
+kind: artifact        # 中间产物：medium=payload，仅供流程内部流转（kind 归属见 SPEC v0.3 待定项）
+medium: payload
+delivery: 流程内部（STR-001 步骤间流转，不对外交付）
 version: 3            # 第3版：J-0417 生效后增加了「检修期上下文」字段
 
 # ── 自然语言定义（给模型和人读，比 schema 更重要）──

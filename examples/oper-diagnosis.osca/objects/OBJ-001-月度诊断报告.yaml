@@ -1,5 +1,8 @@
 object_id: OBJ-001
 name: 月度诊断报告
+kind: artifact        # 产出物（SPEC §3）
+medium: document
+delivery: 飞书文档
 version: 2
 
 definition: |

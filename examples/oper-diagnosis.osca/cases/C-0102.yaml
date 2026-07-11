@@ -23,5 +23,6 @@ distillation:
   status: distilled
   batch: D-2026-07-26
   resulted_in: J-0423
-  note: 连续第 3 次删除同类月度咨询费报警（前两次见 2026-04 / 2026-05 报告）；
-        王工 2026-07-28 一句话确认新规则，J-0405 改 status: superseded。
+  note: |
+    连续第 3 次删除同类月度咨询费报警（前两次见 2026-04 / 2026-05 报告）；
+    王工 2026-07-28 一句话确认新规则，J-0405 改 status: superseded。

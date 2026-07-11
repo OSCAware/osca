@@ -1,6 +1,7 @@
 connector_id: CON-001
 name: 财务系统（只读）
 kind: sql_readonly           # 确定性执行：模型只能调用，不能改写查询逻辑
+binding_ref: FINANCE_DB      # 指向部署环境 binding 的名字，不是值（SPEC §4 层2）
 
 # ── 为什么是确定性的（设计意图，给读包的人看）──
 rationale: |

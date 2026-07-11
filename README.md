@@ -1,90 +1,99 @@
 <div align="center">
   <img src="https://avatars.githubusercontent.com/OSCAware" width="88" alt="OSCA" />
   <h1>OSCA</h1>
-  <p><b>用文本定义、随人的反馈进化的 AI 认知工作流程规范。</b></p>
-  <p><i>OSCA is an open specification for defining AI cognitive workflows in plain text —
-  workflows that run deterministically, keep humans at the decision points, and evolve
-  through human feedback recorded in an attributable contribution ledger.</i></p>
+  <p><b>An open specification for AI cognitive workflows — defined in plain text, evolving through human feedback.</b></p>
+  <p><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a></sub></p>
 </div>
 
 ---
 
-## Oscaware 是什么
+OSCA is an open specification for defining AI cognitive workflows in plain text — workflows that run
+deterministically, keep humans at the decision points, and evolve through human feedback recorded in an
+attributable **contribution ledger**.
 
-> **Oscaware 是一套 AI 认知工作流程的定义（OSCA）、一本由人类专家持续供给的贡献账本，和一套在运行中把人的反馈变成流程调整的蒸馏机制。**
+## What Oscaware is
 
-公式版：**Oscaware ＝ OSCA 定义 ＋ 贡献账本 ＋ 蒸馏机制**
+> **Oscaware is a definition for AI cognitive workflows (OSCA), a contribution ledger continuously supplied by human experts, and a distillation mechanism that turns human feedback into workflow adjustments at runtime.**
 
-## 先认识四个词
+Formula: **Oscaware ＝ OSCA definition ＋ Contribution ledger ＋ Distillation**
 
-| 词 | 意思 |
+## Four words first
+
+| Word | Meaning |
 |---|---|
-| **反馈** | 人在关键位置给出的纠正或确认。例：店长说「这两个品要退回供货商」。这是人做的事。 |
-| **贡献账本** | 反馈被整理后沉淀下来的一条条可复用条目。这是留下来的资产，每条可署名。 |
-| **判断** | 账本条目在技术规范里的名字（judgment，`J-xxxx` 文件）。 |
-| **进化** | 中性词：不承诺越用越好，只承诺越用越顺手——始终贴合当下的环境。 |
+| **Feedback** | A correction or confirmation a person gives at a key point. E.g. a store manager says "these two go back to the supplier." This is the human's part. |
+| **Contribution ledger** | The reusable entries that feedback settles into. This is the asset left behind — every entry can be attributed. |
+| **Judgment** | The ledger entry's name in the technical spec (`J-xxxx` files). |
+| **Evolve** | A neutral word: no promise it gets smarter or better, only that it stays a better fit — always aligned with the environment as it is now. |
 
-一句话记：**反馈是人做的事，账本是留下的资产，蒸馏是中间那道工序。**
+In one line: **feedback is what a person does, the ledger is the asset left behind, distillation is the step in between.**
 
-## 一个例子看懂账本
+## One example to grasp the ledger
 
-超市生鲜：这个月新上 10 个品，系统按常规把它们排进临期打折和过期报废流程，并向店长确认。店长说：不对，其中 2 个要退回供货商。这条反馈入账之后，下个月这 2 个品自动走退供流程。
+Supermarket fresh food: this month 10 new SKUs arrive; by default the system routes them into near-expiry
+discounting and past-expiry write-off, and confirms with the store manager. The manager says: no, 2 of these
+should go back to the supplier. Once that feedback is recorded, next month those 2 SKUs auto-route to supplier
+return.
 
-**一条反馈，改了流程本身**——知识库是你去查它；账本是它自己生效。
+**One piece of feedback changed the workflow itself** — a knowledge base is something you look up; a ledger acts on its own.
 
-账本条目长这样（摘自[样例包](examples/oper-diagnosis.osca/judgments/J-0417.yaml)）：
+A ledger entry looks like this (from the [sample pack](examples/oper-diagnosis.osca/judgments/J-0417.yaml)):
 
 ```yaml
 judgment_id: J-0417
 signature:
-  object: OBJ-002                  # 对什么生效
+  object: OBJ-002                  # what it applies to
   guard: "费用科目 == 差旅费 && 环比涨幅 > 30 && 检修期上下文 != null"
 body: |
   差旅费异动若与该单位检修计划期重叠，视为正常波动，正文不报——
   除非涨幅同时超过该单位近三年检修期同科目峰值。
-evidence: [C-0091, C-0094]         # 出生证据：专家改稿的原始 diff
+evidence: [C-0091, C-0094]         # origin evidence: the expert's original edit diff
 meta: {author: 王工, confirmed: 6, overruled: 0, trust: high}
 ```
 
-## OSCA 的四个问题
+## The four questions of OSCA
 
-| 字母 | 问题 |
+| Letter | Question |
 |---|---|
-| **O** — Object 目标 | 这件活要达成什么？ |
-| **S** — Structure 步骤 | 分几步走？ |
-| **C** — Connector 接口 | 数据从哪来、结果给谁？ |
-| **A** — Aware 时机 | 什么时候动手？ |
+| **O** — Object | What is this job trying to achieve? |
+| **S** — Structure | How many steps? |
+| **C** — Connector | Where does the data come from, and who gets the result? |
+| **A** — Aware | When does it act? |
 
-四个答案之上，压一层账本来把关。一个 agent ＝ 一个 `.osca` 文件夹 ＝ 一个 git 仓库，纯 Markdown + YAML，可打印、可签名、可交付。
+On top of those four answers sits a ledger that vets them. One agent ＝ one `.osca` folder ＝ one git repo, pure
+Markdown + YAML — printable, signable, deliverable.
 
-## 仓库结构
+## Repository layout
 
 ```
 osca/
-├── docs/OSCA-SPEC-v0.2.md        # 规范正文（CC BY 4.0）
-├── examples/oper-diagnosis.osca/  # 完整脱敏样例包（含 supersedes 链与口述 case）
-├── cli/                           # osca lint / pack / load（开发中）
-├── site/                          # oscaware.com 单页源文件
-├── CONTRIBUTING.md                # pre-1.0 参与方式
+├── docs/OSCA-SPEC-v0.3.md         # the specification (CC BY 4.0); v0.2 kept for history
+├── docs/OSCA-LINT-RULES.md        # lint rule catalogue (ledger discipline, machine-enforced)
+├── examples/oper-diagnosis.osca/  # a full de-identified sample pack (with supersedes chains and spoken-language cases)
+├── cli/                           # osca lint / pack / load (all three working)
+├── site/                          # oscaware.com single-page source
+├── CONTRIBUTING.md                # how to take part, pre-1.0
 └── CHANGELOG.md
 ```
 
-## 状态与路线
+## Status & roadmap
 
-- 当前：**SPEC v0.2 草案** ＋ 完整样例包。
-- 进行中：v0.3 由首个真实落地场景的格式缺口清单喂养；CLI（`lint / pack / load`）随参考实现交付。
-- 1.0 的发布凭据：规范 ＋ 参考实现 ＋ 一个可回放的脱敏样例账本——机制完整、当场可验。
+- Now: **SPEC v0.3** + a full sample pack + the CLI trio (`lint / pack / load`).
+  The sample pack passes all 21 lint rules; deliverables pack reproducibly and verify integrity.
+- In progress: the runtime host (reference implementation) — loading, triggers, gates, episode assembly, policy enforcement.
+- The bar for 1.0: spec + reference implementation + one replayable de-identified sample ledger — mechanism complete, verifiable on the spot.
 
-## 参与
+## Taking part
 
-规范讨论请提 issue（建议按「场景 → 期望 → 对应规范章节」描述）；PR 暂缓，详见 [CONTRIBUTING](CONTRIBUTING.md)。
+For spec discussion, open an issue (framed as "scenario → expectation → relevant spec section"). PRs are on
+hold for now; see [CONTRIBUTING](CONTRIBUTING.md).
 
-## 许可与商标
+## License & trademark
 
-- 代码与样例：[Apache-2.0](LICENSE)
-- 规范文本（`docs/`）：[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.zh)
-- 「Oscaware」与「OSCA」的名称及标识不在上述许可范围内；描述兼容性（如「兼容 OSCA 规范」）属合理使用，其余使用需另行授权。
+- Code & samples: [Apache-2.0](LICENSE)
+- Spec text (`docs/`): [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+- The names and marks "Oscaware" and "OSCA" are not covered by the licenses above; describing compatibility (e.g. "OSCA-compatible") is fair use — other uses require separate permission.
 
 ---
 
-<div align="center">官网：<a href="https://oscaware.com">oscaware.com</a></div>
+<div align="center">Website: <a href="https://oscaware.com">oscaware.com</a></div>
