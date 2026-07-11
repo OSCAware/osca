@@ -141,5 +141,19 @@
 - 审批配置损坏时 grant_approval 拒绝授予、status 明示 config_error/deny_all
   ——不再展示永不生效的 granted
 
+## [Review 复核 · 九轮] - 2026-07-12
+- authorize_llm 统一闸：每次 llm.complete 前查包停 + kill switch + tokens 额度——
+  在途剧集对执行中途新触发的 kill switch 不再有豁免
+- 健康档案作为安全信号的可信度收口（M3-W4 配套）：Host 校验完整契约
+  （generated_by/at/model/ledger_head、非负整数计数、total 自洽、judgments 数量、
+  red_rate 派生一致），任一不过按档案不可用；可判 0（green+red==0）= unavailable，
+  不作 0% 红灯；git 根上 ledger_head ≠ 当前 HEAD 的旧档案不采信；
+  判定改整数计数交叉相乘——四位小数派生值不再翻转严格 > 判定
+- 预算键常量上移 osca_cli.triggers（lint 与 Host Policy/Runner 单一真理源）；
+  运行时自防补齐：per_episode 出现跨层/未知键 → 额度撤销，aware.budget 出现
+  跨层/未知键 → 拒绝执行
+- 脱敏类别双份常量增加一致性锚测试（cli 枚举 vs host 正则表，漂移即红灯）
+- SPEC v0.4 §4 健康档案契约同步定稿（ledger_head/unavailable/交叉相乘/原子发布）
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC

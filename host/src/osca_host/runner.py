@@ -25,6 +25,7 @@ from datetime import datetime
 
 import yaml
 from osca_cli.llm import LLMError, resolve_llm
+from osca_cli.triggers import AWARE_BUDGET_KEYS
 
 from osca_host.connector import ConnectorProxy
 from osca_host.episode import Episode
@@ -155,6 +156,10 @@ def run_episode(
     if episode.budget is not None and not isinstance(episode.budget, dict):
         return _finish(episode, "failed", "aware.budget 形状非法（须为 mapping）——宁可拒绝，不可无硬顶执行")
     budget = episode.budget or {}
+    if unknown := sorted(k for k in budget if k not in AWARE_BUDGET_KEYS):
+        # 跨层/未知键 = 声明了没人执行的硬顶——lint 应拦，运行时自防拒绝执行（fail-closed）
+        detail = f"aware.budget 含运行时不执行的键 {unknown}（只认 {list(AWARE_BUDGET_KEYS)}）——拒绝执行"
+        return _finish(episode, "failed", detail)
 
     def budget_cap(key: str) -> int | None:
         """声明了却不可解析 = 额度撤销（0）——绕过 lint 也不许退化成无硬顶（fail-closed 自防）。"""
@@ -233,9 +238,9 @@ def run_episode(
                 detail = f"上游产物「{input_key}」缺失——流水线声明与执行不符，直接拒绝"
                 _record(episode, step_name, performer, "failed", detail)
                 return _finish(episode, "failed", detail)
-            # 额度预检：零额度/已用尽不发起调用——「额度撤销、任何调用即拒」在这里成立，
-            # 止损顶（调用后记账）只管合法正数预算的超顶
-            ok, reason = policy.precheck_tokens(episode.episode_id)
+            # 统一闸（每次 LLM 调用前）：包停 / kill switch / tokens 额度——
+            # 在途剧集对新触发的 kill switch 无豁免；零额度一次都不发起，止损顶只管超顶
+            ok, reason = policy.authorize_llm(episode.episode_id)
             if not ok:
                 return _finish(episode, "stopped", f"{reason}（剧集停）")
             if max_tokens is not None and episode.tokens_used >= max_tokens:

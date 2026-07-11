@@ -19,7 +19,13 @@ from osca_cli.package import (
     YamlFile,
     referenced_ids,
 )
-from osca_cli.triggers import parse_quantity, validate_gate, validate_trigger
+from osca_cli.triggers import (
+    AWARE_BUDGET_KEYS,
+    POLICY_BUDGET_KEYS,
+    parse_quantity,
+    validate_gate,
+    validate_trigger,
+)
 
 Rule = Callable[[OscaPackage], list[Finding]]
 RULES: list[Rule] = []
@@ -418,9 +424,6 @@ CONNECTOR_KINDS = {"mcp", "openapi", "sql_readonly", "code"}
 TRIGGER_KINDS = {"schedule", "event", "watch"}
 # 受支持的脱敏类别枚举——与参考实现 Host 的 REDACTORS 同步（合法形状但未知类别 = 脱敏静默失效）
 REDACT_CATEGORIES = {"身份证号", "手机号"}
-# 预算键按运行时真实契约拆分（SPEC v0.4 §5）：接受运行时不执行的键 = 「声明了硬顶但没人执行」的 fail-open
-AWARE_BUDGET_KEYS = ("max_steps", "max_minutes", "max_tokens")  # 剧集执行器裁决
-POLICY_BUDGET_KEYS = ("max_tool_calls", "max_tokens")  # Policy 拦截器裁决
 
 
 @rule

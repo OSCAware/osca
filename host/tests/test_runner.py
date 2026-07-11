@@ -94,6 +94,30 @@ def test_revoked_package_stops_inflight_episode(episode, loaded, proxy, policy, 
     assert episode.steps == []  # 取消点在第一步发起之前
 
 
+def test_kill_switch_mid_episode_blocks_next_llm_call(episode, loaded, proxy, policy, llm):
+    """在途剧集对新触发的 kill switch 无豁免：第一个 agent 步后触发，第二个 agent 步零调用。"""
+
+    class TripAfterFirst:
+        model = "mock"
+
+        def complete(self, system, user, tag=None):
+            reply = llm.complete(system, user, tag=tag)
+            policy.publish_kill_switch(True, "kill switch 触发：测试注入")
+            return reply
+
+    run_episode(episode, loaded, proxy, policy, llm=TripAfterFirst())
+    assert episode.status == "stopped" and "拒绝发起 LLM 调用" in episode.stop_reason
+    assert llm.calls == ["episode/生成报警候选"]  # 第二个 agent 步（裁决）一次都没调
+
+
+def test_cross_section_budget_key_refused(episode, loaded, proxy, policy, llm):
+    """aware.budget 里出现 Policy 层的键（如 max_tool_calls）——运行时自防拒绝执行。"""
+    episode.budget = {"max_tool_calls": 1}
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "failed" and "不执行的键" in episode.stop_reason
+    assert llm.calls == []
+
+
 def test_zero_token_budget_blocks_llm_call_entirely(episode, loaded, proxy, llm):
     """「额度撤销、任何调用即拒」：零额度在 llm.complete 之前预检拒绝——LLM 一次都不调。"""
     policy = PolicyInterceptor(

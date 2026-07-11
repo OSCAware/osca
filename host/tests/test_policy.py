@@ -215,14 +215,25 @@ REPLAY_POLICY = {**POLICY, "kill_switch": [{"when": "回放红灯率 > 20%"}]}
 
 
 def test_replay_red_rate_trips_kill_switch():
-    p = make(policy=REPLAY_POLICY, stats={**HEALTHY, "replay_red_rate": 0.5, "replay_at": "2026-07-11T10:00:00"})
+    p = make(
+        policy=REPLAY_POLICY, stats={**HEALTHY, "replay_green": 1, "replay_red": 1, "replay_at": "2026-07-11T10:00:00"}
+    )
     assert p.kill_tripped
-    assert "回放红灯率 50%" in p.kill_reason and "2026-07-11" in p.kill_reason
+    assert "回放红灯率 1/2" in p.kill_reason and "2026-07-11" in p.kill_reason
 
 
 def test_replay_red_rate_below_threshold_stays_quiet():
-    p = make(policy=REPLAY_POLICY, stats={**HEALTHY, "replay_red_rate": 0.1})
+    p = make(policy=REPLAY_POLICY, stats={**HEALTHY, "replay_green": 9, "replay_red": 1})
     assert not p.kill_tripped
+
+
+def test_replay_threshold_no_float_rounding():
+    """1/3 = 33.333…% > 33.33%：四位小数派生值会翻转严格 > 判定——整数计数交叉相乘不受舍入影响。"""
+    p = make(
+        policy={**POLICY, "kill_switch": [{"when": "回放红灯率 > 33.33%"}]},
+        stats={**HEALTHY, "replay_green": 2, "replay_red": 1},
+    )
+    assert p.kill_tripped
 
 
 def test_replay_health_missing_is_availability_gap_not_config_error():
@@ -232,20 +243,105 @@ def test_replay_health_missing_is_availability_gap_not_config_error():
     assert any("回放健康档案缺失" in a["reason"] for a in p.audit if a["decision"] == "warn")
 
 
-def test_replay_health_reader_conservative(tmp_path):
+def test_replay_health_reader_full_contract(tmp_path):
+    """完整契约校验：合法 JSON 但字段缺失/计数矛盾/派生率矛盾/0 可判——一律按档案不可用。"""
+    import json
+
     from osca_host.policy import replay_health
 
-    assert replay_health(tmp_path)["replay_red_rate"] is None  # 档案不存在
+    assert replay_health(tmp_path)["replay_green"] is None  # 档案不存在
 
     health = tmp_path / "indexes" / "replay-health.json"
     health.parent.mkdir()
-    health.write_text('{"red_rate": 0.25, "at": "2026-07-11T10:00:00"}', encoding="utf-8")
-    stats = replay_health(tmp_path)
-    assert stats["replay_red_rate"] == 0.25 and "2026-07-11" in stats["replay_at"]
+    ok_doc = {
+        "generated_by": "oscapipe checkup",
+        "at": "2026-07-12T10:00:00",
+        "model": "mock",
+        "ledger_head": "abc1234567890abc1234567890abc1234567890a",
+        "total": 3,
+        "green": 2,
+        "red": 1,
+        "error": 0,
+        "red_rate": 0.3333,
+    }
+    health.write_text(json.dumps(ok_doc), encoding="utf-8")
+    stats = replay_health(tmp_path)  # tmp_path 非 git 根：ledger_head 无从校验，诚实接受
+    assert stats["replay_green"] == 2 and stats["replay_red"] == 1 and "2026-07-12" in stats["replay_at"]
 
-    for bad in ("不是 JSON{{{", '{"red_rate": "多"}', '{"red_rate": 1.5}', '{"red_rate": true}', '["形状不对"]'):
-        health.write_text(bad, encoding="utf-8")
-        assert replay_health(tmp_path)["replay_red_rate"] is None, bad  # 损坏/越界一律保守
+    bad_docs = [
+        {"red_rate": 0},  # 九轮病灶：最小合法 JSON 曾被采信
+        {**ok_doc, "ledger_head": ""},
+        {k: v for k, v in ok_doc.items() if k != "ledger_head"},
+        {**ok_doc, "total": 9},  # 计数不自洽
+        {**ok_doc, "red_rate": 0.25},  # 派生率与计数矛盾——档案不可信
+        {**ok_doc, "green": True, "total": 2},  # bool 不是计数
+        {**ok_doc, "green": 0, "red": 0, "error": 3, "red_rate": 0.0},  # 0/0 = unavailable，不是 0% 健康
+        {**ok_doc, "judgments": {"J-1": {}}},  # judgments 数量与 total 不符
+    ]
+    for doc in bad_docs:
+        health.write_text(json.dumps(doc), encoding="utf-8")
+        assert replay_health(tmp_path)["replay_green"] is None, doc
+    for raw in ("不是 JSON{{{", '["形状不对"]'):
+        health.write_text(raw, encoding="utf-8")
+        assert replay_health(tmp_path)["replay_green"] is None, raw
+
+
+def test_replay_health_rejected_when_ledger_advances(tmp_path):
+    """git 根：ledger_head ≠ 当前 HEAD → 账本已前进，旧档案不作安全信号。"""
+    import json
+    import subprocess
+
+    from osca_host.policy import replay_health
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "测试")
+    (tmp_path / "a.txt").write_text("1", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "1")
+    head = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+
+    health = tmp_path / "indexes" / "replay-health.json"
+    health.parent.mkdir()
+    doc = {
+        "generated_by": "oscapipe checkup",
+        "at": "2026-07-12T10:00:00",
+        "model": "mock",
+        "ledger_head": head,
+        "total": 1,
+        "green": 1,
+        "red": 0,
+        "error": 0,
+    }
+    health.write_text(json.dumps(doc), encoding="utf-8")
+    assert replay_health(tmp_path)["replay_green"] == 1  # HEAD 匹配 → 采信
+
+    (tmp_path / "a.txt").write_text("2", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "2")
+    assert replay_health(tmp_path)["replay_green"] is None  # 账本前进 → 不采信
+
+
+def test_policy_budget_cross_or_unknown_keys_revoke_quota():
+    """跨层/未知预算键（max_steps/banana 落在 per_episode）——运行时自防同样撤额，不依赖 lint。"""
+    p = make(policy={**POLICY, "budgets": {"per_episode": {"max_steps": 0, "banana": 0}}})
+    assert p.max_tool_calls == 0 and p.max_tokens == 0
+    assert not p.precheck_tokens("EP-1")[0]
+    assert any("不执行的键" in a["reason"] for a in p.audit)
+
+
+def test_redact_enum_synced_with_lint():
+    """脱敏类别双份常量的一致性锚（cli 枚举 vs host 正则表）——漂移即红灯，后续上移单一真理源。"""
+    from osca_cli.rules import REDACT_CATEGORIES
+
+    from osca_host.policy import REDACTORS
+
+    assert set(REDACT_CATEGORIES) == set(REDACTORS)
 
 
 def test_sample_pack_replay_condition_now_evaluable(sample_pack):
@@ -253,5 +349,5 @@ def test_sample_pack_replay_condition_now_evaluable(sample_pack):
     import yaml as _yaml
 
     policy_doc = _yaml.safe_load((sample_pack / "policy.yaml").read_text(encoding="utf-8"))
-    p = PolicyInterceptor("demo", policy_doc, {"confirmed": 9, "overruled": 0, "replay_red_rate": 0.5})
+    p = PolicyInterceptor("demo", policy_doc, {"confirmed": 9, "overruled": 0, "replay_green": 1, "replay_red": 1})
     assert p.kill_tripped and "回放红灯率" in p.kill_reason

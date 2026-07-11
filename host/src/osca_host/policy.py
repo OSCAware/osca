@@ -28,10 +28,14 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from osca_cli.triggers import parse_quantity  # 数量记法单一真理源（SPEC v0.4 §5，lint OSCA040 同源）
+from osca_cli.triggers import (  # 数量记法与预算键的单一真理源（SPEC v0.4 §5，lint OSCA040 同源）
+    POLICY_BUDGET_KEYS,
+    parse_quantity,
+)
 
 __all__ = ["PolicyInterceptor", "REDACTORS", "ledger_stats", "parse_quantity", "replay_health"]
 
@@ -100,6 +104,12 @@ class PolicyInterceptor:
             )
             self.max_tool_calls: int | None = 0
             self.max_tokens: int | None = 0
+        elif unknown := sorted(k for k in per_episode if k not in POLICY_BUDGET_KEYS):
+            # 跨层/未知键（如 max_steps、banana）= 声明了没人执行的硬顶——运行时自防同样撤额，不依赖 lint
+            detail = f"per_episode 含运行时不执行的键 {unknown}（只认 {list(POLICY_BUDGET_KEYS)}）——额度撤销（0）"
+            self._record("deny", "budgets", "、".join(unknown), detail)
+            self.max_tool_calls = 0
+            self.max_tokens = 0
         else:
 
             def quantity_or_revoke(key: str) -> int | None:
@@ -209,17 +219,19 @@ class PolicyInterceptor:
                 continue
 
             # 回放红灯率：数据源是回放器生成的健康档案缓存（SPEC v0.4 §4 契约）。
-            # 档案缺失/损坏 = 数据可用性缺口 → 保守不生效留痕，不是配置错误不停机。
-            rate = stats.get("replay_red_rate")
-            if rate is None:
+            # 档案缺失/损坏/契约不符/与账本版本不符 = 数据可用性缺口 → 保守不生效留痕，不是配置错误不停机。
+            green, red = stats.get("replay_green"), stats.get("replay_red")
+            if green is None or red is None:
                 self._warn_once(
                     condition,
-                    "回放健康档案缺失或不可读（indexes/replay-health.json，由回放器 checkup 生成）——条件不生效",
+                    "回放健康档案缺失、契约不符或与账本版本不符（indexes/replay-health.json）——条件不生效",
                 )
                 continue
-            if rate * 100 > threshold:
+            # 交叉相乘判定，无浮点舍入：red/(green+red) > X%  ⇔  red*100 > X*(green+red)
+            # （四位小数的派生 red_rate 会把 33.333…% 舍成 33.33%、翻转严格 > 判定——计数才是数据源）
+            if red * 100 > threshold * (green + red):
                 stamp = stats.get("replay_at") or "时间未知"
-                reason = f"kill switch 触发：回放红灯率 {rate:.0%} > {replay.group(1)}%（健康档案 {stamp}）"
+                reason = f"kill switch 触发：回放红灯率 {red}/{green + red} > {replay.group(1)}%（健康档案 {stamp}）"
                 self._record("deny", "kill_switch", condition, reason)
                 return True, reason
         return False, ""
@@ -263,6 +275,18 @@ class PolicyInterceptor:
         if tool not in allowed:
             return self._deny(step, tool, f"步骤「{step}」白名单不含 {tool}（模型越权，直接拒绝）")
         return self._allow(step, tool, "白名单放行")
+
+    def authorize_llm(self, episode_id: str) -> tuple[bool, str]:
+        """每次 llm.complete 前的统一闸：包停 / kill switch / tokens 额度一起查。
+
+        在途剧集对**新触发**的 kill switch 无豁免——只在步间查 revoked 会漏掉
+        执行中途被健康度重算触发的停机（Review 九轮实测：第二条 Agent 步照常调用）。
+        """
+        if self.revoked:
+            return self._deny(None, episode_id, f"包已停：{self.revoked}——拒绝发起 LLM 调用")
+        if self.kill_tripped:
+            return self._deny(None, episode_id, f"{self.kill_reason}——拒绝发起 LLM 调用")
+        return self.precheck_tokens(episode_id)
 
     def precheck_tokens(self, episode_id: str) -> tuple[bool, str]:
         """LLM 调用前的额度预检：额度已尽（含配置错误撤销成 0 的额度）就不发起调用。
@@ -407,11 +431,19 @@ def ledger_stats(pack) -> dict:
 def replay_health(root: Path | str) -> dict:
     """回放健康档案 indexes/replay-health.json（回放器生成的缓存，契约见 SPEC v0.4 §4）。
 
-    缺失/损坏/形状越界（red_rate 须为 [0,1] 数值）→ rate 为 None：条件不生效留痕
-    （公理 A4：缓存坏了可重建；安全条件的输入缺口走保守默认，绝不许炸装载）。
+    完整契约校验（Review 九轮）——任一不过一律按档案不可用处理（保守不生效留痕，公理 A4）：
+    - generated_by/at/model/ledger_head 必须是非空字符串；
+    - green/red/error 必须是非负整数（bool 不算），且 total == 三者之和；
+    - judgments 在场时必须是数量等于 total 的 mapping；
+    - red_rate 是派生字段、不作数据源——在场则校验与计数一致，矛盾即不可信；
+    - 可判数 0（green+red==0）= unavailable：0/0 不是健康，不给 kill switch 当 0%；
+    - 包根是 git 仓库时 ledger_head 必须等于当前 HEAD——账本已前进的旧档案不作安全信号
+      （非 git 根无从校验，诚实接受；checkup 只在 git 账本上运行，此路径实际不产档案）。
+    判定数据源是整数计数（交叉相乘无舍入），不是浮点 red_rate。
     """
-    path = Path(root) / "indexes" / "replay-health.json"
-    absent = {"replay_red_rate": None, "replay_at": None}
+    root = Path(root)
+    path = root / "indexes" / "replay-health.json"
+    absent = {"replay_green": None, "replay_red": None, "replay_at": None}
     if not path.is_file():
         return absent
     try:
@@ -420,8 +452,31 @@ def replay_health(root: Path | str) -> dict:
         return absent
     if not isinstance(data, dict):
         return absent
-    rate = data.get("red_rate")
-    if isinstance(rate, bool) or not isinstance(rate, int | float) or not 0 <= rate <= 1:
+    for key in ("generated_by", "at", "model", "ledger_head"):
+        if not isinstance(data.get(key), str) or not data[key].strip():
+            return absent
+    counts: dict[str, int] = {}
+    for key in ("green", "red", "error", "total"):
+        value = data.get(key)
+        if type(value) is not int or value < 0:
+            return absent
+        counts[key] = value
+    if counts["total"] != counts["green"] + counts["red"] + counts["error"]:
         return absent
-    stamp = data.get("at")
-    return {"replay_red_rate": float(rate), "replay_at": str(stamp) if stamp else None}
+    judgments = data.get("judgments")
+    if judgments is not None and (not isinstance(judgments, dict) or len(judgments) != counts["total"]):
+        return absent
+    decidable = counts["green"] + counts["red"]
+    rate = data.get("red_rate")
+    if rate is not None:
+        if isinstance(rate, bool) or not isinstance(rate, int | float):
+            return absent
+        expected = round(counts["red"] / decidable, 4) if decidable else 0.0
+        if abs(float(rate) - expected) > 1e-9:
+            return absent  # 派生字段与计数矛盾——档案不可信
+    if decidable == 0:
+        return absent  # unavailable：全部不可回放不是「0% 红灯」
+    proc = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True)
+    if proc.returncode == 0 and proc.stdout.strip() != data["ledger_head"]:
+        return absent  # 账本已前进——旧档案不作安全信号
+    return {"replay_green": counts["green"], "replay_red": counts["red"], "replay_at": data["at"]}
