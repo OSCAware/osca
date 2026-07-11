@@ -298,6 +298,55 @@ async def test_wakeup_refused_on_broken_ledger(running_host, sample_pack, deploy
     assert (await _send({"cmd": "episodes"}, host))["episodes"] == []  # 半截账本不装配
 
 
+async def test_refresh_exception_refuses_wakeup_and_callback_survives(running_host, sample_pack, deploy, monkeypatch):
+    """刷新是安全边界：磁盘满等普通异常不许穿透 trigger 回调——拒绝本次唤醒，故障修复后照常。"""
+    import osca_host.host as host_mod
+
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    pid = "demo-group-oper-diagnosis"
+
+    def disk_full(root, pkg=None):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(host_mod, "rebuild_index", disk_full)
+    response = await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    assert response["ok"]  # 发射本身干净返回——异常没有穿透控制通道
+    assert (await _send({"cmd": "episodes"}, host))["episodes"] == []  # 唤醒被拒，旧快照保留
+
+    monkeypatch.undo()  # 「修好磁盘」后无需任何干预即自然恢复
+    await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    assert len((await _send({"cmd": "episodes"}, host))["episodes"]) == 1
+
+
+async def test_enable_failure_rolls_back_and_stays_retryable(running_host, sample_pack, deploy, monkeypatch):
+    """enable 全部订阅成功才置位：半路失败即补偿回滚，不留「显示启用、实际半布防」，且可重试修复。"""
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    pid = "demo-group-oper-diagnosis"
+    await _send({"cmd": "disable", "package_id": pid, "aware_id": "AW-001"}, host)
+
+    original = host.table.subscribe
+    calls = {"n": 0}
+
+    def flaky(kind, spec, sub):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("布防失败（测试注入）")
+        return original(kind, spec, sub)
+
+    monkeypatch.setattr(host.table, "subscribe", flaky)
+    response = await _send({"cmd": "enable", "package_id": pid, "aware_id": "AW-001"}, host)
+    assert not response["ok"] and "补偿回滚" in response["detail"]
+    status = await _send({"cmd": "status"}, host)
+    assert status["triggers"] == []  # 已布防的第一条也撤了
+    assert [w["state"] for w in status["packages"][0]["watchers"]] == ["disabled"] * 3
+
+    monkeypatch.undo()  # 「修复故障」后重试即成——不会被幂等挡回
+    response = await _send({"cmd": "enable", "package_id": pid, "aware_id": "AW-001"}, host)
+    assert response["ok"] and "重新布防 3 条" in response["detail"]
+
+
 async def test_arming_failure_rolls_back_registration(running_host, sample_pack, monkeypatch):
     """发布与布防同生共死：第二条订阅失败 → 补偿回滚，注册表/笼子/闸门/watcher 零残留。"""
     host = running_host

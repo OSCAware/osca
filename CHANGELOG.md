@@ -74,5 +74,16 @@
 - 签名表缓存形状校验：合法 YAML 但形状不对（顶层 list / entry 非 mapping）同样视为
   缓存损坏——oscapipe 检索重建不炸，Host 装配退化空桶（包才是真理）
 
+## [Review 复核 · 四轮] - 2026-07-11
+- 刷新安全边界收口：磁盘满/权限/索引重建失败等普通异常不再穿透 trigger 回调
+  （穿透会杀死共享 watcher 循环）——记完整异常、拒绝本次唤醒，故障修复后自然恢复；
+  TriggerTable 派发对订阅方异常各自隔离（`_fire` 逐个 try，人工发射转人话错误）
+- 装配签名表与快照同源：`signature_entries` 上移公仓（rebuild_index 与 Host 共用），
+  装配不再读磁盘缓存——坏缓存不可能把判断静默清空（fail-open），TOCTOU 窗口消除
+- enable 补偿回滚：全部订阅成功才置 enabled，半路失败撤已布防部分、保持停用可重试
+  ——不再留下「显示启用、实际半布防」且被幂等挡住的死角
+- oscapipe 签名表形状校验补严：先取原值再验 `isinstance(list)`——
+  `judgments: {}/""/0/false/null` 等 falsy 变体不再被吞成合法空表
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC

@@ -58,6 +58,13 @@ def test_episode_metadata(episode):
     assert summary["objects"] == ["OBJ-001", "OBJ-002", "OBJ-003"]
 
 
+def test_assembly_reads_pack_not_disk_cache(loaded):
+    """签名表与已校验快照同源：磁盘缓存写坏/清空都不影响装配——绝不 fail-open 静默清空判断。"""
+    (loaded.root / "indexes" / "judgments.index.yaml").write_text("- not-a-table\n", encoding="utf-8")
+    judgments = retrieve_judgments(loaded, "AW-001", {"OBJ-002"})
+    assert [j["judgment_id"] for j in judgments] == ["J-0417", "J-0423"]
+
+
 def test_assembly_is_deterministic(loaded):
     aware = next(a for a in loaded.awares if a.aware_id == "AW-001")
     a = assemble("EP-0001", loaded, aware, "AW-001/T3")

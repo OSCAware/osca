@@ -115,14 +115,22 @@ class TriggerTable:
                     if watcher.kind != "event":
                         return f"{trigger_id} 是 {watcher.kind} 触发，仅 event 可人工发射"
                     watcher.fires += 1
-                    sub.deliver(sub.trigger_id)
+                    try:
+                        sub.deliver(sub.trigger_id)
+                    except Exception as e:
+                        log.exception(f"人工发射派发异常：{trigger_id}")
+                        return f"发射派发异常：{e}（watcher 存活，详见 Host 日志）"
                     return None
         return f"触发原语未布防：{package_id} 的 {trigger_id}"
 
     def _fire(self, watcher: Watcher) -> None:
         watcher.fires += 1
         for sub in list(watcher.subs):
-            sub.deliver(sub.trigger_id)
+            try:
+                sub.deliver(sub.trigger_id)
+            except Exception:
+                # 订阅方异常各自隔离——一个包的故障不许杀掉共享 watcher 的循环任务、不许殃及同伴
+                log.exception(f"派发异常：{sub.trigger_id}（watcher {watcher.key} 继续存活）")
 
     # ── watcher 编译（装载时；语法已过 lint，此处解析必须成功） ──────
 

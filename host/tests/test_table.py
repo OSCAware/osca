@@ -14,6 +14,24 @@ def sub(package_id: str, aware_id: str, tid: str, hits: list[str]) -> Subscripti
     return Subscription(package_id, aware_id, tid, hits.append)
 
 
+async def test_fire_isolates_subscriber_exceptions():
+    """订阅方异常各自隔离：一个包的派发故障不许杀掉共享 watcher、不许殃及同伴。"""
+    table, hits = TriggerTable(), []
+
+    def bad(trigger_id):
+        raise RuntimeError("订阅方故障（测试注入）")
+
+    watcher = table.subscribe("event", {"source": "op"}, Subscription("p1", "AW-001", "AW-001/T3", bad))
+    table.subscribe("event", {"source": "op"}, Subscription("p2", "AW-001", "AW-001/T3", hits.append))
+    table._fire(watcher)
+    assert hits == ["AW-001/T3"]  # 同伴照常收到派发
+    assert table.watchers  # watcher 存活
+
+    error = table.fire_manual("p1", "AW-001/T3")  # 人工发射路径：异常转人话错误，不穿透控制通道
+    assert error is not None and "派发异常" in error
+    table.shutdown()
+
+
 async def test_arm_failure_leaves_no_empty_watcher(monkeypatch):
     """_arm 失败必须撤掉刚建的 watcher——零订阅的僵尸槽位会永久占住去重键。"""
     import pytest

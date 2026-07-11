@@ -17,8 +17,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
-import yaml
 from osca_cli.package import referenced_ids
+from osca_cli.packer import signature_entries
 
 from osca_host.loader import AwareDecl, LoadedPackage
 
@@ -68,18 +68,13 @@ class Episode:
 
 
 def _signature_table(loaded: LoadedPackage) -> list[dict]:
-    """签名表：装载五步的最后一步重建，是判断检索的硬过滤输入（indexes/ 属缓存，不在 pack 内）。
+    """签名表直接从已校验的 loaded.pack 生成（osca_cli.packer.signature_entries，单一真理源）。
 
-    形状防御：缓存可能被外部写坏（合法 YAML 但顶层不是 mapping）——检索退化为空桶，
-    包才是真理（唤醒路径每次刷新时都会重建本表）。
+    不读磁盘缓存：装配用的判断集与快照同源——坏缓存不可能把判断静默清空（fail-open），
+    也没有「刷新完成 → 装配读盘」的 TOCTOU 窗口。磁盘 indexes/ 缓存仍由装载与唤醒刷新
+    重建，那是给检索器（oscapipe）与人看的。
     """
-    index_path = loaded.root / "indexes" / "judgments.index.yaml"
-    try:
-        data = yaml.safe_load(index_path.read_text(encoding="utf-8"))
-    except yaml.YAMLError:
-        return []
-    table = data.get("judgments") if isinstance(data, dict) else None
-    return [e for e in table if isinstance(e, dict)] if isinstance(table, list) else []
+    return signature_entries(loaded.pack)
 
 
 def _by_id(loaded: LoadedPackage, dirname: str) -> dict[str, dict]:

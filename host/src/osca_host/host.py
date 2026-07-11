@@ -184,16 +184,25 @@ class Host:
         aware = next(a for a in pkg.awares if a.aware_id == aware_id)
         if enabled and gate.enabled:
             return {"ok": True, "detail": f"{aware_id} 已是启用状态——幂等，不重复布防（防止双份订阅双份唤醒）"}
-        gate.enabled = enabled
         if enabled:
-            for t in aware.triggers:
-                self.table.subscribe(
-                    t.kind,
-                    t.spec,
-                    Subscription(package_id, aware_id, t.trigger_id, self._make_deliver(package_id, aware_id)),
-                )
+            # 全部订阅成功才置 enabled：任一条失败即补偿回滚——不留「显示启用、实际半布防」的 Aware
+            try:
+                for t in aware.triggers:
+                    self.table.subscribe(
+                        t.kind,
+                        t.spec,
+                        Subscription(package_id, aware_id, t.trigger_id, self._make_deliver(package_id, aware_id)),
+                    )
+            except Exception as e:
+                self.table.unsubscribe(package_id, aware_id)  # 撤已布防的部分
+                self._sync_slots(package_id)
+                detail = f"触发器启失败：{e}——已补偿回滚（撤已布防部分），{aware_id} 保持停用、可重试"
+                log.error(detail)
+                return {"ok": False, "detail": detail}
+            gate.enabled = True
             detail = f"触发器启：{aware_id} 重新布防 {len(aware.triggers)} 条"
         else:
+            gate.enabled = False
             removed = self.table.unsubscribe(package_id, aware_id)
             detail = f"触发器停：{aware_id} 撤防 {len(removed)} 条（三级停之二）"
         self._sync_slots(package_id)
@@ -245,6 +254,11 @@ class Host:
                 stats = ledger_stats(fresh)
         except LedgerLockBusy:
             log.warning(f"[{loaded.package_id}] 账本写锁被占用（写入者事务进行中）——保留旧快照")
+            return False
+        except Exception:
+            # 刷新是安全边界：磁盘满/权限/索引重建失败等一律不许穿透——穿透会杀死
+            # 共享 watcher 的循环任务，修好磁盘也不会自然再试。留完整异常，拒绝本次唤醒。
+            log.exception(f"[{loaded.package_id}] 账本刷新异常——保留旧快照，本次唤醒拒绝")
             return False
         loaded.pack = fresh  # 原子替换：校验/索引/统计全部成功之后才动快照
         policy.refresh_kill_switch(stats)

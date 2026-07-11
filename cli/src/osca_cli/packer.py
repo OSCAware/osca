@@ -209,12 +209,12 @@ def verify_checksums(root: Path, result: OpResult) -> bool:
     return ok
 
 
-def rebuild_index(root: Path, pkg=None) -> Path:
-    """重建判断签名表（检索契约 §7 第 1 段的硬过滤输入）。索引是缓存，坏了随时重建（公理 A4）。
+def signature_entries(pkg) -> list[dict]:
+    """判断签名表条目（检索硬过滤的输入形状）——rebuild_index 与 Host 装配共用。
 
-    pkg 可传入已解析的 OscaPackage 复用（调用方刚解析过时省一次全包解析）。
+    Host 装配直接调用本函数从已校验的包快照生成，不读磁盘缓存：坏缓存不可能把
+    判断静默清空（fail-open），也没有「刷新完成 → 装配读盘」的 TOCTOU 窗口。
     """
-    pkg = pkg if pkg is not None else load_package(root)
     entries = []
     for f in pkg.typed_files("judgments"):
         sig = f.mapping.get("signature") or {}
@@ -229,10 +229,19 @@ def rebuild_index(root: Path, pkg=None) -> Path:
                 "trust": meta.get("trust"),
             }
         )
+    return sorted(entries, key=lambda e: e["judgment_id"] or "")
+
+
+def rebuild_index(root: Path, pkg=None) -> Path:
+    """重建判断签名表（检索契约 §7 第 1 段的硬过滤输入）。索引是缓存，坏了随时重建（公理 A4）。
+
+    pkg 可传入已解析的 OscaPackage 复用（调用方刚解析过时省一次全包解析）。
+    """
+    pkg = pkg if pkg is not None else load_package(root)
     index = {
         "generated_by": f"osca load {__version__}",
         "note": "机器生成的缓存，人不手写；坏了删掉重建（公理 A4）",
-        "judgments": sorted(entries, key=lambda e: e["judgment_id"] or ""),
+        "judgments": signature_entries(pkg),
     }
     index_path = root / "indexes" / "judgments.index.yaml"
     index_path.parent.mkdir(parents=True, exist_ok=True)
