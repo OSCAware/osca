@@ -1,8 +1,9 @@
 """Host 进程：确定性常驻，无 LLM（架构 §4）。
 
-W2 形态：注册表 + 触发表（定时器/轮询器布防）+ 闸门 + 控制通道。
-三级停已可演示两级：包停（unload）、触发器停（disable 单 Aware）。
-剧集停（budget 硬顶）随 W3 剧集执行落地。
+W3 形态：注册表 + 触发表 + 闸门 + 剧集装配器 + 控制通道。
+过闸唤醒 → 装配一次性上下文进剧集台账（执行属 W5）。
+三级停已可演示两级：包停（unload）、触发器停（disable 单 Aware）；
+剧集停（budget 硬顶）随 W5 剧集执行落地。
 """
 
 from __future__ import annotations
@@ -11,10 +12,12 @@ import asyncio
 import contextlib
 import logging
 import signal
+from collections import OrderedDict
 from pathlib import Path
 
 from osca_host import __version__
 from osca_host.control import ControlServer
+from osca_host.episode import Episode, assemble
 from osca_host.gate import Gate
 from osca_host.loader import load_for_host
 from osca_host.registry import Registry, RegistryError
@@ -22,12 +25,16 @@ from osca_host.triggers import Subscription, TriggerTable
 
 log = logging.getLogger("osca-host")
 
+EPISODE_LEDGER_CAP = 100  # 剧集台账只留近期；持久归档随 W5 对账器落地
+
 
 class Host:
     def __init__(self, socket_path: Path):
         self.registry = Registry()
         self.table = TriggerTable()
         self.gates: dict[tuple[str, str], Gate] = {}  # (package_id, aware_id) → Gate
+        self.episodes: OrderedDict[str, Episode] = OrderedDict()  # 剧集台账（近期）
+        self._episode_seq = 0
         self.control = ControlServer(socket_path, self.handle)
         self._stop = asyncio.Event()
 
@@ -51,6 +58,13 @@ class Host:
                 return self._set_aware(str(request.get("package_id")), str(request.get("aware_id")), cmd == "enable")
             if cmd == "fire":
                 return self._fire(str(request.get("package_id")), str(request.get("trigger_id")))
+            if cmd == "episodes":
+                return {"ok": True, "episodes": [ep.summary() for ep in self.episodes.values()]}
+            if cmd == "episode":
+                episode = self.episodes.get(str(request.get("episode_id")))
+                if episode is None:
+                    return {"ok": False, "detail": f"剧集不存在（台账只留近期 {EPISODE_LEDGER_CAP} 条）"}
+                return {"ok": True, "episode": episode.dump()}
             if cmd == "stop":
                 log.info("收到 stop 命令，开始关停")
                 self._stop.set()
@@ -136,8 +150,26 @@ class Host:
                 return
             woke, verdict = gate.on_trigger(trigger_id)
             log.info(f"[{package_id}/{aware_id}] {trigger_id} 命中 → {verdict}")
+            if woke:
+                self._assemble_episode(package_id, aware_id, trigger_id)
 
         return deliver
+
+    def _assemble_episode(self, package_id: str, aware_id: str, trigger_id: str) -> None:
+        loaded = self.registry.packages.get(package_id)
+        if loaded is None:
+            return
+        aware = next(a for a in loaded.awares if a.aware_id == aware_id)
+        self._episode_seq += 1
+        episode = assemble(f"EP-{self._episode_seq:04d}", loaded, aware, trigger_id)
+        self.episodes[episode.episode_id] = episode
+        while len(self.episodes) > EPISODE_LEDGER_CAP:
+            self.episodes.popitem(last=False)
+        s = episode.summary()
+        log.info(
+            f"剧集 {episode.episode_id} 装配完成：判断 {len(s['judgments'])} 条（{', '.join(s['judgments'])}）"
+            f" / 对象 {len(s['objects'])} 个 / 预算 {episode.budget}（执行属 W5，本周只装配）"
+        )
 
     def _sync_slots(self, package_id: str) -> None:
         """注册表槽位状态跟随布防事实：armed（已挂 watcher/待人工发射）或 disabled。"""

@@ -123,3 +123,28 @@ async def test_w2_trigger_stop_and_manual_fire(running_host, sample_pack):
     # 非 event 不可人工发射(纪律)
     response = await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T1"}, host)
     assert not response["ok"]
+
+
+async def test_w3_wake_assembles_episode(running_host, sample_pack):
+    """W3 验收路径:发射 → 唤醒 → 剧集装配进台账 → 完整上下文可导出。"""
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack)}, host)
+    pid = "demo-group-oper-diagnosis"
+
+    response = await _send({"cmd": "episodes"}, host)
+    assert response["ok"] and response["episodes"] == []  # 唤醒前台账为空
+
+    await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    response = await _send({"cmd": "episodes"}, host)
+    (summary,) = response["episodes"]
+    assert summary["episode_id"] == "EP-0001"
+    assert summary["fired_trigger"] == "AW-001/T3"
+    assert summary["judgments"] == ["J-0417", "J-0423"]
+
+    response = await _send({"cmd": "episode", "episode_id": "EP-0001"}, host)
+    ctx = response["episode"]["context"]
+    assert ctx["structure"]["structure_id"] == "STR-001"
+    assert "policy" not in ctx  # 公理 A5:模型不读笼子
+
+    response = await _send({"cmd": "episode", "episode_id": "EP-9999"}, host)
+    assert not response["ok"]

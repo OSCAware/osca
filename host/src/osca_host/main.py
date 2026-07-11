@@ -52,6 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_fire.add_argument("package_id")
     p_fire.add_argument("trigger_id", help="全局触发 ID，如 AW-001/T3")
 
+    sub.add_parser("episodes", help="剧集台账：近期唤醒装配的剧集摘要")
+
+    p_episode = sub.add_parser("episode", help="导出一个剧集的完整一次性上下文")
+    p_episode.add_argument("episode_id", help="剧集 ID，如 EP-0001")
+
     sub.add_parser("stop", help="关停 Host（等价于全体包停后退出）")
 
     return parser
@@ -59,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _client(request: dict, socket_path: Path) -> int:
     response = send_command(request, socket_path)
-    if request["cmd"] == "status" and response.get("ok"):
+    if request["cmd"] in ("status", "episodes", "episode") and response.get("ok"):
         print(json.dumps(response, ensure_ascii=False, indent=2))
     else:
         detail = response.get("detail", "")
@@ -92,6 +97,10 @@ def main(argv: list[str] | None = None) -> int:
         return _client({"cmd": args.command, "package_id": args.package_id, "aware_id": args.aware_id}, args.socket)
     if args.command == "fire":
         return _client({"cmd": "fire", "package_id": args.package_id, "trigger_id": args.trigger_id}, args.socket)
+    if args.command == "episodes":
+        return _client({"cmd": "episodes"}, args.socket)
+    if args.command == "episode":
+        return _client({"cmd": "episode", "episode_id": args.episode_id}, args.socket)
     if args.command == "stop":
         return _client({"cmd": "stop"}, args.socket)
 

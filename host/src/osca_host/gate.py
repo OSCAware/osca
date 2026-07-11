@@ -58,7 +58,7 @@ class Gate:
         note = "precondition 未求值（W4 Connector 后接管），默认放行；" if self.precondition else ""
         self.wakes += 1
         self.last_wake = now
-        return True, f"{note}唤醒 → 装配 {self.aware.then}（剧集装配 W3 接管，本周记账）"
+        return True, f"{note}唤醒 → 装配 {self.aware.then}"
 
     def snapshot(self) -> dict:
         return {

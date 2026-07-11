@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from osca_cli.package import load_package
+from osca_cli.package import OscaPackage, load_package
 from osca_cli.packer import OpResult, load_osca
 
 
@@ -32,6 +32,8 @@ class AwareDecl:
     triggers: list[TriggerDecl]
     gate: dict  # combine/precondition/debounce/on_fail，W2 闸门编译输入
     then: str | None  # 唤醒后装配的 structure 引用
+    discretion: str = ""  # 有界主动的裁量说明，进剧集上下文
+    budget: dict = field(default_factory=dict)  # 剧集预算（max_steps/max_minutes/max_tokens）
 
 
 @dataclass
@@ -43,14 +45,14 @@ class LoadedPackage:
     format_version: str
     root: Path
     awares: list[AwareDecl] = field(default_factory=list)
+    pack: OscaPackage | None = field(default=None, repr=False)  # 装载时解析的包内容（装载态即运行态）
 
     @property
     def trigger_count(self) -> int:
         return sum(len(a.triggers) for a in self.awares)
 
 
-def _parse_awares(root: Path) -> list[AwareDecl]:
-    pkg = load_package(root)
+def _parse_awares(pkg: OscaPackage) -> list[AwareDecl]:
     awares: list[AwareDecl] = []
     for f in pkg.typed_files("aware"):
         aware_id = f.mapping.get("aware_id") or f.relpath
@@ -75,6 +77,8 @@ def _parse_awares(root: Path) -> list[AwareDecl]:
                 triggers=triggers,
                 gate=f.mapping.get("gate") or {},
                 then=f.mapping.get("then"),
+                discretion=str(f.mapping.get("discretion", "")),
+                budget=f.mapping.get("budget") or {},
             )
         )
     return awares
@@ -93,14 +97,16 @@ def load_for_host(
     if not result.ok or root is None:
         return result, None
 
-    manifest = load_package(root).yaml_files.get("osca.yaml")
+    pack = load_package(root)
+    manifest = pack.yaml_files.get("osca.yaml")
     m = manifest.mapping if manifest else {}
     loaded = LoadedPackage(
         package_id=str(m.get("package_id", root.name)),
         name=str(m.get("name", "")),
         format_version=str(m.get("format_version", "")),
         root=root,
-        awares=_parse_awares(root),
+        awares=_parse_awares(pack),
+        pack=pack,
     )
     result.step(f"运行时结构解析完成：Aware {len(loaded.awares)} 个，触发原语 {loaded.trigger_count} 条（W2 编译布防）")
     return result, loaded
