@@ -65,6 +65,7 @@ osca/
 ├── docs/OSCA-LINT-RULES.md       # lint 规则清单（账本纪律的机器化）
 ├── examples/oper-diagnosis.osca/  # 完整脱敏样例包（含 supersedes 链与口述 case）
 ├── cli/                           # osca lint / pack / load（三件套可用）
+├── host/                          # 运行框架 Host 参考实现（进行中：装载/注册表已通，触发表在路上）
 ├── site/                          # oscaware.com 单页源文件
 ├── CONTRIBUTING.md                # pre-1.0 参与方式
 └── CHANGELOG.md

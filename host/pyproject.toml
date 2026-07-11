@@ -1,0 +1,43 @@
+[project]
+name = "osca-host"
+version = "0.1.0"
+description = "OSCA 运行框架 Host 参考实现——确定性常驻进程，无 LLM（架构 §4）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Oscaware" }]
+dependencies = [
+    "osca-cli",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+osca-host = "osca_host.main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[tool.uv.sources]
+osca-cli = { path = "../cli", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/osca_host"]
+
+[tool.ruff]
+line-length = 120  # 诊断消息为中文长句，100 列放不下
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

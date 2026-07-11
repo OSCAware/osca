@@ -71,6 +71,7 @@ osca/
 ├── docs/OSCA-LINT-RULES.md        # lint rule catalogue (ledger discipline, machine-enforced)
 ├── examples/oper-diagnosis.osca/  # a full de-identified sample pack (with supersedes chains and spoken-language cases)
 ├── cli/                           # osca lint / pack / load (all three working)
+├── host/                          # runtime host reference implementation (in progress: loader/registry done, triggers next)
 ├── site/                          # oscaware.com single-page source
 ├── CONTRIBUTING.md                # how to take part, pre-1.0
 └── CHANGELOG.md

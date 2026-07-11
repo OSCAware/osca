@@ -44,16 +44,17 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.10", "3.12"]
+        package: [cli, host]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: ruff 检查
-        working-directory: cli
+        working-directory: ${{ matrix.package }}
         run: |
           uv run ruff check src tests
           uv run ruff format --check src tests
       - name: 测试
-        working-directory: cli
+        working-directory: ${{ matrix.package }}
         run: uv run pytest -q
