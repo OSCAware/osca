@@ -396,6 +396,7 @@ def test_legal_shape_illegal_value_rejected(make_pkg, base):
         ("policy.yaml", "kill_switch", [{"when": ["not", "string"]}]),  # truthy 非字符串
         ("policy.yaml", "budgets", {"per_episode": {"max_tool_calls": "unlimited"}}),  # 记法非法 → 无限额
         ("policy.yaml", "budgets", {"per_episode": {"max_tokens": -5}}),
+        ("policy.yaml", "budgets", {"per_epiosde": {"max_tokens": 1}}),  # 外层拼写错误 → 静默无限额
         ("aware/AW-001-定时.yaml", "budget", {"max_steps": "很多步"}),
         ("policy.yaml", "permissions", [{"step": "取数"}]),  # 缺 allow——白名单必须显式
         ("structure.yaml", "pipeline", [{"step": "", "performer": "agent"}]),  # 空 step

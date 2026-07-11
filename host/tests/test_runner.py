@@ -102,7 +102,7 @@ def test_kill_switch_mid_episode_blocks_next_llm_call(episode, loaded, proxy, po
 
         def complete(self, system, user, tag=None):
             reply = llm.complete(system, user, tag=tag)
-            policy.publish_kill_switch(True, "kill switch 触发：测试注入")
+            policy.publish_kill_switch("tripped", "kill switch 触发：测试注入")
             return reply
 
     run_episode(episode, loaded, proxy, policy, llm=TripAfterFirst())

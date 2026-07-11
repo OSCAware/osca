@@ -155,5 +155,20 @@
 - 脱敏类别双份常量增加一致性锚测试（cli 枚举 vs host 正则表，漂移即红灯）
 - SPEC v0.4 §4 健康档案契约同步定稿（ledger_head/unavailable/交叉相乘/原子发布）
 
+## [Review 复核 · 十轮 · Host 0.2.0] - 2026-07-12
+- 账本版本戳协议升级：`ledger_stamp`（包内容 git tree OID，子目录包不被无关提交
+  作废）+ `ledger_dirty`（包范围干净区）上移 osca_cli.ledger——健康档案生产端与
+  Host 消费端同一协议；档案字段 ledger_head → **ledger_tree**
+- kill switch 三态（TRIPPED/CLEAR/UNAVAILABLE）：unavailable 保留既有安全状态
+  ——已触发的红灯不被可用性缺口（档案缺失/账本前进/网关故障）清除，有可判数据
+  证明健康才解除；重启即重评（持久化停机名单归部署侧，诚实标注）
+- 健康档案消费端全 schema：judgments/red_rate 必填、逐项 light 枚举 + 非负整数
+  assertions、灯色汇总与顶层计数对账、red_rate 有限且与计数一致；
+  **非 git / git 失败 = 无法验证版本归属 → 不可用**（无法验证 ≠ 可以采信）
+- Decimal 精确算术：阈值十进制 + 整数交叉相乘——18.4%×375 的二进制浮点误触发根除
+- budgets 外层未知段（如 per_epiosde 拼写错误）：lint ERROR + 运行时额度撤销
+- authorize_llm 三检入授权锁（与 revoke/kill 发布同一线性化边界）；permit 成功留审计痕
+- Host 版本 0.1.0 → 0.2.0（replay_health 返回键与档案契约为破坏性变更）
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC

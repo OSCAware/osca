@@ -588,6 +588,15 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
                 findings.append(_err("OSCA040", "policy.yaml", f"{key} 必须是 mapping（现为 {type(v).__name__}）"))
         budgets = m.get("budgets")
         if isinstance(budgets, dict):
+            for key in sorted(budgets):
+                if key != "per_episode":
+                    findings.append(
+                        _err(
+                            "OSCA040",
+                            "policy.yaml",
+                            f"budgets 含未知段「{key}」（只认 per_episode）——拼写错误会静默变成无限额",
+                        )
+                    )
             per = budgets.get("per_episode")
             if per is not None and not isinstance(per, dict):
                 findings.append(_err("OSCA040", "policy.yaml", "budgets.per_episode 必须是 mapping"))
