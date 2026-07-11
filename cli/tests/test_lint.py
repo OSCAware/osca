@@ -183,6 +183,15 @@ def test_osca031_supersedes_cycle_rejected(make_pkg, base):
     assert any(f.rule == "OSCA031" and "成环" in f.message for f in result.findings)
 
 
+def test_osca031_fork_supersedes_rejected(make_pkg, base):
+    """两条 active 判断同时取代同一旧判断 = 取代分叉——账本只认一条现役后继。"""
+    base = _second_judgment(base)  # J-0002 supersedes J-0001
+    base["judgments/J-0003.yaml"] = dict(base["judgments/J-0002.yaml"], judgment_id="J-0003")
+    base["judgments/J-0001.yaml"]["status"] = "superseded"
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA031" and "分叉" in f.message for f in result.findings)
+
+
 def test_osca032_trust_should_be_high(make_pkg, base):
     base["judgments/J-0001.yaml"]["meta"] |= {"confirmed": 6, "overruled": 0}
     assert "OSCA032" in rules_hit(lint_package(make_pkg(base)))

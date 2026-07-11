@@ -63,6 +63,15 @@ def test_pack_excludes_indexes_and_junk(make_pkg, base, tmp_path):
     assert CHECKSUMS_REL in names  # 缓存不进包，但校验和清单进
 
 
+def test_pack_refuses_output_inside_package(make_pkg, base, tmp_path):
+    """输出落在包内 → 下次打包吞进自身、哈希漂移——破坏可复现承诺，直接拒绝。"""
+    pkg = make_pkg(base)
+    result, zip_path = pack_package(pkg, pkg / "build.zip")
+    assert not result.ok and zip_path is None
+    assert any("输出路径在包内" in line for line in result.lines)
+    assert not (pkg / "build.zip").exists()
+
+
 def test_pack_refuses_symlinks(make_pkg, base, tmp_path):
     """符号链接会把宿主机文件打进交付件——pack 直接拒绝。"""
     pkg = make_pkg(base)

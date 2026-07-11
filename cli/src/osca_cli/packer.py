@@ -139,6 +139,9 @@ def pack_package(path: str | Path, output: str | Path | None = None) -> tuple[Op
     manifest = load_package(root).yaml_files.get("osca.yaml")
     package_id = manifest.mapping.get("package_id", root.name) if manifest else root.name
     zip_path = Path(output) if output else Path.cwd() / f"{package_id}.osca.zip"
+    if zip_path.resolve().is_relative_to(root.resolve()):
+        result.fail(f"输出路径在包内：{zip_path}——下次打包会把交付件吞进自身、连续打包哈希漂移，请输出到包外")
+        return result, None
     zip_path.parent.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:

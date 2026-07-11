@@ -55,5 +55,13 @@
 - CI 与 pre-commit：脱敏内容扫描加 `-i`——大小写变体不再绕过门禁
 - 文档：README（中英）、CONTRIBUTING 状态修正（M2 七组件齐 + replay，SPEC v0.3 定稿）
 
+## [Review 复核 · 二轮] - 2026-07-11
+- Host 原子发布：policy/proxy/gate 全部构建成功才进注册表——运行时构建失败不再留半注册包；
+  kill switch 阈值伪数字（如 `.`）按不可求值处理，不炸装载
+- 长跑 Host 账本以磁盘为准：每次唤醒前刷新包内容 + 重建签名表 + 重算 kill switch——
+  M3 拍板的新判断不重启即入检索
+- lint：OSCA031 增加取代分叉检查（同一旧判断被多条判断取代即报错）
+- osca pack：输出路径落在包内直接拒绝（防交付件被下次打包吞进自身、哈希漂移）
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC

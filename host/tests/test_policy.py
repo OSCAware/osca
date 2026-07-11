@@ -72,6 +72,16 @@ def test_approval_gate_one_shot():
     assert not p.grant_approval("不存在的动作")[0]
 
 
+def test_kill_switch_garbage_threshold_does_not_crash():
+    """正则容忍 '.' 这类伪数字——按不可求值处理，绝不许炸装载（半注册包的病根之一）。"""
+    p = make(
+        policy={**POLICY, "kill_switch": [{"when": "overruled/confirmed > ."}]},
+        stats={"confirmed": 1, "overruled": 100},
+    )
+    assert not p.kill_tripped
+    assert any("阈值不可解析" in a["reason"] for a in p.audit)
+
+
 def test_revoke_stops_all_calls():
     """包停触达认知平面：撤销后模型调用与运行时内部调用全部拒绝。"""
     p = make()

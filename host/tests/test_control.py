@@ -241,6 +241,47 @@ async def test_kill_switch_recomputed_at_wakeup(running_host, sample_pack, deplo
     assert len(response["episodes"]) == 1  # 第二次唤醒被拒——没有新剧集
 
 
+async def test_wakeup_sees_newly_distilled_judgment(running_host, sample_pack, deploy):
+    """长跑 Host 的账本以磁盘为准：M3 拍板落账后，不 unload/load，下次唤醒即用新判断。"""
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    pid = "demo-group-oper-diagnosis"
+
+    # 模拟 M3 拍板落账：磁盘新增一条 active 判断（Host 进程不重启）
+    (sample_pack / "judgments" / "J-0500.yaml").write_text(
+        "judgment_id: J-0500\n"
+        "status: active\n"
+        "supersedes: null\n"
+        'signature: {object: OBJ-002, aware: AW-001, guard: "费用科目 == 会议费"}\n'
+        "body: |\n  新蒸馏的判断：会议费异动按季度滚动看。\n"
+        "evidence: [C-0102]\n"
+        "meta: {author: 王工, confirmed: 0, overruled: 0, trust: provisional}\n"
+        "expiry: [口径变更]\n"
+        "replay:\n  - {given: C-0102.input, with_this_judgment: 压制单月报警}\n",
+        encoding="utf-8",
+    )
+    await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    (summary,) = (await _send({"cmd": "episodes"}, host))["episodes"]
+    assert "J-0500" in summary["judgments"]  # 唤醒前刷新包内容 + 签名表——新判断即入检索
+
+
+async def test_load_failure_leaves_no_half_registered_package(running_host, sample_pack, monkeypatch):
+    """原子发布：运行时构建（policy/proxy/gate）任一失败，注册表不得留下半注册包。"""
+    import osca_host.host as host_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("构造失败（测试注入）")
+
+    monkeypatch.setattr(host_mod, "PolicyInterceptor", boom)
+    response = await _send({"cmd": "load", "path": str(sample_pack)}, running_host)
+    assert not response["ok"]
+    assert any("包未注册" in line for line in response["detail"])
+
+    response = await _send({"cmd": "status"}, running_host)
+    assert response["packages"] == []  # 无半注册包
+    assert response["triggers"] == []  # 无残留布防
+
+
 async def test_enable_is_idempotent(running_host, sample_pack, deploy):
     """对已启用 Aware 重复 enable 不得重复订阅（否则一次触发双份唤醒）。"""
     host = running_host

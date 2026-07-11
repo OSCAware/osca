@@ -19,6 +19,7 @@ from pathlib import Path
 
 import yaml
 from osca_cli.package import load_package
+from osca_cli.packer import rebuild_index
 
 from osca_host import __version__
 from osca_host.connector import ConnectorProxy
@@ -108,42 +109,44 @@ class Host:
         pkg_bindings: dict = {}
         if request.get("bindings"):
             pkg_bindings = yaml.safe_load(Path(str(request["bindings"])).read_text(encoding="utf-8")) or {}
-        lines = result.lines + self.registry.register(loaded)
-        self.bindings[loaded.package_id] = pkg_bindings
 
-        # 笼子先立起来：policy 拦截器 + connector 代理，然后才布防
-        policy_file = loaded.pack.yaml_files.get("policy.yaml")
-        policy = PolicyInterceptor(
-            loaded.package_id,
-            policy_file.mapping if policy_file else {},
-            ledger_stats(loaded.pack),
-        )
-        self.policies[loaded.package_id] = policy
-        self.proxies[loaded.package_id] = ConnectorProxy(loaded, pkg_bindings, policy)
+        # 先在局部构建全部运行时对象——任何一步失败都不触碰注册表（原子发布，杜绝半注册包）
+        pid = loaded.package_id
+        try:
+            policy_file = loaded.pack.yaml_files.get("policy.yaml")
+            policy = PolicyInterceptor(pid, policy_file.mapping if policy_file else {}, ledger_stats(loaded.pack))
+            proxy = ConnectorProxy(loaded, pkg_bindings, policy)
+            gates = {
+                aware.aware_id: Gate(pid, aware, precondition_eval=lambda text, p=pid: self._eval_precondition(p, text))
+                for aware in loaded.awares
+            }
+        except Exception as e:
+            detail = f"✗ 运行时构建失败：{e}——包未注册（原子发布：构建不全不触碰注册表）"
+            log.error(detail)
+            return {"ok": False, "detail": [*result.lines, detail]}
+
+        # 发布点：注册表 + 笼子 + 闸门一起可见
+        lines = result.lines + self.registry.register(loaded)
+        self.bindings[pid] = pkg_bindings
+        self.policies[pid] = policy
+        self.proxies[pid] = proxy
+        for aware_id, gate in gates.items():
+            self.gates[(pid, aware_id)] = gate
         if policy.kill_tripped:
             lines.append(f"⚠ {policy.kill_reason}——包已装载但唤醒与调用全部拒绝（三级停语义，公理 A10）")
 
-        # 布防：enabled 的 Aware 逐条触发原语进触发表；闸门每 Aware 一个
+        # 布防：enabled 的 Aware 逐条触发原语进触发表
         armed = 0
-        pid = loaded.package_id
         for aware in loaded.awares:
-            self.gates[(pid, aware.aware_id)] = Gate(
-                pid, aware, precondition_eval=lambda text, p=pid: self._eval_precondition(p, text)
-            )
             if aware.enabled:
                 for t in aware.triggers:
                     self.table.subscribe(
                         t.kind,
                         t.spec,
-                        Subscription(
-                            loaded.package_id,
-                            aware.aware_id,
-                            t.trigger_id,
-                            self._make_deliver(loaded.package_id, aware.aware_id),
-                        ),
+                        Subscription(pid, aware.aware_id, t.trigger_id, self._make_deliver(pid, aware.aware_id)),
                     )
                     armed += 1
-        self._sync_slots(loaded.package_id)
+        self._sync_slots(pid)
         lines.append(f"触发表布防 {armed} 条（schedule/watch 挂 watcher，event 待人工发射）")
         for line in lines:
             log.info(line)
@@ -202,8 +205,11 @@ class Host:
             policy = self.policies.get(package_id)
             loaded = self.registry.packages.get(package_id)
             if policy and loaded:
-                # 账本健康度即安全信号（公理 A10）：计数被 M3 采集器改过就要看见——唤醒前重算
-                policy.refresh_kill_switch(ledger_stats(load_package(loaded.root)))
+                # 账本以磁盘为准：M3 采集/拍板可能已落账——唤醒前刷新包内容 + 签名表缓存 + kill switch，
+                # 新蒸馏的判断不重启即入检索（触发命中才刷新，轮询本身不刷，成本与唤醒同频）
+                loaded.pack = load_package(loaded.root)
+                rebuild_index(loaded.root)
+                policy.refresh_kill_switch(ledger_stats(loaded.pack))
             if policy and policy.kill_tripped:
                 log.warning(f"[{package_id}/{aware_id}] {trigger_id} 命中 → 拒绝唤醒：{policy.kill_reason}")
                 return

@@ -35,7 +35,7 @@
 | 规则 | 级别 | 内容 | 依据 |
 |---|---|---|---|
 | OSCA030 | 错误 | 每条判断 ≥1 条出生证据，且必须是包内存在的 case（C-xxxx，别的 ID 类型不算证据） | 纪律 2 |
-| OSCA031 | 错误 | supersedes 双向一致且无环：新判断指向的旧判断必须 status=superseded；superseded 的判断必须被指向；自指与环（互相取代）一律报错 | 纪律 1 |
+| OSCA031 | 错误 | supersedes 双向一致、无环、无分叉：新判断指向的旧判断必须 status=superseded；superseded 的判断必须被指向；自指与环（互相取代）报错；同一旧判断被多条判断取代（分叉）报错 | 纪律 1 |
 | OSCA032 | 错误 | trust 由计数驱动（active 判断：confirmed≥5 且 overruled=0 ⇔ high）；superseded 冻结不查 | 纪律 4 |
 | OSCA033 | 错误 | status ∈ {active, superseded, review} | SPEC §9 |
 | OSCA034 | 错误 | 每条判断自带 replay 回放断言（＝单元测试） | 纪律 4 |

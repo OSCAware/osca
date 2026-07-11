@@ -91,8 +91,16 @@ class PolicyInterceptor:
                         "条件不可机器求值，不生效（受限形式：overruled/confirmed > X）",
                     )
                 continue
+            try:
+                threshold = float(m.group(1))
+            except ValueError:  # 正则容忍 "." 这类伪数字——按不可求值处理，绝不许炸装载
+                if condition not in self._warned_conditions:
+                    self._warned_conditions.add(condition)
+                    detail = "阈值不可解析，不生效（受限形式：overruled/confirmed > X）"
+                    self._record("warn", "kill_switch", condition, detail)
+                continue
             confirmed, overruled = stats.get("confirmed", 0), stats.get("overruled", 0)
-            if confirmed > 0 and overruled / confirmed > float(m.group(1)):
+            if confirmed > 0 and overruled / confirmed > threshold:
                 reason = f"kill switch 触发：overruled/confirmed = {overruled}/{confirmed} > {m.group(1)}"
                 self._record("deny", "kill_switch", condition, reason)
                 return True, reason

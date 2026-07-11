@@ -262,7 +262,7 @@ def osca031_supersedes(pkg: OscaPackage) -> list[Finding]:
     findings = []
     judgments = _judgments(pkg)
     by_id = {f.mapping.get("judgment_id"): f for f in judgments}
-    superseded_by: dict[str, str] = {}
+    superseded_by: dict[str, list[str]] = defaultdict(list)
     chain: dict[str, str] = {}  # jid → 它取代的 jid（环检测输入）
     for f in judgments:
         target = f.mapping.get("supersedes")
@@ -277,11 +277,21 @@ def osca031_supersedes(pkg: OscaPackage) -> list[Finding]:
             findings.append(_err("OSCA031", f.relpath, f"supersedes 指向的 {target} 不存在"))
         else:
             chain[jid] = target
-            superseded_by[target] = jid
+            superseded_by[target].append(jid)
             if old.mapping.get("status") != "superseded":
                 findings.append(
                     _err("OSCA031", old.relpath, f"被 {f.mapping.get('judgment_id')} 取代，status 必须改为 superseded")
                 )
+    # 取代分叉：同一旧判断被多条判断取代——账本只认一条现役后继，分叉即口径分裂
+    for target, successors in sorted(superseded_by.items()):
+        if len(successors) > 1:
+            findings.append(
+                _err(
+                    "OSCA031",
+                    by_id[target].relpath,
+                    f"{target} 被多条判断取代（{'、'.join(sorted(successors))}）——取代链分叉，须并成一条",
+                )
+            )
     # 环检测：沿取代链走，回到走过的节点即环（每个环只报一次，以环内最小 ID 为代表）
     for start in sorted(chain):
         path: list[str] = []
