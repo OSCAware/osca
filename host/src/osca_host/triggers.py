@@ -1,10 +1,12 @@
 """Host 组件 2：触发表 —— trigger 原语扁平注册，哈希分发，跨 Aware 去重共享（架构 §4）。
 
-语法解析复用 osca_cli.triggers（单一真理源）。W2 布防范围：
-- schedule：定时器，按 next_fire 睡到点发射；
-- watch：轮询器，按 every 计 tick——emit_when 求值需要 Connector 代理（W4），本周只计不发射；
+语法解析复用 osca_cli.triggers（单一真理源）。布防语义：
+- schedule：定时器，按 next_fire 睡到点发射；纯时间，可跨包去重共享；
+- watch：轮询器，按 every 经 poller（Connector 代理）取数，emit_when 命中才发射；
+  数据绑定在包上，去重共享只在包内（不同包的 CON-001 可能是不同系统）；
+  无 emit_when 时按「状态变化」发射；emit_when 不可求值或取数失败只计 tick 留痕；
 - event：登记不布防，由控制通道人工发射（对应样例 T3「操作者控制台按钮」）。
-去重：相同 (kind, spec) 只建一个 watcher，多个订阅共享（引用计数 = 订阅数）。
+去重：相同 (kind, spec[, 包域]) 只建一个 watcher，多个订阅共享（引用计数 = 订阅数）。
 """
 
 from __future__ import annotations
@@ -19,7 +21,12 @@ from datetime import datetime
 
 from osca_cli.triggers import parse_duration, parse_schedule
 
+from osca_host.expr import evaluate_emit_when
+
 log = logging.getLogger("osca-host")
+
+# poller(package_id, 接口引用) → 状态负载（dict）或 None（取数失败）
+Poller = Callable[[str, str], object]
 
 
 @dataclass
@@ -35,29 +42,33 @@ class Watcher:
     key: str
     kind: str
     spec: dict
+    scope: str = ""  # watch 的包域（数据绑定在包上）；schedule/event 为空
     subs: list[Subscription] = field(default_factory=list)
     task: asyncio.Task | None = None
     fires: int = 0  # 发射次数
-    ticks: int = 0  # watch 轮询 tick 数（W2 只计不发射）
+    ticks: int = 0  # watch 轮询 tick 数
+    state: object = None  # watch 的上一轮状态（old）
     next_fire: datetime | None = None
 
 
-def _canonical_key(kind: str, spec: dict) -> str:
-    payload = json.dumps({"kind": kind, "spec": spec}, sort_keys=True, ensure_ascii=False, default=str)
+def _canonical_key(kind: str, spec: dict, scope: str) -> str:
+    payload = json.dumps({"kind": kind, "spec": spec, "scope": scope}, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
 class TriggerTable:
-    def __init__(self) -> None:
+    def __init__(self, poller: Poller | None = None) -> None:
         self.watchers: dict[str, Watcher] = {}
+        self.poller = poller  # 未注入时轮询只计 tick（W4 前的行为，测试仍可裸用）
 
     # ── 布防与撤防 ────────────────────────────────────────────────────
 
     def subscribe(self, kind: str, spec: dict, sub: Subscription) -> Watcher:
-        key = _canonical_key(kind, spec)
+        scope = sub.package_id if kind == "watch" else ""
+        key = _canonical_key(kind, spec, scope)
         watcher = self.watchers.get(key)
         if watcher is None:
-            watcher = Watcher(key=key, kind=kind, spec=spec)
+            watcher = Watcher(key=key, kind=kind, spec=spec, scope=scope)
             self.watchers[key] = watcher
             self._arm(watcher)
         else:
@@ -135,13 +146,35 @@ class TriggerTable:
         if every is None:
             log.error(f"watcher {watcher.key} every 编译失败：{watcher.spec.get('every')}")
             return
+        uses = str(watcher.spec.get("uses"))
+        emit_when = watcher.spec.get("emit_when")
         while True:
             await asyncio.sleep(every.total_seconds())
             watcher.ticks += 1
-            log.info(
-                f"轮询 tick {watcher.key}（{watcher.spec.get('uses')}）："
-                f"emit_when 求值待 W4 Connector 代理，本轮不发射（第 {watcher.ticks} 次）"
-            )
+            if self.poller is None:
+                log.info(f"轮询 tick {watcher.key}（{uses}）：poller 未注入，只计 tick（第 {watcher.ticks} 次）")
+                continue
+            new_state = self.poller(watcher.scope, uses)
+            if new_state is None:
+                log.warning(f"轮询 {watcher.key}（{uses}）取数失败，本轮不发射（第 {watcher.ticks} 次）")
+                continue
+            old_state, watcher.state = watcher.state, new_state
+            if old_state is None:
+                log.info(f"轮询 {watcher.key}（{uses}）首轮建立基线，不发射")
+                continue
+            if emit_when is not None:
+                verdict = evaluate_emit_when(str(emit_when), old_state, new_state)
+                if verdict is None:
+                    log.warning(
+                        f"轮询 {watcher.key} emit_when 不可求值或字段缺失，本轮不发射（受限形式见 SPEC v0.4 §4）"
+                    )
+                    continue
+                should_fire = verdict
+            else:
+                should_fire = old_state != new_state  # 无 emit_when：状态变化即发射
+            if should_fire:
+                log.info(f"轮询 {watcher.key}（{uses}）emit 条件命中，发射")
+                self._fire(watcher)
 
     # ── 快照 ──────────────────────────────────────────────────────────
 

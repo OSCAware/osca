@@ -69,3 +69,24 @@ async def test_fire_manual_event_only():
     assert error and "仅 event 可人工发射" in error
     assert table.fire_manual("p1", "AW-001/T9") is not None  # 未布防
     table.shutdown()
+
+
+async def test_watch_emits_on_state_transition():
+    states = iter([{"已关账": False}, {"已关账": False}, {"已关账": True}, {"已关账": True}])
+    table = TriggerTable(poller=lambda scope, uses: next(states, {"已关账": True}))
+    hits = []
+    spec = {"uses": "CON-001.拉取费用明细", "every": "1s", "emit_when": "old.已关账 == false && new.已关账 == true"}
+    watcher = table.subscribe("watch", spec, sub("p1", "AW-001", "AW-001/T2", hits))
+    await asyncio.sleep(4.6)  # 基线 → 无变化 → 转变发射 → 已关账保持不再发射
+    assert hits == ["AW-001/T2"]
+    assert watcher.fires == 1
+    table.shutdown()
+
+
+async def test_watch_scoped_per_package():
+    table, hits = TriggerTable(), []
+    spec = {"uses": "CON-001.取数", "every": "1s"}
+    table.subscribe("watch", spec, sub("p1", "AW-001", "AW-001/T2", hits))
+    table.subscribe("watch", spec, sub("p2", "AW-001", "AW-001/T2", hits))
+    assert len(table.watchers) == 2  # 数据绑定在包上:同 spec 不同包不共享
+    table.shutdown()

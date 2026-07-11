@@ -87,10 +87,10 @@ def test_client_without_host(tmp_path):
     assert "未运行" in response["detail"]
 
 
-async def test_w2_trigger_stop_and_manual_fire(running_host, sample_pack):
+async def test_w2_trigger_stop_and_manual_fire(running_host, sample_pack, deploy):
     """W2 验收路径:布防 → 触发器停/启 → 人工发射穿透闸门唤醒。"""
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack)}, host)
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
     pid = "demo-group-oper-diagnosis"
 
     # 布防:3 条订阅,槽位 armed;schedule watcher 已排好下次触发
@@ -125,10 +125,10 @@ async def test_w2_trigger_stop_and_manual_fire(running_host, sample_pack):
     assert not response["ok"]
 
 
-async def test_w3_wake_assembles_episode(running_host, sample_pack):
+async def test_w3_wake_assembles_episode(running_host, sample_pack, deploy):
     """W3 验收路径:发射 → 唤醒 → 剧集装配进台账 → 完整上下文可导出。"""
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack)}, host)
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
     pid = "demo-group-oper-diagnosis"
 
     response = await _send({"cmd": "episodes"}, host)
@@ -148,3 +148,73 @@ async def test_w3_wake_assembles_episode(running_host, sample_pack):
 
     response = await _send({"cmd": "episode", "episode_id": "EP-9999"}, host)
     assert not response["ok"]
+
+
+@pytest.fixture
+def deploy(tmp_path):
+    """部署环境:mock 固件目录 + bindings.yaml(binding 永不进包,这里模拟运维注入)。"""
+    import yaml as _yaml
+
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    (fixtures / "拉取费用明细.yaml").write_text(
+        _yaml.safe_dump({"已关账": True, "rows": [{"科目": "差旅费", "金额": 45}]}, allow_unicode=True),
+        encoding="utf-8",
+    )
+    bindings = tmp_path / "bindings.yaml"
+    bindings.write_text(
+        _yaml.safe_dump({"FINANCE_DB": {"endpoint": f"mock://{fixtures}", "secret_ref": "FINANCE_DB_RO_KEY"}}),
+        encoding="utf-8",
+    )
+    return bindings
+
+
+async def test_w4_precondition_evaluated_through_proxy(running_host, sample_pack, deploy):
+    """W4 验收路径:装载带 binding → 发射 → precondition 经代理真求值 → 唤醒装配。"""
+    host = running_host
+    response = await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    assert response["ok"]
+    pid = "demo-group-oper-diagnosis"
+
+    await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    response = await _send({"cmd": "status"}, host)
+    (pkg,) = response["packages"]
+    (gate,) = pkg["gates"]
+    assert gate["wakes"] == 1 and gate["precondition_blocked"] == 0  # 真求值通过,非默认放行
+
+    policy = pkg["policy"]
+    assert policy["kill_switch_tripped"] is False
+    assert policy["max_tool_calls"] == 30
+    assert "终稿发送管理层" in policy["approvals"]
+    # precondition 的取数在政策审计里留了「运行时内部调用」放行痕
+    assert any(a["subject"] == "CON-001.拉取费用明细" and a["decision"] == "allow" for a in policy["audit_tail"])
+
+    response = await _send({"cmd": "episodes"}, host)
+    assert len(response["episodes"]) == 1
+
+
+async def test_w4_approval_gate_via_control(running_host, sample_pack, deploy):
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    pid = "demo-group-oper-diagnosis"
+
+    response = await _send({"cmd": "approve", "package_id": pid, "action": "终稿发送管理层"}, host)
+    assert response["ok"]
+    response = await _send({"cmd": "status"}, host)
+    assert response["packages"][0]["policy"]["approvals"]["终稿发送管理层"] == "granted"
+
+    response = await _send({"cmd": "approve", "package_id": pid, "action": "不存在的动作"}, host)
+    assert not response["ok"]
+
+
+async def test_w4_precondition_blocks_without_bindings(running_host, sample_pack):
+    """未注入部署 binding → precondition 取数失败 → 保守拦截唤醒(不装配)。"""
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack)}, host)
+    pid = "demo-group-oper-diagnosis"
+    await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    response = await _send({"cmd": "status"}, host)
+    (gate,) = response["packages"][0]["gates"]
+    assert gate["wakes"] == 0 and gate["precondition_blocked"] == 1
+    response = await _send({"cmd": "episodes"}, host)
+    assert response["episodes"] == []

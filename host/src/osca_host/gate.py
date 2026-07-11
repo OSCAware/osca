@@ -1,27 +1,33 @@
 """Host 组件 3：闸门 —— 触发 ≠ 唤醒，闸门裁决（架构 §4）。
 
-组合语义按 SPEC v0.4 草案 §3。W2 边界（诚实标注）：
-- precondition 求值需要 Connector 代理（W4），本周记录声明、默认放行并打日志；
-- 过闸后的「唤醒」是 W3 剧集装配器的活，本周唤醒 = 计数 + 日志。
+组合语义按 SPEC v0.4 草案 §3。precondition 求值器由 Host 注入（走 Connector 代理，
+可求值形式见 SPEC v0.4 草案 §4）：求值 False 拦截唤醒并复述 on_fail 声明；
+不可求值（None）保守默认放行、留痕。on_fail 的顺延重试执行归对账/重试机制（W5 后）。
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 
 from osca_cli.triggers import parse_duration
 
 from osca_host.loader import AwareDecl
 
+# precondition_eval(声明文本) → (True 放行 / False 拦截 / None 不可求值, 人可读说明)
+PreconditionEval = Callable[[str], "tuple[bool | None, str]"]
+
 
 class Gate:
-    def __init__(self, package_id: str, aware: AwareDecl):
+    def __init__(self, package_id: str, aware: AwareDecl, precondition_eval: PreconditionEval | None = None):
         self.package_id = package_id
         self.aware = aware
         self.trigger_ids = [t.trigger_id for t in aware.triggers]
         self.combine = aware.gate.get("combine", "any")
         self.debounce = parse_duration(aware.gate.get("debounce")) if aware.gate.get("debounce") else None
         self.precondition = aware.gate.get("precondition")
+        self.precondition_eval = precondition_eval
+        self.precondition_blocked = 0
         self.enabled = aware.enabled
         self.wakes = 0
         self.debounced = 0
@@ -55,7 +61,17 @@ class Gate:
             self.debounced += 1
             return False, f"debounce 抑制（窗口 {self.aware.gate.get('debounce')}，第 {self.debounced} 次）"
 
-        note = "precondition 未求值（W4 Connector 后接管），默认放行；" if self.precondition else ""
+        note = ""
+        if self.precondition:
+            if self.precondition_eval is None:
+                note = "precondition 未求值（评估器未注入），默认放行；"
+            else:
+                verdict, detail = self.precondition_eval(self.precondition)
+                if verdict is False:
+                    self.precondition_blocked += 1
+                    on_fail = self.aware.gate.get("on_fail", "（无 on_fail 声明）")
+                    return False, f"precondition 拦截：{detail}。on_fail 声明：{on_fail}"
+                note = f"precondition {detail}；"
         self.wakes += 1
         self.last_wake = now
         return True, f"{note}唤醒 → 装配 {self.aware.then}"
@@ -67,5 +83,6 @@ class Gate:
             "combine": self.combine,
             "wakes": self.wakes,
             "debounced": self.debounced,
+            "precondition_blocked": self.precondition_blocked,
             "last_wake": self.last_wake.isoformat(timespec="seconds") if self.last_wake else None,
         }

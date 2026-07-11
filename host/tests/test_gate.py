@@ -73,3 +73,24 @@ def test_precondition_noted_in_verdict():
     gate = make_gate({"combine": "any", "precondition": "取数非空"})
     _, verdict = gate.on_trigger("AW-001/T1")
     assert "precondition 未求值" in verdict
+
+
+def test_precondition_evaluator_blocks_wake():
+    gate = make_gate({"combine": "any", "precondition": "CON-001.取数(当月) 返回非空", "on_fail": "顺延24小时重试"})
+    gate.precondition_eval = lambda text: (False, "CON-001.取数(当月) 返回为空")
+    woke, verdict = gate.on_trigger("AW-001/T1")
+    assert not woke and "precondition 拦截" in verdict and "顺延24小时重试" in verdict
+    assert gate.wakes == 0 and gate.precondition_blocked == 1
+    assert gate.last_wake is None  # 拦截不消耗 debounce 窗口
+
+
+def test_precondition_evaluator_pass_and_unevaluable():
+    gate = make_gate({"combine": "any", "precondition": "CON-001.取数(当月) 返回非空"})
+    gate.precondition_eval = lambda text: (True, "求值通过（返回非空）")
+    woke, verdict = gate.on_trigger("AW-001/T1")
+    assert woke and "求值通过" in verdict
+
+    gate2 = make_gate({"combine": "any", "precondition": "看情况"})
+    gate2.precondition_eval = lambda text: (None, "不可求值，默认放行")
+    woke, verdict = gate2.on_trigger("AW-001/T1")
+    assert woke and "不可求值" in verdict

@@ -52,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_fire.add_argument("package_id")
     p_fire.add_argument("trigger_id", help="全局触发 ID，如 AW-001/T3")
 
+    p_approve = sub.add_parser("approve", help="审批门：对审批清单内的动作授予一次性放行（M4 换审批卡界面）")
+    p_approve.add_argument("package_id")
+    p_approve.add_argument("action", help="policy.yaml approvals 里声明的动作名")
+
     sub.add_parser("episodes", help="剧集台账：近期唤醒装配的剧集摘要")
 
     p_episode = sub.add_parser("episode", help="导出一个剧集的完整一次性上下文")
@@ -97,6 +101,8 @@ def main(argv: list[str] | None = None) -> int:
         return _client({"cmd": args.command, "package_id": args.package_id, "aware_id": args.aware_id}, args.socket)
     if args.command == "fire":
         return _client({"cmd": "fire", "package_id": args.package_id, "trigger_id": args.trigger_id}, args.socket)
+    if args.command == "approve":
+        return _client({"cmd": "approve", "package_id": args.package_id, "action": args.action}, args.socket)
     if args.command == "episodes":
         return _client({"cmd": "episodes"}, args.socket)
     if args.command == "episode":

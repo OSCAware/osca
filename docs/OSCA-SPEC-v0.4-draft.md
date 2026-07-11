@@ -78,9 +78,28 @@ gate 允许字段集：`combine` / `precondition` / `debounce` / `on_fail`。
 - `debounce`：唤醒后的抑制窗口，窗口内再次过闸门只计数不唤醒。
 - `enabled: false` 的 Aware 不布防触发原语（三级停之「触发器停」）。
 
+## 4. 运行时求值参考语义（precondition / emit_when / kill_switch）
+
+v0.3 中这三处均为声明性文本。参考实现给出**可求值受限形式**；不合形式的声明
+不报错、不生效——保守默认（precondition 放行、emit_when 不发射、kill_switch 不触发）并留痕。
+
+- **precondition**（闸门前置条件）：`CON-xxx.接口名(参数) 返回非空`。
+  经 Connector 代理真调用：返回空或取数失败 → 拦截唤醒并复述 `on_fail` 声明
+  （顺延重试的执行属对账/重试机制，后续版本落地）。
+- **emit_when**（watch 发射条件）：以 `&&` 连接的比较子句，字段取自 `old.*` / `new.*`，
+  比较符 `==` / `!=`，字面量 true/false/null、数字，其余按字符串比对。
+  例：`old.已关账 == false && new.已关账 == true`。**无 emit_when 时按状态变化发射**；
+  首轮建立基线不发射。
+- **kill_switch**（policy.yaml）：可求值形式 `overruled/confirmed > X`。
+  计数口径：**现役（active）判断合计**——被取代判断的计数随取代冻结成历史，
+  推翻→重审→蒸馏新判断是账本自愈，健康度看现役账本（时间窗随蒸馏管道的时间账收紧）。
+- **watch 去重域**：schedule 纯时间可跨包共享；watch 数据绑定在包上，
+  去重共享只在包内（不同包的同名 Connector 可能指向不同系统）。
+
 ---
 
 ## 变更记录
 
 - **v0.4-draft**（2026-07-11）：§5 触发原语受限语法（时长 / schedule 结构化字段 / watch / event 字段集）；
   闸门编译期矛盾检查清单；组合语义定稿。废止自由文本 schedule。
+  追加 §4 运行时求值参考语义（precondition / emit_when / kill_switch 的可求值受限形式与保守默认）。
