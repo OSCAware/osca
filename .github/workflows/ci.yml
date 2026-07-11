@@ -1,0 +1,59 @@
+# CI 三关:脱敏检索 → osca lint → pytest。任何一关红灯即整体失败。
+# 依据:《开发计划 v1.0》M1 公开标准 + 《开仓指南 v1.0》第 2 节脱敏清单。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  audit:
+    name: 脱敏检索
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 全库违禁词零命中
+        # 违禁词拆词构造,保证本文件自身通过检索(与 scripts/hooks/pre-commit 同一手法)
+        run: |
+          W1="$(printf '\344\272\254\350\203\275')"
+          W2="jing""neng"
+          W3="uere""port"
+          PATTERN="${W1}|${W2}|${W3}"
+          if git ls-files | grep -iE "$PATTERN"; then
+            echo "::error::文件名检出脱敏违禁词"; exit 1
+          fi
+          if git grep -nE "$PATTERN" -- ':!.github/workflows/ci.yml' ':!scripts/hooks/pre-commit'; then
+            echo "::error::文件内容检出脱敏违禁词"; exit 1
+          fi
+          echo "✓ 脱敏检索零命中"
+
+  lint:
+    name: osca lint 样例包
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: 样例包绿灯
+        working-directory: cli
+        run: uv run osca lint ../examples/oper-diagnosis.osca
+
+  test:
+    name: pytest + ruff
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: ruff 检查
+        working-directory: cli
+        run: |
+          uv run ruff check src tests
+          uv run ruff format --check src tests
+      - name: 测试
+        working-directory: cli
+        run: uv run pytest -q
