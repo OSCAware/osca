@@ -171,4 +171,7 @@
 - Host 版本 0.1.0 → 0.2.0（replay_health 返回键与档案契约为破坏性变更）
 
 ## [Unreleased]
-- Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC
+- 发布 OSCA 开放规范白皮书 v1.0：以 OSCA 为核心、Oscaware 为参考实现，覆盖 O/S/C/A/J、
+  双平面 Runtime、判断飞轮、采用路径、兼容与证据边界；历史 v0.1 扩展稿留档
+- Phase 0 内容线：P0-A 在高频真实场景形成 ≥20 条经专家 Confirm 入账的 Judgment，并观察
+  后续独立使用；P0-B 慢场景单独报告，反哺 SPEC
