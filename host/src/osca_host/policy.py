@@ -1,9 +1,13 @@
 """Host 组件 5：Policy 拦截器 —— 笼子的强制执行（架构 §4）。
 
 权限硬管，不靠 AI 自觉：policy.yaml 由运行时读取执行，模型永不读（公理 A5）。
-覆盖：按步骤工具白名单（默认拒绝）、审批门、预算硬顶（tool_calls；tokens 归 W5）、
+覆盖：按步骤工具白名单（默认拒绝）、审批门、预算硬顶（tool_calls + tokens）、
 数据脱敏、kill switch（账本健康度即安全信号，公理 A10）。
 每次裁决记审计日志——越权调用直接拒绝并留痕。
+
+tokens 硬顶语义（W5，剧集执行接 LLM 后生效）：用量在调用后由网关回报，
+记账后超顶即拒——超顶的那次调用已经发生，剧集就地停；这是止损顶，不是预扣顶。
+数量记法受限形式 `<正整数>[k]`（如 200k），不可解析的记警告、硬顶不生效。
 
 W4 边界（诚实标注）：kill_switch 条件的可求值形式为「overruled/confirmed > X」，
 按包内全部判断的计数合计近似（「近30天」窗口需要蒸馏管道的时间账，M3 后收紧）；
@@ -21,13 +25,26 @@ REDACTORS: dict[str, re.Pattern[str]] = {
 }
 
 KILL_RATIO = re.compile(r".*overruled\s*/\s*confirmed\s*>\s*([\d.]+).*")
+QUANTITY = re.compile(r"(\d+)\s*([kK]?)")
 
 AUDIT_TAIL = 20  # status 里只带最近这些条
+
+
+def parse_quantity(value) -> int | None:
+    """数量记法受限形式：整数或 `<正整数>[k]`（200k → 200000）；其余不可解析返回 None。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and (m := QUANTITY.fullmatch(value.strip())):
+        return int(m.group(1)) * (1000 if m.group(2) else 1)
+    return None
 
 
 class PolicyInterceptor:
     def __init__(self, package_id: str, policy: dict, ledger_stats: dict[str, int]):
         self.package_id = package_id
+        self.audit: list[dict] = []
         self.permissions: dict[str, set[str]] = {
             str(p.get("step")): set(p.get("allow") or [])
             for p in policy.get("permissions") or []
@@ -37,13 +54,17 @@ class PolicyInterceptor:
         per_episode = budgets.get("per_episode") or {}
         self.max_tool_calls = per_episode.get("max_tool_calls")
         self._tool_calls: dict[str, int] = {}  # episode_id → 已用
+        self.max_tokens = parse_quantity(per_episode.get("max_tokens")) if "max_tokens" in per_episode else None
+        if "max_tokens" in per_episode and self.max_tokens is None:
+            detail = "max_tokens 不可解析（受限形式：<正整数>[k]），硬顶不生效"
+            self._record("warn", "budgets", str(per_episode["max_tokens"]), detail)
+        self._tokens: dict[str, int] = {}  # episode_id → 已用
         self.egress_allow: set[str] = set((policy.get("egress") or {}).get("allow_domains") or [])
         self.redact_categories = [c for c in (policy.get("data") or {}).get("redact") or [] if c in REDACTORS]
         self.approvals: dict[str, str] = {
             str(a.get("action")): str(a.get("approver")) for a in policy.get("approvals") or [] if isinstance(a, dict)
         }
         self._granted: set[str] = set()
-        self.audit: list[dict] = []
         self.kill_tripped, self.kill_reason = self._eval_kill_switch(policy, ledger_stats)
 
     # ── kill switch（公理 A10：账本健康度即安全信号） ──────────────────
@@ -83,6 +104,15 @@ class PolicyInterceptor:
         if tool not in allowed:
             return self._deny(step, tool, f"步骤「{step}」白名单不含 {tool}（模型越权，直接拒绝）")
         return self._allow(step, tool, "白名单放行")
+
+    def charge_tokens(self, episode_id: str, tokens: int) -> tuple[bool, str]:
+        """LLM 用量记账（网关调用后回报）。超顶即拒——止损顶：超顶那次调用已发生，剧集就地停。"""
+        used = self._tokens.get(episode_id, 0) + tokens
+        self._tokens[episode_id] = used
+        if self.max_tokens is not None and used > self.max_tokens:
+            return self._deny(None, episode_id, f"预算硬顶：本剧集 tokens 已用 {used} > {self.max_tokens}")
+        cap = f"/{self.max_tokens}" if self.max_tokens is not None else "（无 tokens 硬顶）"
+        return self._allow(None, episode_id, f"tokens 记账：{used}{cap}")
 
     # ── egress（默认全禁，白名单放行） ────────────────────────────────
 
@@ -156,6 +186,7 @@ class PolicyInterceptor:
             "kill_switch_tripped": self.kill_tripped,
             "kill_reason": self.kill_reason or None,
             "max_tool_calls": self.max_tool_calls,
+            "max_tokens": self.max_tokens,
             "approvals": {a: ("granted" if a in self._granted else "pending") for a in self.approvals},
             "redact": self.redact_categories,
             "audit_tail": self.audit[-AUDIT_TAIL:],

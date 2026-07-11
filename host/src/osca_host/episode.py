@@ -28,7 +28,7 @@ CASE_NUM = re.compile(r"C-(\d+)")
 
 @dataclass
 class Episode:
-    """一次唤醒装配出的一次性上下文。执行（W5）前它就是剧集的全部。"""
+    """一次唤醒装配出的一次性上下文 + 执行态（W5）。剧集短命：跑完即死，台账留痕。"""
 
     episode_id: str
     package_id: str
@@ -38,6 +38,14 @@ class Episode:
     then: str | None
     budget: dict
     context: dict = field(repr=False)
+    # ── 执行态（runner 写入）：assembled → running → completed | stopped | failed ──
+    status: str = "assembled"
+    steps: list[dict] = field(default_factory=list)  # 逐步留痕（performer/回执/产出/tokens）
+    draft: str | None = None  # 最近一个 agent 步的产出——机器侧的交付物
+    tokens_used: int = 0
+    stop_reason: str | None = None  # stopped/failed 的人话原因；completed 为 None
+    finished_at: str | None = None
+    settlements: list[dict] = field(default_factory=list)  # 对账器落账记录（W5 组件 7）
 
     def summary(self) -> dict:
         return {
@@ -47,6 +55,10 @@ class Episode:
             "fired_trigger": self.fired_trigger,
             "assembled_at": self.assembled_at,
             "then": self.then,
+            "status": self.status,
+            "stop_reason": self.stop_reason,
+            "tokens_used": self.tokens_used,
+            "draft_ready": self.draft is not None,
             "judgments": [j["judgment_id"] for j in self.context["judgments"]],
             "objects": sorted(self.context["objects"]),
         }

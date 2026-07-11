@@ -1,9 +1,10 @@
-"""Host 进程：确定性常驻，无 LLM（架构 §4）。
+"""Host 进程：控制平面确定性常驻，本体无 LLM（架构 §4）。
 
-W4 形态：注册表 + 触发表 + 闸门 + 剧集装配器 + Policy 拦截器 + Connector 代理 + 控制通道。
-笼子已硬：按步骤白名单（默认拒绝）、审批门、预算硬顶、脱敏、kill switch，全程审计。
-W2 的两笔债已还：precondition 经代理真求值、watch 的 emit_when 真比对。
-三级停可演示两级：包停（unload）、触发器停（disable）；剧集停随 W5 剧集执行落地。
+W5 形态（M2 七组件齐）：注册表 + 触发表 + 闸门 + 剧集装配器 + Policy 拦截器
++ Connector 代理 + 对账器 + 控制通道。唤醒 → 装配 → 执行 → （objective 型）对账。
+LLM 只活在剧集执行器（认知平面，osca_host.runner）里，跑在独立线程，
+Host 事件循环保持确定性响应；三级停三级全可演示：剧集停（pipeline 完成 /
+budget 硬顶 / 步骤失败）、触发器停（disable）、包停（unload）。
 """
 
 from __future__ import annotations
@@ -26,11 +27,13 @@ from osca_host.gate import Gate
 from osca_host.loader import load_for_host
 from osca_host.policy import PolicyInterceptor, ledger_stats
 from osca_host.registry import Registry, RegistryError
+from osca_host.runner import run_episode
+from osca_host.settle import settle_episode
 from osca_host.triggers import Subscription, TriggerTable
 
 log = logging.getLogger("osca-host")
 
-EPISODE_LEDGER_CAP = 100  # 剧集台账只留近期；持久归档随 W5 对账器落地
+EPISODE_LEDGER_CAP = 100  # 剧集台账只留近期；持久归档随 M3 采集器/账本落地
 
 
 class Host:
@@ -43,6 +46,7 @@ class Host:
         self.bindings: dict = {}  # 部署环境注入的 binding 表（--bindings，永不进包）
         self.episodes: OrderedDict[str, Episode] = OrderedDict()  # 剧集台账（近期）
         self._episode_seq = 0
+        self._episode_tasks: set[asyncio.Task] = set()  # 在跑剧集（认知平面，独立线程）
         self.control = ControlServer(socket_path, self.handle)
         self._stop = asyncio.Event()
 
@@ -227,7 +231,9 @@ class Host:
 
     def _assemble_episode(self, package_id: str, aware_id: str, trigger_id: str) -> None:
         loaded = self.registry.packages.get(package_id)
-        if loaded is None:
+        proxy = self.proxies.get(package_id)
+        policy = self.policies.get(package_id)
+        if loaded is None or proxy is None or policy is None:
             return
         aware = next(a for a in loaded.awares if a.aware_id == aware_id)
         self._episode_seq += 1
@@ -238,8 +244,26 @@ class Host:
         s = episode.summary()
         log.info(
             f"剧集 {episode.episode_id} 装配完成：判断 {len(s['judgments'])} 条（{', '.join(s['judgments'])}）"
-            f" / 对象 {len(s['objects'])} 个 / 预算 {episode.budget}（执行属 W5，本周只装配）"
+            f" / 对象 {len(s['objects'])} 个 / 预算 {episode.budget}，开始执行"
         )
+        # 认知平面在独立线程执行（LLM 阻塞调用），Host 事件循环保持确定性响应。
+        # loaded/proxy/policy 在此刻捕获——执行中途包停也不半路丢引用。
+        task = asyncio.create_task(self._execute_episode(episode, loaded, proxy, policy))
+        self._episode_tasks.add(task)
+        task.add_done_callback(self._episode_tasks.discard)
+
+    async def _execute_episode(self, episode: Episode, loaded, proxy, policy) -> None:
+        await asyncio.to_thread(run_episode, episode, loaded, proxy, policy)
+        tail = f"（{episode.stop_reason}）" if episode.stop_reason else ""
+        log.info(f"剧集 {episode.episode_id} 终态 {episode.status}{tail}：tokens {episode.tokens_used}")
+        if episode.status != "completed":
+            return
+        # 对账器（组件 7）：objective 型对象自动落 outcome case，不消耗剧集
+        for entry in await asyncio.to_thread(settle_episode, loaded, proxy, episode):
+            if entry["settled"]:
+                log.info(f"对账落账：{entry['object']} → {entry['case']}（现实是第二位专家，公理 A2）")
+            else:
+                log.info(f"对账未执行：{entry['object']}——{entry['note']}")
 
     def _sync_slots(self, package_id: str) -> None:
         """注册表槽位状态跟随布防事实：armed（已挂 watcher/待人工发射）或 disabled。"""
@@ -272,6 +296,13 @@ class Host:
                 log.error(f"启动装载失败：{pack['path']}")
 
         await self._stop.wait()
+
+        # 先等在跑剧集收尾（剧集短命，正常秒级；网关卡死时 60s 兜底放弃等待，线程随进程消亡）
+        if self._episode_tasks:
+            log.info(f"关停前等待 {len(self._episode_tasks)} 个在跑剧集收尾")
+            _, pending = await asyncio.wait(list(self._episode_tasks), timeout=60)
+            if pending:
+                log.warning(f"{len(pending)} 个剧集未在 60s 内收尾，放弃等待")
 
         # 关停 = 全体包停：逐包撤防注销（三级停之「包停」的机制复用）
         for package_id in list(self.registry.packages):

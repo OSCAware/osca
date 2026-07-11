@@ -20,6 +20,19 @@
 - `osca load`：完整性校验（防篡改）→ lint → binding 比对 → 重建签名表索引
 - 样例包修复（lint 抓出）：C-0102 YAML 语法错误、CON-001 缺 binding_ref、OBJ-001/002 缺 kind、sql impl 占位
 
+## [Host 0.1 · M2 七组件齐] - 2026-07-11
+- 运行框架 Host 参考实现（架构 §4）：Loader（复用 cli 装载核心）、触发表（定时器/轮询器，
+  哈希去重共享）、闸门（combine/debounce/precondition 真求值）、剧集装配器（一次性上下文 +
+  签名表检索 top3–7 带 case）、Policy 拦截器（步骤白名单默认拒绝 / 审批门 / 预算硬顶
+  tool_calls + tokens 止损顶 / 脱敏 / kill switch）、Connector 代理（manifest 契约校验 +
+  binding 部署注入 + mock 固件执行器）、对账器 settle（objective 型自动落 outcome case）
+- 剧集执行器（认知平面）：performer 受限集 connector / agent / optimizer（初版贪心）/
+  human（飞轮采集点）/ runtime（移交对账）；三级停三级全可演示，剧集台账全程留痕
+- LLM 通道：抽象接口 + 环境变量配置（OSCA_LLM_URL / MODEL / API_KEY，OpenAI-compatible
+  线协议，温度恒 0），不锁定厂商、配置永不进包；mock:// 固件执行器供测试与演练
+- `osca replay`：单条判断 A/B 体检——发布凭据第三样「可回放」的完整体
+- SPEC v0.4 草案增补：触发原语受限语法、组合语义、运行时求值参考语义、剧集执行参考语义、
+  settle 受限形式、回放机器判据
+
 ## [Unreleased]
-- 运行框架（参考实现）：装载、触发表、闸门、剧集装配器、Policy 拦截器
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC

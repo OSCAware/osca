@@ -1,9 +1,10 @@
 """osca 命令入口。
 
-三个子命令对应《OSCA-SPEC》的工具链约定：
-- lint  账本纪律的机器化（规则清单：docs/OSCA-LINT-RULES.md）
-- pack  开发态（git 仓库）→ 交付态（zip）：lint 门禁 + 校验和清单 + 可复现打包
-- load  装载校验：完整性（防篡改）→ lint → binding 比对 → 重建签名表索引
+四个子命令对应《OSCA-SPEC》的工具链约定：
+- lint    账本纪律的机器化（规则清单：docs/OSCA-LINT-RULES.md）
+- pack    开发态（git 仓库）→ 交付态（zip）：lint 门禁 + 校验和清单 + 可复现打包
+- load    装载校验：完整性（防篡改）→ lint → binding 比对 → 重建签名表索引
+- replay  单条判断体检：A/B 回放（注入/不注入），看输出是否从改前移向改后
 """
 
 from __future__ import annotations
@@ -38,6 +39,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_load.add_argument("--dest", help="zip 解压目标目录（默认 ./<zip 文件名去 .zip>/）")
     p_load.add_argument("--bindings", help="部署环境 bindings.yaml 路径，用于比对 binding 是否齐备")
 
+    p_replay = sub.add_parser("replay", help="单条判断体检：A/B 回放（LLM 经 OSCA_LLM_URL 配置，可 mock://）")
+    p_replay.add_argument("package", help=".osca 包目录路径")
+    p_replay.add_argument("judgment_id", help="判断 ID，如 J-0417")
+
     return parser
 
 
@@ -69,6 +74,18 @@ def main(argv: list[str] | None = None) -> int:
         result, _ = load_osca(args.archive, dest=args.dest, bindings=args.bindings)
         print(result.render(f"osca load {args.archive}"))
         return EXIT_OK if result.ok else EXIT_FAILURE
+
+    if args.command == "replay":
+        from osca_cli.llm import LLMError
+        from osca_cli.replay import ReplayError, format_report, replay_judgment
+
+        try:
+            report = replay_judgment(args.package, args.judgment_id)
+        except (ReplayError, LLMError) as e:
+            print(str(e))
+            return EXIT_FAILURE
+        print(format_report(report))
+        return EXIT_OK if report.ok else EXIT_FAILURE
 
     parser.error(f"未知命令：{args.command}")
     return EXIT_FAILURE
