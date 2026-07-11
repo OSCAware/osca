@@ -18,8 +18,11 @@ from datetime import datetime
 from pathlib import Path
 
 import yaml
+from osca_cli.findings import Severity
+from osca_cli.ledger import LedgerLockBusy, ledger_lock
 from osca_cli.package import load_package
 from osca_cli.packer import rebuild_index
+from osca_cli.rules import run_all
 
 from osca_host import __version__
 from osca_host.connector import ConnectorProxy
@@ -135,17 +138,23 @@ class Host:
         if policy.kill_tripped:
             lines.append(f"⚠ {policy.kill_reason}——包已装载但唤醒与调用全部拒绝（三级停语义，公理 A10）")
 
-        # 布防：enabled 的 Aware 逐条触发原语进触发表
+        # 布防：enabled 的 Aware 逐条触发原语进触发表；任一条失败即补偿回滚——不留半装载包
         armed = 0
-        for aware in loaded.awares:
-            if aware.enabled:
-                for t in aware.triggers:
-                    self.table.subscribe(
-                        t.kind,
-                        t.spec,
-                        Subscription(pid, aware.aware_id, t.trigger_id, self._make_deliver(pid, aware.aware_id)),
-                    )
-                    armed += 1
+        try:
+            for aware in loaded.awares:
+                if aware.enabled:
+                    for t in aware.triggers:
+                        self.table.subscribe(
+                            t.kind,
+                            t.spec,
+                            Subscription(pid, aware.aware_id, t.trigger_id, self._make_deliver(pid, aware.aware_id)),
+                        )
+                        armed += 1
+        except Exception as e:
+            self._unload(pid)  # 补偿回滚：撤已布防 watcher + 清笼子/闸门/binding + 注销
+            detail = f"✗ 布防失败：{e}——已补偿回滚（发布与布防同生共死），包未装载"
+            log.error(detail)
+            return {"ok": False, "detail": [*result.lines, detail]}
         self._sync_slots(pid)
         lines.append(f"触发表布防 {armed} 条（schedule/watch 挂 watcher，event 待人工发射）")
         for line in lines:
@@ -204,12 +213,9 @@ class Host:
                 return
             policy = self.policies.get(package_id)
             loaded = self.registry.packages.get(package_id)
-            if policy and loaded:
-                # 账本以磁盘为准：M3 采集/拍板可能已落账——唤醒前刷新包内容 + 签名表缓存 + kill switch，
-                # 新蒸馏的判断不重启即入检索（触发命中才刷新，轮询本身不刷，成本与唤醒同频）
-                loaded.pack = load_package(loaded.root)
-                rebuild_index(loaded.root)
-                policy.refresh_kill_switch(ledger_stats(loaded.pack))
+            if policy and loaded and not self._refresh_ledger(loaded, policy):
+                log.warning(f"[{package_id}/{aware_id}] {trigger_id} 命中 → 账本刷新失败，本次唤醒拒绝（保留旧快照）")
+                return
             if policy and policy.kill_tripped:
                 log.warning(f"[{package_id}/{aware_id}] {trigger_id} 命中 → 拒绝唤醒：{policy.kill_reason}")
                 return
@@ -219,6 +225,30 @@ class Host:
                 self._assemble_episode(package_id, aware_id, trigger_id)
 
         return deliver
+
+    def _refresh_ledger(self, loaded, policy: PolicyInterceptor) -> bool:
+        """唤醒前把账本刷成磁盘现状（持账本写锁，与 oscapipe 写入者互斥）。
+
+        读取 → lint 校验 → 重建签名表 → 算 kill switch 输入，全部成功才原子替换
+        loaded.pack；锁忙（写入者事务进行中）或账本不合规 → 保留旧快照并拒绝本次
+        唤醒——宁可拒绝，不可用半截账本装配剧集。触发命中才刷新，成本与唤醒同频。
+        """
+        try:
+            with ledger_lock(loaded.root, blocking=False):
+                fresh = load_package(loaded.root)
+                errors = [f for f in run_all(fresh) if f.severity is Severity.ERROR]
+                if errors:
+                    head = "；".join(f"{f.rule} {f.message}" for f in errors[:3])
+                    log.warning(f"[{loaded.package_id}] 账本刷新失败（lint {len(errors)} 错误：{head}）——保留旧快照")
+                    return False
+                rebuild_index(loaded.root, fresh)
+                stats = ledger_stats(fresh)
+        except LedgerLockBusy:
+            log.warning(f"[{loaded.package_id}] 账本写锁被占用（写入者事务进行中）——保留旧快照")
+            return False
+        loaded.pack = fresh  # 原子替换：校验/索引/统计全部成功之后才动快照
+        policy.refresh_kill_switch(stats)
+        return True
 
     # ── 运行时内部取数（precondition / watch 轮询，经 Connector 代理 + Policy） ──
 

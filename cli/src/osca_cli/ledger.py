@@ -22,6 +22,10 @@ from pathlib import Path
 CASE_NUM = re.compile(r"C-(\d+)")
 
 
+class LedgerLockBusy(Exception):
+    """非阻塞获取账本写锁失败——另一写入者的事务正在进行。"""
+
+
 def allocate_case_path(root: Path) -> tuple[str, Path]:
     """原子分配下一个 case 编号并独占占位（空文件）。
 
@@ -43,12 +47,19 @@ def allocate_case_path(root: Path) -> tuple[str, Path]:
 
 
 @contextmanager
-def ledger_lock(root: Path):
-    """包级账本写锁（flock，跨进程互斥）。锁不住单文件时序的场合用它包住整个临界区。"""
+def ledger_lock(root: Path, *, blocking: bool = True):
+    """包级账本写锁（flock，跨进程互斥）。锁不住单文件时序的场合用它包住整个临界区。
+
+    blocking=False 用于「不该等的读方」（如 Host 唤醒前刷新快照）：写入者事务
+    进行中即抛 LedgerLockBusy——宁可拒绝本次唤醒，不可读半截账本。
+    """
     lock_dir = root / "indexes"
     lock_dir.mkdir(exist_ok=True)
     with (lock_dir / ".ledger.lock").open("w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise LedgerLockBusy(f"账本写锁被占用：{root}（写入者事务进行中）") from e
         try:
             yield
         finally:

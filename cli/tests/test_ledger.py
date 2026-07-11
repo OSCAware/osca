@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
-from osca_cli.ledger import allocate_case_path, ledger_lock
+import pytest
+
+from osca_cli.ledger import LedgerLockBusy, allocate_case_path, ledger_lock
 
 
 def test_allocate_appends_after_existing(tmp_path):
@@ -33,6 +35,15 @@ def test_concurrent_allocation_never_collides(tmp_path):
         ids = list(pool.map(lambda _: allocate_case_path(tmp_path)[0], range(24)))
     assert len(set(ids)) == 24  # 全部唯一
     assert sorted(ids)[-1] == "C-0024"
+
+
+def test_nonblocking_lock_raises_when_busy(tmp_path):
+    """不该等的读方（Host 唤醒前刷新）：写入者持锁时立刻收到 LedgerLockBusy，不阻塞。"""
+    with ledger_lock(tmp_path):
+        with pytest.raises(LedgerLockBusy), ledger_lock(tmp_path, blocking=False):
+            pass  # pragma: no cover——不该走到这里
+    with ledger_lock(tmp_path, blocking=False):
+        pass  # 锁释放后非阻塞获取照常
 
 
 def test_ledger_lock_serializes_critical_section(tmp_path):

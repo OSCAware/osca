@@ -70,7 +70,11 @@ class TriggerTable:
         if watcher is None:
             watcher = Watcher(key=key, kind=kind, spec=spec, scope=scope)
             self.watchers[key] = watcher
-            self._arm(watcher)
+            try:
+                self._arm(watcher)
+            except Exception:
+                del self.watchers[key]  # 布防失败不留空 watcher（零订阅的僵尸槽位）
+                raise
         else:
             log.info(f"触发共享：{sub.trigger_id} 复用 watcher {key}（引用 {len(watcher.subs) + 1}）")
         watcher.subs.append(sub)

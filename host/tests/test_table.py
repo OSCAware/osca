@@ -14,6 +14,22 @@ def sub(package_id: str, aware_id: str, tid: str, hits: list[str]) -> Subscripti
     return Subscription(package_id, aware_id, tid, hits.append)
 
 
+async def test_arm_failure_leaves_no_empty_watcher(monkeypatch):
+    """_arm 失败必须撤掉刚建的 watcher——零订阅的僵尸槽位会永久占住去重键。"""
+    import pytest
+
+    table = TriggerTable()
+
+    def boom(watcher):
+        raise RuntimeError("arm 失败（测试注入）")
+
+    monkeypatch.setattr(table, "_arm", boom)
+    with pytest.raises(RuntimeError):
+        table.subscribe("schedule", SCHEDULE_SPEC, sub("p1", "AW-001", "AW-001/T1", []))
+    assert table.watchers == {}  # 无空 watcher 残留
+    table.shutdown()
+
+
 async def test_dedup_shares_watcher():
     table, hits = TriggerTable(), []
     table.subscribe("schedule", SCHEDULE_SPEC, sub("p1", "AW-001", "AW-001/T1", hits))

@@ -63,5 +63,16 @@
 - lint：OSCA031 增加取代分叉检查（同一旧判断被多条判断取代即报错）
 - osca pack：输出路径落在包内直接拒绝（防交付件被下次打包吞进自身、哈希漂移）
 
+## [Review 复核 · 三轮] - 2026-07-11
+- Host 热刷新入账本锁协议：唤醒前的快照刷新持账本写锁（非阻塞）——写入者事务进行中
+  或磁盘账本不合规（lint 红灯）即拒绝本次唤醒、保留旧快照；读取/校验/重建索引/统计
+  全部成功后才原子替换 `loaded.pack`（不用半截账本装配剧集）
+- `osca_cli.ledger`：`ledger_lock` 增加非阻塞模式（`blocking=False` → `LedgerLockBusy`）；
+  `rebuild_index` 可复用已解析包
+- 发布与布防同生共死：`_load` 布防任一条失败即补偿回滚（撤 watcher + 清笼子/闸门/binding
+  + 注销），不留半装载包；`TriggerTable.subscribe` 在 `_arm` 失败时撤掉空 watcher
+- 签名表缓存形状校验：合法 YAML 但形状不对（顶层 list / entry 非 mapping）同样视为
+  缓存损坏——oscapipe 检索重建不炸，Host 装配退化空桶（包才是真理）
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC

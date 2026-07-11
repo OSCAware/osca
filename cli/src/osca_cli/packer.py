@@ -209,9 +209,12 @@ def verify_checksums(root: Path, result: OpResult) -> bool:
     return ok
 
 
-def rebuild_index(root: Path) -> Path:
-    """重建判断签名表（检索契约 §7 第 1 段的硬过滤输入）。索引是缓存，坏了随时重建（公理 A4）。"""
-    pkg = load_package(root)
+def rebuild_index(root: Path, pkg=None) -> Path:
+    """重建判断签名表（检索契约 §7 第 1 段的硬过滤输入）。索引是缓存，坏了随时重建（公理 A4）。
+
+    pkg 可传入已解析的 OscaPackage 复用（调用方刚解析过时省一次全包解析）。
+    """
+    pkg = pkg if pkg is not None else load_package(root)
     entries = []
     for f in pkg.typed_files("judgments"):
         sig = f.mapping.get("signature") or {}

@@ -68,10 +68,18 @@ class Episode:
 
 
 def _signature_table(loaded: LoadedPackage) -> list[dict]:
-    """签名表：装载五步的最后一步重建，是判断检索的硬过滤输入（indexes/ 属缓存，不在 pack 内）。"""
+    """签名表：装载五步的最后一步重建，是判断检索的硬过滤输入（indexes/ 属缓存，不在 pack 内）。
+
+    形状防御：缓存可能被外部写坏（合法 YAML 但顶层不是 mapping）——检索退化为空桶，
+    包才是真理（唤醒路径每次刷新时都会重建本表）。
+    """
     index_path = loaded.root / "indexes" / "judgments.index.yaml"
-    index = yaml.safe_load(index_path.read_text(encoding="utf-8")) or {}
-    return index.get("judgments") or []
+    try:
+        data = yaml.safe_load(index_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError:
+        return []
+    table = data.get("judgments") if isinstance(data, dict) else None
+    return [e for e in table if isinstance(e, dict)] if isinstance(table, list) else []
 
 
 def _by_id(loaded: LoadedPackage, dirname: str) -> dict[str, dict]:

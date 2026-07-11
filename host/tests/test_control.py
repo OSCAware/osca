@@ -230,9 +230,15 @@ async def test_kill_switch_recomputed_at_wakeup(running_host, sample_pack, deplo
     response = await _send({"cmd": "episodes"}, host)
     assert len(response["episodes"]) == 1  # 装载时账本健康，唤醒成功
 
-    # 模拟 M3 采集器落账：现役判断被大量推翻（9/6 > 0.3），Host 进程不重启
+    # 模拟 M3 采集器落账：现役判断被大量推翻（9/7 > 0.3），Host 进程不重启。
+    # trust 同步降 provisional——保持账本 lint 合规（唤醒前的刷新校验只放行合规账本）
     j = sample_pack / "judgments" / "J-0417.yaml"
-    j.write_text(j.read_text(encoding="utf-8").replace("overruled: 0", "overruled: 9"), encoding="utf-8")
+    text = (
+        j.read_text(encoding="utf-8")
+        .replace("overruled: 0", "overruled: 9")
+        .replace("trust: high", "trust: provisional")
+    )
+    j.write_text(text, encoding="utf-8")
 
     await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
     response = await _send({"cmd": "status"}, host)
@@ -263,6 +269,55 @@ async def test_wakeup_sees_newly_distilled_judgment(running_host, sample_pack, d
     await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
     (summary,) = (await _send({"cmd": "episodes"}, host))["episodes"]
     assert "J-0500" in summary["judgments"]  # 唤醒前刷新包内容 + 签名表——新判断即入检索
+
+
+async def test_wakeup_refused_while_ledger_locked(running_host, sample_pack, deploy):
+    """写入者事务进行中（持账本写锁）→ 唤醒拒绝、保留旧快照——不读半截账本。"""
+    from osca_cli.ledger import ledger_lock
+
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    pid = "demo-group-oper-diagnosis"
+
+    with ledger_lock(sample_pack):  # 模拟 oscapipe capture/confirm 正持锁写账
+        await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+        assert (await _send({"cmd": "episodes"}, host))["episodes"] == []  # 拒绝唤醒
+
+    await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    assert len((await _send({"cmd": "episodes"}, host))["episodes"]) == 1  # 锁释放后照常
+
+
+async def test_wakeup_refused_on_broken_ledger(running_host, sample_pack, deploy):
+    """磁盘账本不合规（如写入中断留下不可解析判断）→ 唤醒拒绝、保留旧快照。"""
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    pid = "demo-group-oper-diagnosis"
+
+    (sample_pack / "judgments" / "J-0999.yaml").write_text("judgment_id: [未闭合", encoding="utf-8")
+    await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    assert (await _send({"cmd": "episodes"}, host))["episodes"] == []  # 半截账本不装配
+
+
+async def test_arming_failure_rolls_back_registration(running_host, sample_pack, monkeypatch):
+    """发布与布防同生共死：第二条订阅失败 → 补偿回滚，注册表/笼子/闸门/watcher 零残留。"""
+    host = running_host
+    original = host.table.subscribe
+    calls = {"n": 0}
+
+    def flaky(kind, spec, sub):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("布防失败（测试注入）")
+        return original(kind, spec, sub)
+
+    monkeypatch.setattr(host.table, "subscribe", flaky)
+    response = await _send({"cmd": "load", "path": str(sample_pack)}, host)
+    assert not response["ok"]
+    assert any("补偿回滚" in line for line in response["detail"])
+
+    status = await _send({"cmd": "status"}, host)
+    assert status["packages"] == [] and status["triggers"] == []  # 第一条 watcher 也已撤
+    assert host.policies == {} and host.proxies == {} and host.gates == {} and host.bindings == {}
 
 
 async def test_load_failure_leaves_no_half_registered_package(running_host, sample_pack, monkeypatch):
