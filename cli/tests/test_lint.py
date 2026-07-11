@@ -387,6 +387,27 @@ def test_bool_counts_rejected(make_pkg, base):
     assert any(f.rule == "OSCA040" and "布尔" in f.message for f in result.findings)
 
 
+def test_legal_shape_illegal_value_rejected(make_pkg, base):
+    """合法形状、非法值同样必须 ERROR——否则不绕过 lint 也能削弱脱敏/预算/kill switch。"""
+    import copy
+
+    value_cases = [
+        ("policy.yaml", "data", {"redact": ["身份证"]}),  # 未知类别 → 运行时过滤成空
+        ("policy.yaml", "kill_switch", [{"when": ["not", "string"]}]),  # truthy 非字符串
+        ("policy.yaml", "budgets", {"per_episode": {"max_tool_calls": "unlimited"}}),  # 记法非法 → 无限额
+        ("policy.yaml", "budgets", {"per_episode": {"max_tokens": -5}}),
+        ("aware/AW-001-定时.yaml", "budget", {"max_steps": "很多步"}),
+        ("policy.yaml", "permissions", [{"step": "取数"}]),  # 缺 allow——白名单必须显式
+        ("structure.yaml", "pipeline", [{"step": "", "performer": "agent"}]),  # 空 step
+        ("structure.yaml", "pipeline", [{"performer": "agent"}]),  # 缺 step
+    ]
+    for relpath, fieldname, bad in value_cases:
+        mutated = copy.deepcopy(base)
+        mutated[relpath][fieldname] = bad
+        result = lint_package(make_pkg(mutated))
+        assert not result.ok, f"{relpath} 的 {fieldname}={bad!r} 应报 ERROR"
+
+
 def test_shape_findings_are_locatable_not_backstop(make_pkg, base):
     """诊断可定位：形状错误报在对应文件的正常 finding，不退化为 run_all 兜底的「.」。"""
     import copy

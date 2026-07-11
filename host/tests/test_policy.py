@@ -82,35 +82,40 @@ def test_kill_switch_garbage_threshold_does_not_crash():
     assert any("阈值不可解析" in a["reason"] for a in p.audit)
 
 
-def test_interceptor_defends_leaf_shapes_itself():
-    """笼子自防（不依赖 lint 先行）：叶子形状错误留审计警告、绝不静默改语义。"""
+def test_interceptor_fails_closed_on_broken_safety_config():
+    """fail-closed（七轮定稿）：安全段配置非法时保守默认朝安全侧倒——「有警告」不能替代安全效果。"""
+    from osca_host.policy import REDACTORS
+
     p = make(
         policy={
             **POLICY,
-            "data": {"redact": "身份证号"},  # 字符串 → 逐字符遍历 → 脱敏静默关闭（此前的病灶）
+            "data": {"redact": "身份证号"},  # 字符串会被逐字符遍历——此前脱敏被静默关闭
             "egress": {"allow_domains": "oscaware.com"},
         }
     )
-    assert p.redact_categories == []
-    assert any("data.redact 形状错误" in a["reason"] for a in p.audit)  # 关闭有痕，不是静默
-    assert p.egress_allow == set()
-    assert any("egress.allow_domains 形状错误" in a["reason"] for a in p.audit)
-    assert not p.authorize_egress("oscaware.com")[0]  # 白名单未生效 → 默认全禁仍成立
+    assert set(p.redact_categories) == set(REDACTORS)  # 脱敏配置非法 → 保守全开（宁可多脱不可泄露）
+    assert p.redact("经办电话 13812345678")[1] == 1  # 真的在脱，不只是留警告
+    assert p.egress_allow == set() and not p.authorize_egress("oscaware.com")[0]  # 默认全禁成立
 
     p2 = make(
         policy={
             **POLICY,
-            "permissions": ["oops", {"step": "取数", "allow": "不是列表"}],
+            "permissions": [{"step": "取数", "allow": ["CON-001.拉取费用明细", 42]}],  # 混合列表
             "approvals": ["oops"],
             "kill_switch": 42,
             "budgets": {"per_episode": ["oops"]},
-        },
-        stats={"confirmed": 1, "overruled": 100},
+        }
     )
-    assert p2.permissions == {"取数": set()}  # allow 形状错误 → 空白名单（默认拒绝语义不变）
-    assert p2.approvals == {} and p2.max_tool_calls is None and p2.max_tokens is None
-    assert not p2.kill_tripped  # kill_switch 形状错误 → 不生效并留痕
-    assert any("形状错误" in a["reason"] for a in p2.audit)
+    assert p2.permissions["取数"] == set()  # 混合列表不部分接受——整叶空白名单（默认拒绝）
+    assert p2.kill_tripped and "配置错误" in p2.kill_reason  # kill switch 形状非法 → 停机
+    assert p2.max_tool_calls == 0 and p2.max_tokens == 0  # 预算非法 → 额度撤销
+    assert not p2.require_approval("终稿发送管理层")[0]  # 审批配置非法 → 一律拒绝
+    assert not p2.require_approval("任意动作")[0]  # 「不在清单放行」的口子也关死
+
+    p3 = make(policy={**POLICY, "data": {"redact": ["身份证"]}})  # 合法形状、未知类别
+    assert set(p3.redact_categories) == set(REDACTORS)  # 未知类别同样保守全开
+    p4 = make(policy={**POLICY, "kill_switch": [{"when": ["not", "string"]}]})
+    assert p4.kill_tripped and "配置错误" in p4.kill_reason  # when 非字符串 → 停机
 
 
 def test_revoke_stops_all_calls():
@@ -133,11 +138,15 @@ def test_kill_switch_refreshes_with_ledger():
     assert not p.kill_tripped
 
 
-def test_unparsable_max_tool_calls_warns_and_disables_cap():
-    p = make(policy={**POLICY, "budgets": {"per_episode": {"max_tool_calls": "十次"}}})
-    assert p.max_tool_calls is None
-    assert any("max_tool_calls 不可解析" in a["reason"] for a in p.audit)
-    assert p.authorize_tool("取数", "CON-001.拉取费用明细", episode_id="EP-1")[0]  # 顶不生效但不误伤调用
+def test_unparsable_budget_revokes_quota_not_unlimited():
+    """错误预算不是无限额（fail-closed）：不可解析 → 额度撤销（0），任何调用即拒。"""
+    p = make(policy={**POLICY, "budgets": {"per_episode": {"max_tool_calls": "unlimited"}}})
+    assert p.max_tool_calls == 0
+    ok, reason = p.authorize_tool("取数", "CON-001.拉取费用明细", episode_id="EP-1")
+    assert not ok and "预算硬顶" in reason
+    assert any("额度撤销" in a["reason"] for a in p.audit)
+    # 未声明 ≠ 非法：不写 max_tokens 是合法的「无硬顶」选择
+    assert p.max_tokens is None
 
 
 def test_write_approval_defaults_to_deny():

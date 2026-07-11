@@ -7,11 +7,16 @@
 
 tokens 硬顶语义（W5，剧集执行接 LLM 后生效）：用量在调用后由网关回报，
 记账后超顶即拒——超顶的那次调用已经发生，剧集就地停；这是止损顶，不是预扣顶。
-数量记法受限形式 `<正整数>[k]`（如 200k），不可解析的记警告、硬顶不生效。
+数量记法受限形式 `<正整数>[k]`（如 200k）。
+
+fail-closed 纪律（Review 七轮定稿）：安全段配置非法时，保守默认必须朝安全侧倒——
+「有警告」不能替代安全效果。脱敏配置非法 → 启用全部已知类别（宁可多脱不可泄露）；
+预算非法/不可解析 → 额度撤销（0），不是无限额；kill_switch 形状非法 → 按配置错误
+停机；审批配置非法 → 一律拒绝。自由文本 kill 条件不可求值仍记警告不生效——那是
+SPEC v0.4 §4 给声明性文本的保守默认，与形状非法是两回事。
 
 W4 边界（诚实标注）：kill_switch 条件的可求值形式为「overruled/confirmed > X」，
-按包内全部判断的计数合计近似（「近30天」窗口需要蒸馏管道的时间账，M3 后收紧）；
-不可求值的条件记警告、不生效。
+按包内全部判断的计数合计近似（「近30天」窗口需要蒸馏管道的时间账，M3 后收紧）。
 """
 
 from __future__ import annotations
@@ -19,26 +24,18 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
+from osca_cli.triggers import parse_quantity  # 数量记法单一真理源（SPEC v0.4 §5，lint OSCA040 同源）
+
+__all__ = ["PolicyInterceptor", "REDACTORS", "ledger_stats", "parse_quantity"]
+
 REDACTORS: dict[str, re.Pattern[str]] = {
     "身份证号": re.compile(r"\b\d{17}[\dXx]\b"),
     "手机号": re.compile(r"\b1[3-9]\d{9}\b"),
 }
 
 KILL_RATIO = re.compile(r".*overruled\s*/\s*confirmed\s*>\s*([\d.]+).*")
-QUANTITY = re.compile(r"(\d+)\s*([kK]?)")
 
 AUDIT_TAIL = 20  # status 里只带最近这些条
-
-
-def parse_quantity(value) -> int | None:
-    """数量记法受限形式：整数或 `<正整数>[k]`（200k → 200000）；其余不可解析返回 None。"""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and (m := QUANTITY.fullmatch(value.strip())):
-        return int(m.group(1)) * (1000 if m.group(2) else 1)
-    return None
 
 
 class PolicyInterceptor:
@@ -70,44 +67,81 @@ class PolicyInterceptor:
                 shape_warn("permissions", p, "含 step 字符串的 mapping")
                 continue
             allow = p.get("allow")
-            if allow is not None and not isinstance(allow, list):
+            if allow is not None and (not isinstance(allow, list) or any(not isinstance(a, str) for a in allow)):
+                # 混合/非法列表不部分接受：整个白名单按空处理——默认拒绝（fail-closed）
                 shape_warn(f"permissions[{p['step']}].allow", allow, "字符串列表")
                 allow = []
-            self.permissions[p["step"]] = {a for a in allow or [] if isinstance(a, str)}
+            self.permissions[p["step"]] = set(allow or [])
 
-        budgets = as_dict("budgets", policy.get("budgets"))
-        per_episode = as_dict("budgets.per_episode", budgets.get("per_episode"))
-        self.max_tool_calls = (
-            parse_quantity(per_episode.get("max_tool_calls")) if "max_tool_calls" in per_episode else None
+        # 预算：配置非法/不可解析 = 额度撤销（0）——错误预算不是无限额（fail-closed）
+        budgets_raw = policy.get("budgets")
+        per_raw = budgets_raw.get("per_episode") if isinstance(budgets_raw, dict) else None
+        budgets_broken = (budgets_raw is not None and not isinstance(budgets_raw, dict)) or (
+            per_raw is not None and not isinstance(per_raw, dict)
         )
-        if "max_tool_calls" in per_episode and self.max_tool_calls is None:
-            detail = "max_tool_calls 不可解析（受限形式：<正整数>[k]），硬顶不生效"
-            self._record("warn", "budgets", str(per_episode["max_tool_calls"]), detail)
+        per_episode = per_raw if isinstance(per_raw, dict) else {}
+        if budgets_broken:
+            self._record(
+                "deny",
+                "budgets",
+                str(budgets_raw),
+                "预算配置非法——额度撤销（tool_calls/tokens = 0），修好 policy 再放行",
+            )
+            self.max_tool_calls: int | None = 0
+            self.max_tokens: int | None = 0
+        else:
+
+            def quantity_or_revoke(key: str) -> int | None:
+                if key not in per_episode:
+                    return None  # 未声明 = 无硬顶（合法的显式选择）
+                value = parse_quantity(per_episode[key])
+                if value is None:
+                    detail = f"{key} 不合数量记法（<正整数>[k]）——额度撤销（0），不是无限额"
+                    self._record("deny", "budgets", str(per_episode[key]), detail)
+                    return 0
+                return value
+
+            self.max_tool_calls = quantity_or_revoke("max_tool_calls")
+            self.max_tokens = quantity_or_revoke("max_tokens")
         self._tool_calls: dict[str, int] = {}  # episode_id → 已用
-        self.max_tokens = parse_quantity(per_episode.get("max_tokens")) if "max_tokens" in per_episode else None
-        if "max_tokens" in per_episode and self.max_tokens is None:
-            detail = "max_tokens 不可解析（受限形式：<正整数>[k]），硬顶不生效"
-            self._record("warn", "budgets", str(per_episode["max_tokens"]), detail)
         self._tokens: dict[str, int] = {}  # episode_id → 已用
 
         domains = as_dict("egress", policy.get("egress")).get("allow_domains")
-        if domains is not None and not isinstance(domains, list):
-            shape_warn("egress.allow_domains", domains, "字符串列表")  # 白名单未生效——默认全禁仍成立
+        if domains is not None and (not isinstance(domains, list) or any(not isinstance(d, str) for d in domains)):
+            # 混合/非法列表整叶弃用——默认全禁成立（fail-closed）
+            shape_warn("egress.allow_domains", domains, "字符串列表")
             domains = []
-        self.egress_allow: set[str] = {d for d in domains or [] if isinstance(d, str)}
+        self.egress_allow: set[str] = set(domains or [])
 
+        # 脱敏：配置非法（形状/混合元素/未知类别）→ 保守启用全部已知类别——宁可多脱，不可泄露
         redact = as_dict("data", policy.get("data")).get("redact")
-        if redact is not None and not isinstance(redact, list):
-            shape_warn("data.redact", redact, "字符串列表")  # 脱敏能力绝不静默关闭——留痕可查
-            redact = []
-        self.redact_categories = [c for c in redact or [] if c in REDACTORS]
+        redact_broken = redact is not None and (
+            not isinstance(redact, list) or any(not isinstance(c, str) or c not in REDACTORS for c in redact)
+        )
+        if redact_broken:
+            detail = "脱敏配置非法（须为受支持类别的字符串列表）——保守启用全部已知脱敏类别（fail-closed）"
+            self._record("deny", "data.redact", str(redact), detail)
+            self.redact_categories = list(REDACTORS)
+        else:
+            self.redact_categories = list(redact or [])
 
+        # 审批：配置非法 → 审批门一律拒绝——清空后按「不在清单」放行是 fail-open，不允许
+        approvals_raw = policy.get("approvals")
         self.approvals: dict[str, str] = {}
-        for a in as_list("approvals", policy.get("approvals")):
-            if isinstance(a, dict) and isinstance(a.get("action"), str):
-                self.approvals[a["action"]] = str(a.get("approver"))
+        self._approvals_broken = approvals_raw is not None and not isinstance(approvals_raw, list)
+        for a in approvals_raw if isinstance(approvals_raw, list) else []:
+            if isinstance(a, dict) and isinstance(a.get("action"), str) and isinstance(a.get("approver"), str):
+                self.approvals[a["action"]] = a["approver"]
             else:
                 shape_warn("approvals", a, "含 action/approver 字符串的 mapping")
+                self._approvals_broken = True
+        if self._approvals_broken:
+            self._record(
+                "deny",
+                "approvals",
+                str(approvals_raw),
+                "审批配置非法——审批门一律拒绝（fail-closed），修好 policy 再放行",
+            )
         self._granted: set[str] = set()
         self.revoked = ""  # 非空即包停/撤销原因——在途剧集在步间与每次调用点看它（三级停之「包停」触达认知平面）
         self._policy = policy  # kill switch 重算用（账本计数变了，条件不变）
@@ -116,15 +150,22 @@ class PolicyInterceptor:
 
     # ── kill switch（公理 A10：账本健康度即安全信号） ──────────────────
 
+    def _config_error_kill(self, subject: str, why: str) -> tuple[bool, str]:
+        """kill switch 形状非法 = 配置错误即停机（fail-closed）——「不生效」是给自由文本条件的，不给坏形状。"""
+        reason = f"kill switch 配置错误（{why}）——配置错误即停机，修好 policy 再启用"
+        if reason not in self._warned_conditions:
+            self._warned_conditions.add(reason)
+            self._record("deny", "kill_switch", subject, reason)
+        return True, reason
+
     def _eval_kill_switch(self, policy: dict, stats: dict[str, int]) -> tuple[bool, str]:
         entries = policy.get("kill_switch")
         if entries is not None and not isinstance(entries, list):
-            if "__kill_switch_shape__" not in self._warned_conditions:
-                self._warned_conditions.add("__kill_switch_shape__")
-                self._record("warn", "kill_switch", str(entries), "kill_switch 形状错误（须为 list）——不生效")
-            return False, ""
+            return self._config_error_kill(str(entries), "必须是 list")
         for entry in entries or []:
-            condition = str(entry.get("when", "")) if isinstance(entry, dict) else str(entry)
+            if not isinstance(entry, dict) or not isinstance(entry.get("when"), str):
+                return self._config_error_kill(str(entry), "每项必须是含 when 字符串的 mapping")
+            condition = entry["when"]
             m = KILL_RATIO.fullmatch(condition)
             if m is None:
                 if condition not in self._warned_conditions:
@@ -210,6 +251,8 @@ class PolicyInterceptor:
     # ── 审批门（授予一次用一次；授予入口是控制通道，M4 换审批卡界面） ──
 
     def require_approval(self, action: str) -> tuple[bool, str]:
+        if self._approvals_broken:
+            return self._deny(None, action, "approvals 配置非法——审批门一律拒绝（fail-closed），修好 policy 再放行")
         approver = self.approvals.get(action)
         if approver is None:
             return True, "动作不在审批清单，放行"

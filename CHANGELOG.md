@@ -109,5 +109,17 @@
   judgment_id 本地验型——报对应文件的正常 finding，不再退化为 run_all 兜底的「.」；
   变异矩阵按 GPT 建议收紧（叶子/元素/布尔各有必须 ERROR 的断言）
 
+## [Review 复核 · 七轮] - 2026-07-12
+- Policy fail-closed 定稿：安全段配置非法时保守默认朝安全侧倒——脱敏配置非法
+  （形状/混合元素/未知类别）→ 启用全部已知脱敏类别（宁可多脱不可泄露）；预算非法或
+  不可解析 → 额度撤销（0），不是无限额；kill_switch 形状非法（非 list/项非 mapping/
+  when 非字符串）→ 配置错误即停机；审批配置非法 → 审批门一律拒绝（「不在清单放行」
+  的口子同时关死）；混合列表不部分接受、整叶保守。SPEC v0.4 §4/§5 同步定稿
+- lint 值级校验（OSCA040）：data.redact 限受支持类别枚举；kill_switch[].when 必须
+  非空字符串；policy per_episode 与 aware budget 的预算键必须合数量记法（正整数，
+  0/负数/unlimited 全拒）；permissions[].allow 必填（空列表也要显式）；pipeline
+  步骤必须有非空字符串 step
+- parse_quantity 上移 osca_cli.triggers（lint 与 Host 同源），并收紧为「正整数」
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC

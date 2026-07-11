@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 DURATION = re.compile(r"(\d+)([smhd])")
 UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+QUANTITY = re.compile(r"(\d+)\s*([kK]?)")
 TIME_HHMM = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
 WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -32,6 +33,21 @@ TRIGGER_KEYS = {
 }
 GATE_KEYS = {"combine", "precondition", "debounce", "on_fail"}
 COMBINE_MODES = {"any", "all", "sequence"}
+
+
+def parse_quantity(value: object) -> int | None:
+    """预算数量记法受限形式（SPEC v0.4 §5）：整数或 `<正整数>[k]`（200k → 200000）。
+
+    其余不可解析返回 None；bool 是 int 子类，显式排除。lint（OSCA040）与
+    Host Policy 拦截器共用——记法只在这里定义一次。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None  # 受限形式是「正整数」——0 与负数一律非法
+    if isinstance(value, str) and (m := QUANTITY.fullmatch(value.strip())):
+        return int(m.group(1)) * (1000 if m.group(2) else 1) or None  # "0"/"0k" 同样非法
+    return None
 
 
 def parse_duration(value: object) -> timedelta | None:
