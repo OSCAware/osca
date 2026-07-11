@@ -127,5 +127,48 @@
   档案缺失/损坏/越界 → 条件不生效留痕——数据可用性缺口走保守默认，与配置形状非法
   （fail-closed 停机）是两回事。样例包 policy 的「回放红灯率 > 20%」自此可真裁决
 
+## [Review 复核 · 八轮] - 2026-07-12
+- 脱敏正则边界修正：`\b` 在中文紧邻数字处无边界（中文与数字同属 \w），
+  「手机号13812345678」会整条漏掉——改用数字负向断言，fail-closed 全开时不再漏
+- 预算键按运行时真实契约拆分：Aware（max_steps/max_minutes/max_tokens）与
+  Policy（max_tool_calls/max_tokens）各自受限、未知键报错——「声明了没人执行的
+  硬顶」不再 0 错通过
+- tokens 额度预检：零额度（含配置错误撤销的）在 llm.complete 之前拒绝——
+  「额度撤销、任何调用即拒」真正成立；止损顶只管合法正数预算的超顶；
+  runner 对绕过 lint 的非法 aware 预算同样撤销自防
+- 自防与 lint 对齐：data 父段非法不再压成 {}（与「未声明」混同）→ 保守全开；
+  kill_switch 空白 when 与 lint 同谓词 → 配置错误停机
+- 审批配置损坏时 grant_approval 拒绝授予、status 明示 config_error/deny_all
+  ——不再展示永不生效的 granted
+
+## [Review 复核 · 九轮] - 2026-07-12
+- authorize_llm 统一闸：每次 llm.complete 前查包停 + kill switch + tokens 额度——
+  在途剧集对执行中途新触发的 kill switch 不再有豁免
+- 健康档案作为安全信号的可信度收口（M3-W4 配套）：Host 校验完整契约
+  （generated_by/at/model/ledger_head、非负整数计数、total 自洽、judgments 数量、
+  red_rate 派生一致），任一不过按档案不可用；可判 0（green+red==0）= unavailable，
+  不作 0% 红灯；git 根上 ledger_head ≠ 当前 HEAD 的旧档案不采信；
+  判定改整数计数交叉相乘——四位小数派生值不再翻转严格 > 判定
+- 预算键常量上移 osca_cli.triggers（lint 与 Host Policy/Runner 单一真理源）；
+  运行时自防补齐：per_episode 出现跨层/未知键 → 额度撤销，aware.budget 出现
+  跨层/未知键 → 拒绝执行
+- 脱敏类别双份常量增加一致性锚测试（cli 枚举 vs host 正则表，漂移即红灯）
+- SPEC v0.4 §4 健康档案契约同步定稿（ledger_head/unavailable/交叉相乘/原子发布）
+
+## [Review 复核 · 十轮 · Host 0.2.0] - 2026-07-12
+- 账本版本戳协议升级：`ledger_stamp`（包内容 git tree OID，子目录包不被无关提交
+  作废）+ `ledger_dirty`（包范围干净区）上移 osca_cli.ledger——健康档案生产端与
+  Host 消费端同一协议；档案字段 ledger_head → **ledger_tree**
+- kill switch 三态（TRIPPED/CLEAR/UNAVAILABLE）：unavailable 保留既有安全状态
+  ——已触发的红灯不被可用性缺口（档案缺失/账本前进/网关故障）清除，有可判数据
+  证明健康才解除；重启即重评（持久化停机名单归部署侧，诚实标注）
+- 健康档案消费端全 schema：judgments/red_rate 必填、逐项 light 枚举 + 非负整数
+  assertions、灯色汇总与顶层计数对账、red_rate 有限且与计数一致；
+  **非 git / git 失败 = 无法验证版本归属 → 不可用**（无法验证 ≠ 可以采信）
+- Decimal 精确算术：阈值十进制 + 整数交叉相乘——18.4%×375 的二进制浮点误触发根除
+- budgets 外层未知段（如 per_epiosde 拼写错误）：lint ERROR + 运行时额度撤销
+- authorize_llm 三检入授权锁（与 revoke/kill 发布同一线性化边界）；permit 成功留审计痕
+- Host 版本 0.1.0 → 0.2.0（replay_health 返回键与档案契约为破坏性变更）
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC

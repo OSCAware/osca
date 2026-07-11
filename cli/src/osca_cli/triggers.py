@@ -22,6 +22,11 @@ from zoneinfo import ZoneInfo
 DURATION = re.compile(r"(\d+)([smhd])")
 UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 QUANTITY = re.compile(r"(\d+)\s*([kK]?)")
+
+# 预算键按运行时真实契约拆分（单一真理源：lint OSCA040 与 Host Policy/Runner 的自防共用）——
+# 接受运行时不执行的键 = 「声明了没人执行的硬顶」fail-open
+AWARE_BUDGET_KEYS = ("max_steps", "max_minutes", "max_tokens")  # 剧集执行器裁决
+POLICY_BUDGET_KEYS = ("max_tool_calls", "max_tokens")  # Policy 拦截器裁决
 TIME_HHMM = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
 WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 

@@ -396,12 +396,29 @@ def test_legal_shape_illegal_value_rejected(make_pkg, base):
         ("policy.yaml", "kill_switch", [{"when": ["not", "string"]}]),  # truthy 非字符串
         ("policy.yaml", "budgets", {"per_episode": {"max_tool_calls": "unlimited"}}),  # 记法非法 → 无限额
         ("policy.yaml", "budgets", {"per_episode": {"max_tokens": -5}}),
+        ("policy.yaml", "budgets", {"per_epiosde": {"max_tokens": 1}}),  # 外层拼写错误 → 静默无限额
         ("aware/AW-001-定时.yaml", "budget", {"max_steps": "很多步"}),
         ("policy.yaml", "permissions", [{"step": "取数"}]),  # 缺 allow——白名单必须显式
         ("structure.yaml", "pipeline", [{"step": "", "performer": "agent"}]),  # 空 step
         ("structure.yaml", "pipeline", [{"performer": "agent"}]),  # 缺 step
     ]
     for relpath, fieldname, bad in value_cases:
+        mutated = copy.deepcopy(base)
+        mutated[relpath][fieldname] = bad
+        result = lint_package(make_pkg(mutated))
+        assert not result.ok, f"{relpath} 的 {fieldname}={bad!r} 应报 ERROR"
+
+
+def test_budget_keys_split_by_runtime_contract(make_pkg, base):
+    """预算键按运行时真实契约拆分：声明了没人执行的硬顶 = fail-open，必须 ERROR。"""
+    import copy
+
+    cases_ = [
+        ("aware/AW-001-定时.yaml", "budget", {"max_tool_calls": 1}),  # 剧集执行器不执行它
+        ("aware/AW-001-定时.yaml", "budget", {"banana": 1}),  # 未知键
+        ("policy.yaml", "budgets", {"per_episode": {"max_steps": 1}}),  # Policy 拦截器不执行它
+    ]
+    for relpath, fieldname, bad in cases_:
         mutated = copy.deepcopy(base)
         mutated[relpath][fieldname] = bad
         result = lint_package(make_pkg(mutated))

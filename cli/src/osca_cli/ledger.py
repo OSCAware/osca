@@ -16,10 +16,49 @@ from __future__ import annotations
 
 import fcntl
 import re
+import subprocess
 from contextlib import contextmanager
 from pathlib import Path
 
 CASE_NUM = re.compile(r"C-(\d+)")
+
+
+def _git_out(root: Path, *args: str) -> str | None:
+    proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def ledger_stamp(root: Path | str) -> str | None:
+    """包内容的版本戳：HEAD 下该包目录的 git tree OID。
+
+    绑定包内容而非整仓 HEAD——子目录包不被无关提交作废；配合干净区检查
+    （ledger_dirty），戳相同 ⇔ 账本文件内容相同。非 git / git 失败 → None，
+    调用方一律按「版本不可证」处理（fail-closed），不许当「非 git 照常接受」。
+    """
+    root = Path(root).resolve()
+    toplevel = _git_out(root, "rev-parse", "--show-toplevel")
+    if toplevel is None:
+        return None
+    try:
+        rel = root.relative_to(Path(toplevel).resolve())
+    except ValueError:
+        return None
+    spec = "HEAD^{tree}" if rel == Path(".") else f"HEAD:{rel.as_posix()}"
+    return _git_out(root, "rev-parse", spec)
+
+
+def ledger_dirty(root: Path | str) -> list[str] | None:
+    """包范围未提交改动清单（indexes/ 缓存除外）；非 git / git 失败 → None（不可判定）。
+
+    健康档案等版本敏感产物的生产端与消费端共用：未提交的判断/case 不在版本快照里，
+    干净区不成立时戳不能证明内容。
+    """
+    root = Path(root)
+    porcelain = _git_out(root, "status", "--porcelain", "--", ".")
+    if porcelain is None:
+        return None
+    cache = re.compile(r"(^|/)indexes/")  # 任意层级的 indexes/ 都是缓存
+    return [line for line in porcelain.splitlines() if line.strip() and not cache.search(line[3:].strip().strip('"'))]
 
 
 class LedgerLockBusy(Exception):

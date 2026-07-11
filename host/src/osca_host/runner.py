@@ -25,6 +25,7 @@ from datetime import datetime
 
 import yaml
 from osca_cli.llm import LLMError, resolve_llm
+from osca_cli.triggers import AWARE_BUDGET_KEYS
 
 from osca_host.connector import ConnectorProxy
 from osca_host.episode import Episode
@@ -152,10 +153,24 @@ def run_episode(
     """沿 pipeline 执行剧集。llm 未注入时按环境变量解析（osca_cli.llm）。"""
     episode.status = "running"
     started = time.monotonic()
+    if episode.budget is not None and not isinstance(episode.budget, dict):
+        return _finish(episode, "failed", "aware.budget 形状非法（须为 mapping）——宁可拒绝，不可无硬顶执行")
     budget = episode.budget or {}
-    max_steps = parse_quantity(budget.get("max_steps")) if "max_steps" in budget else None
-    max_minutes = parse_quantity(budget.get("max_minutes")) if "max_minutes" in budget else None
-    max_tokens = parse_quantity(budget.get("max_tokens")) if "max_tokens" in budget else None
+    if unknown := sorted(k for k in budget if k not in AWARE_BUDGET_KEYS):
+        # 跨层/未知键 = 声明了没人执行的硬顶——lint 应拦，运行时自防拒绝执行（fail-closed）
+        detail = f"aware.budget 含运行时不执行的键 {unknown}（只认 {list(AWARE_BUDGET_KEYS)}）——拒绝执行"
+        return _finish(episode, "failed", detail)
+
+    def budget_cap(key: str) -> int | None:
+        """声明了却不可解析 = 额度撤销（0）——绕过 lint 也不许退化成无硬顶（fail-closed 自防）。"""
+        if key not in budget:
+            return None
+        value = parse_quantity(budget[key])
+        return value if value is not None else 0
+
+    max_steps = budget_cap("max_steps")
+    max_minutes = budget_cap("max_minutes")
+    max_tokens = budget_cap("max_tokens")
 
     pipeline = (episode.context.get("structure") or {}).get("pipeline") or []
     if not pipeline:
@@ -223,6 +238,17 @@ def run_episode(
                 detail = f"上游产物「{input_key}」缺失——流水线声明与执行不符，直接拒绝"
                 _record(episode, step_name, performer, "failed", detail)
                 return _finish(episode, "failed", detail)
+            # 统一闸（每次 LLM 调用前）：包停 / kill switch / tokens 额度——
+            # 在途剧集对新触发的 kill switch 无豁免；零额度一次都不发起，止损顶只管超顶
+            ok, reason = policy.authorize_llm(episode.episode_id)
+            if not ok:
+                return _finish(episode, "stopped", f"{reason}（剧集停）")
+            if max_tokens is not None and episode.tokens_used >= max_tokens:
+                return _finish(
+                    episode,
+                    "stopped",
+                    f"预算硬顶：aware tokens 额度已尽（{episode.tokens_used}/{max_tokens}），拒绝发起调用（剧集停）",
+                )
             try:
                 llm = llm or resolve_llm()
                 reply = llm.complete(

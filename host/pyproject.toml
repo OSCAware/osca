@@ -1,6 +1,6 @@
 [project]
 name = "osca-host"
-version = "0.1.0"
+version = "0.2.0"
 description = "OSCA 运行框架 Host 参考实现——确定性常驻进程，无 LLM（架构 §4）"
 readme = "README.md"
 requires-python = ">=3.10"

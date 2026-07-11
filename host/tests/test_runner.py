@@ -94,6 +94,59 @@ def test_revoked_package_stops_inflight_episode(episode, loaded, proxy, policy, 
     assert episode.steps == []  # 取消点在第一步发起之前
 
 
+def test_kill_switch_mid_episode_blocks_next_llm_call(episode, loaded, proxy, policy, llm):
+    """在途剧集对新触发的 kill switch 无豁免：第一个 agent 步后触发，第二个 agent 步零调用。"""
+
+    class TripAfterFirst:
+        model = "mock"
+
+        def complete(self, system, user, tag=None):
+            reply = llm.complete(system, user, tag=tag)
+            policy.publish_kill_switch("tripped", "kill switch 触发：测试注入")
+            return reply
+
+    run_episode(episode, loaded, proxy, policy, llm=TripAfterFirst())
+    assert episode.status == "stopped" and "拒绝发起 LLM 调用" in episode.stop_reason
+    assert llm.calls == ["episode/生成报警候选"]  # 第二个 agent 步（裁决）一次都没调
+
+
+def test_cross_section_budget_key_refused(episode, loaded, proxy, policy, llm):
+    """aware.budget 里出现 Policy 层的键（如 max_tool_calls）——运行时自防拒绝执行。"""
+    episode.budget = {"max_tool_calls": 1}
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "failed" and "不执行的键" in episode.stop_reason
+    assert llm.calls == []
+
+
+def test_zero_token_budget_blocks_llm_call_entirely(episode, loaded, proxy, llm):
+    """「额度撤销、任何调用即拒」：零额度在 llm.complete 之前预检拒绝——LLM 一次都不调。"""
+    policy = PolicyInterceptor(
+        loaded.package_id,
+        {
+            "permissions": [{"step": "取数", "allow": ["CON-001.拉取费用明细", "CON-001.拉取检修计划期"]}],
+            "budgets": {"per_episode": {"max_tokens": "unlimited"}},  # 记法非法 → 额度撤销（0）
+        },
+        {"confirmed": 0, "overruled": 0},
+    )
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "stopped" and "拒绝发起" in episode.stop_reason
+    assert llm.calls == []  # 不是调用后止损——一次都没发起
+
+
+def test_unparsable_aware_budget_revokes_not_unlimited(episode, loaded, proxy, policy, llm):
+    """绕过 lint 的非法 aware 预算不得退化成无硬顶——runner 自防：额度撤销即停。"""
+    episode.budget = {"max_steps": "很多步"}
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "stopped" and "max_steps" in episode.stop_reason
+    assert llm.calls == []
+
+    episode2 = copy.deepcopy(episode)
+    episode2.status = "assembled"
+    episode2.budget = ["oops"]
+    run_episode(episode2, loaded, proxy, policy, llm=llm)
+    assert episode2.status == "failed" and "形状非法" in episode2.stop_reason
+
+
 def test_budget_tokens_hard_stop(episode, loaded, proxy, policy, llm):
     episode.budget = dict(episode.budget, max_tokens=1)  # aware 预算收到 1 token
     run_episode(episode, loaded, proxy, policy, llm=llm)
