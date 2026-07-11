@@ -61,5 +61,8 @@ __pycache__/
 # OpenAI Sites project binding (local only)
 /.openai/
 
+# Codex isolated worktrees (local only)
+/.worktrees/
+
 # indexes/ 是机器生成的缓存（公理 A4），装载时重建，不入库
 **/*.osca/indexes/
