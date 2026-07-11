@@ -161,6 +161,28 @@ def test_osca031_valid_chain_passes(make_pkg, base):
     assert "OSCA031" not in rules_hit(result)
 
 
+def test_osca030_rejects_non_case_evidence(make_pkg, base):
+    """证据物种只有 case——引用碰巧存在的别类 ID（对象/判断）不算出生证据。"""
+    base["judgments/J-0001.yaml"]["evidence"] = ["OBJ-001"]
+    assert "OSCA030" in rules_hit(lint_package(make_pkg(base)))
+
+
+def test_osca031_self_supersedes_rejected(make_pkg, base):
+    base["judgments/J-0001.yaml"]["supersedes"] = "J-0001"
+    base["judgments/J-0001.yaml"]["status"] = "superseded"
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA031" and "指向自身" in f.message for f in result.findings)
+
+
+def test_osca031_supersedes_cycle_rejected(make_pkg, base):
+    """互相取代是账本悖论：没有一条现役判断，回放无锚点。"""
+    base = _second_judgment(base, status="superseded")
+    base["judgments/J-0001.yaml"]["supersedes"] = "J-0002"
+    base["judgments/J-0001.yaml"]["status"] = "superseded"
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA031" and "成环" in f.message for f in result.findings)
+
+
 def test_osca032_trust_should_be_high(make_pkg, base):
     base["judgments/J-0001.yaml"]["meta"] |= {"confirmed": 6, "overruled": 0}
     assert "OSCA032" in rules_hit(lint_package(make_pkg(base)))
@@ -203,6 +225,30 @@ def test_osca040_object_missing_kind(make_pkg, base):
 
 def test_osca040_negative_example_without_why(make_pkg, base):
     base["objects/OBJ-001-报告.yaml"]["examples"]["negative"] = [{"摘录": "坏"}]
+    assert "OSCA040" in rules_hit(lint_package(make_pkg(base)))
+
+
+def test_osca040_objective_kind_accepted(make_pkg, base):
+    """objective 是合法第五型（SPEC v0.4 §8）——此前被词表拒绝导致 optimizer/settle 不可达。"""
+    base["objects/OBJ-002-目标.yaml"] = {
+        "object_id": "OBJ-002",
+        "name": "示例寻优目标",
+        "kind": "objective",
+        "version": 1,
+        "definition": "演示用寻优目标",
+        "optimize": "minimize",
+    }
+    assert "OSCA040" not in rules_hit(lint_package(make_pkg(base)))
+
+
+def test_osca040_objective_requires_optimize(make_pkg, base):
+    base["objects/OBJ-002-目标.yaml"] = {
+        "object_id": "OBJ-002",
+        "name": "示例寻优目标",
+        "kind": "objective",
+        "version": 1,
+        "definition": "演示用寻优目标",
+    }
     assert "OSCA040" in rules_hit(lint_package(make_pkg(base)))
 
 

@@ -10,9 +10,12 @@ SAMPLE_PACK = Path(__file__).resolve().parents[2] / "examples" / "oper-diagnosis
 
 
 @pytest.fixture
-def sample_pack() -> Path:
+def sample_pack(tmp_path) -> Path:
+    """样例包的 tmp 副本——运行时会往包内写（settle 落账、索引重建），不许写回仓库。"""
     assert SAMPLE_PACK.is_dir(), f"样例包缺失：{SAMPLE_PACK}"
-    return SAMPLE_PACK
+    root = tmp_path / SAMPLE_PACK.name
+    shutil.copytree(SAMPLE_PACK, root, ignore=shutil.ignore_patterns("indexes"))
+    return root
 
 
 @pytest.fixture

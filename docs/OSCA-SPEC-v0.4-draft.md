@@ -107,6 +107,9 @@ structure.pipeline 的 `performer` ∈ `agent` | `connector` | `optimizer` | `hu
 - **agent**：LLM 依一次性上下文出草稿；产出注入剧集台账前过 Policy 脱敏。
   LLM 通道由部署环境变量配置（`OSCA_LLM_URL` / `OSCA_LLM_MODEL` / `OSCA_LLM_API_KEY`，
   OpenAI-compatible 线协议，温度恒 0），不锁定厂商、配置永不进包——与 binding 同一纪律。
+  **归属纪律**：草稿中依据命中判断的段落须在段末标注该判断 ID（如 `（J-0417）`）——
+  蒸馏管道按引用段落在专家终稿中的去留记 confirmed/overruled，段落级标注是
+  账本计数的采集口径（没有标注，判断永远记 uncited，trust 无从累积）。
 - **optimizer**：确定性寻优，LLM 不参与数值搜索（公理 A6）。初版贪心的可求值受限输入：
   候选为 `list[dict]`、每项含数值 `value` 字段，按 objective 的 `optimize` 方向排序取最优；
   缺数值即拒。数值约束求解与 bandit 属部署侧演进，约束声明留档给人审。
@@ -147,6 +150,29 @@ score(产出) = 相似度(产出, expert_final) − 相似度(产出, agent_draf
 期望声明，机器不解析；判断 ID 是否被注入臂引用作为提示信号报告，不作硬判据。
 只有 diff 物种（有 `agent_draft` + `expert_final`）的 case 可 A/B 回放。
 
+## 8. §4 Object 增补：kind: objective（寻优目标，第五型）
+
+§5 optimizer 与 §6 settle 均以「objective 型对象」为锚点，而 v0.3 的 kind 词表
+（`entity | artifact | metric | composite`）没有它的名分——机器可执行的语义
+不配套词表就是规范自相矛盾。v0.4 收编为第五型：
+
+```yaml
+object_id: OBJ-xxx
+name: <中文名>
+kind: objective
+version: <int>
+definition: |               # 这个目标为什么值得追（自然语言，必填）
+optimize: maximize | minimize   # 寻优方向，必填——§5 optimizer 的排序依据
+constraints:                # 约束声明，自由文本列表——留档给人审，机器不解析
+  - <约束一句话>
+settle: {uses: CON-xxx.接口名, when: <自由文本>}   # 对账声明，可选（§6 受限形式）
+```
+
+- `optimize` 之外的数值语义（约束求解、bandit）属部署侧演进，规范只锚定方向；
+- `settle` 合 §6 受限形式则剧集完成后自动对账，否则保守不执行、留痕；
+- optimizer 步骤要求剧集上下文中**恰好一个** objective 对象
+  （多于一个时以步骤字段 `objective: OBJ-xxx` 指定，见 §5）。
+
 ---
 
 ## 变更记录
@@ -157,3 +183,6 @@ score(产出) = 相似度(产出, expert_final) − 相似度(产出, agent_draf
 - **v0.4-draft 增补**（2026-07-11，M2-W5）：§5 剧集执行参考语义（performer 受限集 /
   预算数量记法 / 剧集停三终态）；§6 settle 受限形式（objective → outcome case）；
   §7 回放机器判据（A/B 移动判据，断言文本机器不解析）。
+- **v0.4-draft 增补**（2026-07-11，Review 修复）：§8 Object 第五型 `kind: objective`——
+  修复 §5/§6 引用 objective 型而 kind 词表无名分的规范矛盾（此前 objective 包必被
+  lint 拒绝，optimizer/settle 对合法包不可达）。

@@ -49,6 +49,12 @@ def render_system_prompt(episode: Episode) -> str:
         parts.append("## 对象定义（objects）\n\n```yaml\n" + _yaml(ctx["objects"]) + "\n```")
     if ctx.get("judgments"):
         parts.append("## 命中判断（依签名检索，各带 1 个代表 case）\n\n```yaml\n" + _yaml(ctx["judgments"]) + "\n```")
+        parts.append(
+            "## 归属纪律（飞轮口径）\n\n"
+            "草稿中凡依据某条命中判断裁决或成文的段落，须在该段落末尾标注其判断 ID（如（J-0417））；"
+            "未依据判断的段落不标。段落级标注是采集器归属计数的唯一依据——"
+            "标注随草稿进专家终审：专家整段保留即 confirmed，整段删除即 overruled。"
+        )
     parts.append(
         f"## 剧集\n\n本剧集 {episode.episode_id} 由 {episode.fired_trigger} 触发。"
         "剧集短命无状态：只做本次 pipeline 的事，产出交由人终审。"
@@ -75,7 +81,9 @@ def _step_user_prompt(spec: dict, step_name: str, input_key: str | None, input_v
     if input_key is not None:
         rendered = input_value if isinstance(input_value, str) else _yaml(input_value)
         parts.append(f"输入产物「{input_key}」：\n\n{rendered}")
-    parts.append("只输出本步骤产出物的内容本身，不要输出解释性前后缀。")
+    parts.append(
+        "只输出本步骤产出物的内容本身，不要输出解释性前后缀；依据命中判断的段落保留段末判断 ID 标注（归属纪律）。"
+    )
     return "\n\n".join(parts)
 
 
@@ -160,6 +168,10 @@ def run_episode(
             return _finish(episode, "failed", f"pipeline 第 {index + 1} 项不是步骤声明——宁可拒绝，不可猜测")
         step_name = str(spec.get("step", f"步骤{index + 1}"))
         performer = str(spec.get("performer", ""))
+
+        # ── 包停触达（三级停之三）：unload 撤销后在途剧集步间即停，不再发起任何调用 ──
+        if policy.revoked:
+            return _finish(episode, "stopped", f"包已停：{policy.revoked}（在途剧集步间即停）")
 
         # ── 预算裁决（aware.budget；剧集停之 budget 硬顶） ──
         if max_steps is not None and len(episode.steps) >= max_steps:

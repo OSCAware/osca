@@ -220,6 +220,76 @@ async def test_w4_precondition_blocks_without_bindings(running_host, sample_pack
     assert response["episodes"] == []
 
 
+async def test_kill_switch_recomputed_at_wakeup(running_host, sample_pack, deploy):
+    """账本健康度即安全信号：M3 采集器落账后计数恶化，Host 不重启、下次唤醒前重算即拒。"""
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    pid = "demo-group-oper-diagnosis"
+
+    await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    response = await _send({"cmd": "episodes"}, host)
+    assert len(response["episodes"]) == 1  # 装载时账本健康，唤醒成功
+
+    # 模拟 M3 采集器落账：现役判断被大量推翻（9/6 > 0.3），Host 进程不重启
+    j = sample_pack / "judgments" / "J-0417.yaml"
+    j.write_text(j.read_text(encoding="utf-8").replace("overruled: 0", "overruled: 9"), encoding="utf-8")
+
+    await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    response = await _send({"cmd": "status"}, host)
+    assert response["packages"][0]["policy"]["kill_switch_tripped"] is True  # 唤醒前已重算
+    response = await _send({"cmd": "episodes"}, host)
+    assert len(response["episodes"]) == 1  # 第二次唤醒被拒——没有新剧集
+
+
+async def test_enable_is_idempotent(running_host, sample_pack, deploy):
+    """对已启用 Aware 重复 enable 不得重复订阅（否则一次触发双份唤醒）。"""
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    pid = "demo-group-oper-diagnosis"
+
+    response = await _send({"cmd": "enable", "package_id": pid, "aware_id": "AW-001"}, host)
+    assert response["ok"] and "幂等" in response["detail"]
+    # disable → enable 的正常路径不受影响
+    await _send({"cmd": "disable", "package_id": pid, "aware_id": "AW-001"}, host)
+    response = await _send({"cmd": "enable", "package_id": pid, "aware_id": "AW-001"}, host)
+    assert response["ok"] and "重新布防 3 条" in response["detail"]
+
+
+async def test_bindings_isolated_per_package(running_host, sample_pack, deploy, tmp_path):
+    """同名 binding 不跨包串线：后装包不改先装包的连接目标，卸载即清理。"""
+    import shutil
+
+    import yaml as _yaml
+
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+
+    pack_b = tmp_path / "pack-b.osca"
+    shutil.copytree(sample_pack, pack_b, ignore=shutil.ignore_patterns("indexes"))
+    manifest = pack_b / "osca.yaml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            "package_id: demo-group-oper-diagnosis", "package_id: demo-group-oper-diagnosis-b"
+        ),
+        encoding="utf-8",
+    )
+    fixtures_b = tmp_path / "fixtures-b"
+    fixtures_b.mkdir()
+    bindings_b = tmp_path / "bindings-b.yaml"
+    bindings_b.write_text(
+        _yaml.safe_dump({"FINANCE_DB": {"endpoint": f"mock://{fixtures_b}", "secret_ref": "K"}}), encoding="utf-8"
+    )
+    response = await _send({"cmd": "load", "path": str(pack_b), "bindings": str(bindings_b)}, host)
+    assert response["ok"]
+
+    a = host.proxies["demo-group-oper-diagnosis"].bindings["FINANCE_DB"]["endpoint"]
+    b = host.proxies["demo-group-oper-diagnosis-b"].bindings["FINANCE_DB"]["endpoint"]
+    assert a != b and str(fixtures_b) in b  # 各连各的库
+
+    await _send({"cmd": "unload", "package_id": "demo-group-oper-diagnosis-b"}, host)
+    assert "demo-group-oper-diagnosis-b" not in host.bindings  # binding 随包清理
+
+
 @pytest.fixture
 def deploy_w5(tmp_path, monkeypatch):
     """W5 部署环境:双接口 mock 固件 + bindings + LLM mock 通道(环境变量注入,CI 不联网)。"""
@@ -274,4 +344,12 @@ async def test_w5_fire_runs_pipeline_to_draft(running_host, sample_pack, deploy_
     episode = response["episode"]
     assert [s["status"] for s in episode["steps"]] == ["done", "done", "done", "done", "handoff"]
     assert "检修期常态波动" in episode["draft"]  # 机器侧交付物:草稿待专家终审
-    assert episode["settlements"] == []  # 主观场景无 objective 对象——对账只属闭环场景
+    # 样例包现为闭环场景(OBJ-003 objective):剧集完成后对账器自动落 outcome case。
+    # 对账在剧集终态之后的线程里运行——轮询等它落账。
+    for _ in range(250):
+        if episode["settlements"]:
+            break
+        await asyncio.sleep(0.02)
+        episode = (await _send({"cmd": "episode", "episode_id": summary["episode_id"]}, host))["episode"]
+    (settlement,) = episode["settlements"]
+    assert settlement["settled"] is True and settlement["case"] == "C-0103"

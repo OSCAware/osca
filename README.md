@@ -71,7 +71,7 @@ osca/
 ├── docs/OSCA-LINT-RULES.md        # lint rule catalogue (ledger discipline, machine-enforced)
 ├── examples/oper-diagnosis.osca/  # a full de-identified sample pack (with supersedes chains and spoken-language cases)
 ├── cli/                           # osca lint / pack / load (all three working)
-├── host/                          # runtime host reference implementation (in progress: six of seven components done, settle/replay next)
+├── host/                          # runtime host reference implementation (M2 complete: all seven components + episode runner)
 ├── site/                          # oscaware.com single-page source
 ├── CONTRIBUTING.md                # how to take part, pre-1.0
 └── CHANGELOG.md
@@ -79,9 +79,11 @@ osca/
 
 ## Status & roadmap
 
-- Now: **SPEC v0.3** + a full sample pack + the CLI trio (`lint / pack / load`).
+- Now: **SPEC v0.3** (+ v0.4 draft) + a full sample pack + the CLI (`lint / pack / load / replay`) +
+  the runtime host reference implementation (all seven components: loader, triggers, gates,
+  episode assembly, policy enforcement, connector proxy, settlement).
   The sample pack passes all 22 lint rules; deliverables pack reproducibly and verify integrity.
-- In progress: the runtime host (reference implementation) — loading, triggers, gates, episode assembly, policy enforcement.
+- In progress: the distillation pipeline that turns expert feedback into ledger entries, then the review interfaces.
 - The bar for 1.0: spec + reference implementation + one replayable de-identified sample ledger — mechanism complete, verifiable on the spot.
 
 ## Taking part

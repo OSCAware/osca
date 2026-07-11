@@ -29,6 +29,11 @@ EXCLUDE_NAMES = {".DS_Store"}
 FORBIDDEN_NAMES = {"bindings.yaml"}  # 真实 binding，永不进包
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)  # 固定时间戳 → 可复现打包
 
+# zip bomb 防护上限（.osca 包是纯文本 Markdown/YAML，正常包远小于这些数）
+MAX_ZIP_MEMBERS = 2000
+MAX_MEMBER_BYTES = 50 * 1024 * 1024  # 单成员解压上限
+MAX_TOTAL_BYTES = 200 * 1024 * 1024  # 总解压量上限
+
 
 @dataclass
 class OpResult:
@@ -61,16 +66,32 @@ def _sha256(path: Path) -> str:
 
 
 def package_files(root: Path) -> list[str]:
-    """进包文件清单（排除缓存、版本库、系统垃圾文件），排序保证确定性。"""
+    """进包文件清单（排除缓存、版本库、系统垃圾文件），排序保证确定性。
+
+    符号链接一律不入清单——跟随链接会把包外（宿主机）文件当成包内容；
+    pack 对链接直接拒绝（symlink_entries），load 侧按不存在处理。
+    """
     rels = []
     for p in sorted(root.rglob("*")):
-        if not p.is_file():
+        if p.is_symlink() or not p.is_file():
             continue
         rel = p.relative_to(root).as_posix()
         if rel.split("/", 1)[0] in EXCLUDE_TOP_DIRS or p.name in EXCLUDE_NAMES:
             continue
         rels.append(rel)
     return rels
+
+
+def symlink_entries(root: Path) -> list[str]:
+    """包内（排除目录之外）的符号链接清单——pack 的拒绝对象。"""
+    links = []
+    for p in sorted(root.rglob("*")):
+        if not p.is_symlink():
+            continue
+        rel = p.relative_to(root).as_posix()
+        if rel.split("/", 1)[0] not in EXCLUDE_TOP_DIRS:
+            links.append(rel)
+    return links
 
 
 def checksums_text(root: Path, rels: list[str]) -> str:
@@ -101,12 +122,20 @@ def pack_package(path: str | Path, output: str | Path | None = None) -> tuple[Op
             return result, None
     result.step("零真实 binding 确认")
 
-    # 3. 清单与校验和
+    # 3. 符号链接拦截：跟随链接会把宿主机文件打进交付件
+    links = symlink_entries(root)
+    if links:
+        shown = "、".join(links[:3]) + ("…" if len(links) > 3 else "")
+        result.fail(f"检测到符号链接：{shown}——交付件不收符号链接（防止把包外文件打进包），请替换为真实文件")
+        return result, None
+    result.step("零符号链接确认")
+
+    # 4. 清单与校验和
     rels = package_files(root)
     checksums = checksums_text(root, rels)
     result.step(f"进包文件 {len(rels)} 个，已生成校验和清单")
 
-    # 4. 确定性写 zip
+    # 5. 确定性写 zip
     manifest = load_package(root).yaml_files.get("osca.yaml")
     package_id = manifest.mapping.get("package_id", root.name) if manifest else root.name
     zip_path = Path(output) if output else Path.cwd() / f"{package_id}.osca.zip"
@@ -132,11 +161,22 @@ def pack_package(path: str | Path, output: str | Path | None = None) -> tuple[Op
 
 
 def _safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
-    """防 zip-slip：任何成员不得逃出目标目录。"""
-    for member in zf.namelist():
-        target = (dest / member).resolve()
+    """防 zip-slip 与 zip bomb：路径越界、成员数、单成员与总解压量超限一律拒绝。"""
+    infos = zf.infolist()
+    if len(infos) > MAX_ZIP_MEMBERS:
+        raise ValueError(f"zip 成员数 {len(infos)} 超上限 {MAX_ZIP_MEMBERS}——拒绝解压（zip bomb 防护）")
+    total = 0
+    for info in infos:
+        target = (dest / info.filename).resolve()
         if not target.is_relative_to(dest.resolve()):
-            raise ValueError(f"zip 成员路径越界：{member}")
+            raise ValueError(f"zip 成员路径越界：{info.filename}")
+        if info.file_size > MAX_MEMBER_BYTES:
+            raise ValueError(
+                f"zip 成员 {info.filename} 解压后 {info.file_size} 字节超单成员上限——拒绝解压（zip bomb 防护）"
+            )
+        total += info.file_size
+    if total > MAX_TOTAL_BYTES:
+        raise ValueError(f"zip 总解压量 {total} 字节超上限 {MAX_TOTAL_BYTES}——拒绝解压（zip bomb 防护）")
     zf.extractall(dest)
 
 
@@ -228,8 +268,12 @@ def load_osca(
             result.fail(f"目标目录已存在且非空：{root}（用 --dest 指定其他目录）")
             return result, None
         root.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(source) as zf:
-            _safe_extract(zf, root)
+        try:
+            with zipfile.ZipFile(source) as zf:
+                _safe_extract(zf, root)
+        except ValueError as e:
+            result.fail(str(e))
+            return result, None
         from_zip = True
         result.step(f"已解压到 {root}")
     else:

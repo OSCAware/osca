@@ -77,11 +77,12 @@ class ConnectorProxy:
 
         cid = interface_ref.split(".", 1)[0]
         connector = self.connectors[cid]
-        if (connector.get("permissions") or {}).get("write") != "forbidden" and step is not None:
-            # v0.3 全部只读；allowed_with_approval 的写路径随 M6 对接约定落地
-            return Receipt(
-                ok=False, interface=interface_ref, error="写权限路径未开通（当前参考实现仅支持只读 Connector）"
-            )
+        if (connector.get("permissions") or {}).get("write") != "forbidden":
+            # 写路径的审批门对内对外一视同仁——step=None 的运行时内部调用（watch/precondition/settle）
+            # 也不豁免。不在 approvals 清单的写接口默认拒绝；已授予的 token 一次性消费。
+            ok, reason = self.policy.require_write_approval(interface_ref)
+            if not ok:
+                return Receipt(ok=False, interface=interface_ref, error=reason)
 
         binding_ref = connector.get("binding_ref")
         binding = self.bindings.get(binding_ref) if binding_ref else None

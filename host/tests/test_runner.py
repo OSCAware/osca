@@ -12,7 +12,7 @@ from osca_host.connector import ConnectorProxy
 from osca_host.episode import assemble
 from osca_host.loader import load_for_host
 from osca_host.policy import PolicyInterceptor, ledger_stats, parse_quantity
-from osca_host.runner import _run_optimizer, run_episode
+from osca_host.runner import _run_optimizer, _step_user_prompt, render_system_prompt, run_episode
 
 
 @pytest.fixture
@@ -58,6 +58,15 @@ def episode(loaded):
     return assemble("EP-0001", loaded, aware, "AW-001/T3")
 
 
+def test_prompt_carries_attribution_contract(episode):
+    """归属契约（M2→M3 口径）：命中判断在场时，提示词必须要求段末标注判断 ID——
+    否则草稿全记 uncited，confirmed/overruled 永不累积，trust 无从升级。"""
+    system = render_system_prompt(episode)
+    assert "归属纪律" in system and "段落末尾标注" in system
+    user = _step_user_prompt({"step": "成文"}, "成文", None, None)
+    assert "判断 ID 标注" in user
+
+
 def test_full_pipeline_produces_draft(episode, loaded, proxy, policy, llm):
     run_episode(episode, loaded, proxy, policy, llm=llm)
 
@@ -75,6 +84,14 @@ def test_full_pipeline_produces_draft(episode, loaded, proxy, policy, llm):
     assert llm.calls == ["episode/生成报警候选", "episode/裁决", "episode/成文"]
     # 笼子的 tokens 记账留了审计痕
     assert any("tokens 记账" in a["reason"] for a in policy.audit if a["decision"] == "allow")
+
+
+def test_revoked_package_stops_inflight_episode(episode, loaded, proxy, policy, llm):
+    """包停触达在途剧集：撤销后步间即停，一次调用都不再发起。"""
+    policy.revoke("unload 包停")
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "stopped" and "包已停" in episode.stop_reason
+    assert episode.steps == []  # 取消点在第一步发起之前
 
 
 def test_budget_tokens_hard_stop(episode, loaded, proxy, policy, llm):

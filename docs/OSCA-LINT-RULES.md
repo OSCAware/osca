@@ -34,8 +34,8 @@
 
 | 规则 | 级别 | 内容 | 依据 |
 |---|---|---|---|
-| OSCA030 | 错误 | 每条判断 ≥1 条出生证据，且引用的 case 存在 | 纪律 2 |
-| OSCA031 | 错误 | supersedes 双向一致：新判断指向的旧判断必须 status=superseded；superseded 的判断必须被指向 | 纪律 1 |
+| OSCA030 | 错误 | 每条判断 ≥1 条出生证据，且必须是包内存在的 case（C-xxxx，别的 ID 类型不算证据） | 纪律 2 |
+| OSCA031 | 错误 | supersedes 双向一致且无环：新判断指向的旧判断必须 status=superseded；superseded 的判断必须被指向；自指与环（互相取代）一律报错 | 纪律 1 |
 | OSCA032 | 错误 | trust 由计数驱动（active 判断：confirmed≥5 且 overruled=0 ⇔ high）；superseded 冻结不查 | 纪律 4 |
 | OSCA033 | 错误 | status ∈ {active, superseded, review} | SPEC §9 |
 | OSCA034 | 错误 | 每条判断自带 replay 回放断言（＝单元测试） | 纪律 4 |
@@ -46,7 +46,7 @@
 
 | 规则 | 级别 | 内容 | 依据 |
 |---|---|---|---|
-| OSCA040 | 错误 | 各类文件必填字段：object（name/kind/version/definition，负样例必带 why）；connector（name/kind/interfaces/permissions.write）；aware（name/enabled 布尔/then/budget/≥1 触发原语）；judgment（status/signature 三件/body/meta 计数）；case（captured_at/capture_source/input）；policy（policy_version） | SPEC §4–§10 |
+| OSCA040 | 错误 | 各类文件必填字段：object（name/kind/version/definition，负样例必带 why；kind=objective 必填 optimize: maximize\|minimize）；connector（name/kind/interfaces/permissions.write）；aware（name/enabled 布尔/then/budget/≥1 触发原语）；judgment（status/signature 三件/body/meta 计数）；case（captured_at/capture_source/input）；policy（policy_version） | SPEC §4–§10 + v0.4 §8 |
 
 ## 触发原语与闸门
 

@@ -7,6 +7,7 @@
 - **双面 Aware**：`aware/AW-001` 的 trigger 段给运行时编译，discretion 段给剧集注入
 - **薄 Structure**：`structure.yaml` 只描述「什么喂给什么」，不写 if/else——想写的那一刻，它就是一条该进账本的判断
 - **确定性 Connector**：`connectors/CON-001` 的「拉取检修计划期」接口带 `born_reason`——接口是被判断层倒逼长出来的
+- **寻优目标 objective**：`objects/OBJ-003`（第五型，SPEC v0.4 §8）带 `settle` 对账声明——剧集完成后对账器自动落 outcome case，现实是第二位专家
 - **正判断**：`judgments/J-0417`（trust: high 的来路：confirmed ≥5 且 0 推翻）
 - **负判断**：`judgments/J-0423`（压制噪音的判断与正判断同权）
 - **supersedes 链**：`J-0405（superseded）→ J-0423`——推翻不删除，留档可回放

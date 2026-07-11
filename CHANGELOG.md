@@ -34,5 +34,26 @@
 - SPEC v0.4 草案增补：触发原语受限语法、组合语义、运行时求值参考语义、剧集执行参考语义、
   settle 受限形式、回放机器判据
 
+## [Review 修复 · M2 收口] - 2026-07-11
+- SPEC v0.4 §8：Object 第五型 `kind: objective` 收编词表——修复 optimizer/settle 对合法包
+  不可达的规范矛盾（此前 objective 包必被 lint 拒绝）；样例包新增 OBJ-003（带 settle 对账声明），
+  闭环对账当场可演
+- 归属契约（M2→M3 口径）：剧集提示词要求依据命中判断的段落在段末标注判断 ID（SPEC v0.4 §5）——
+  采集器按段落去留计 confirmed/overruled 由此有了输入，trust 才升得上去
+- Loader：runtime 契约校验——format_version 支持集 + requires.runtime 受限形式 `>=x.y[.z]`，
+  不满足或不可解析即拒绝装载
+- 并发落账：新增 `osca_cli.ledger`（case 编号 O_EXCL 原子分配 + 包级写锁 flock）——
+  对账器 / 采集器 / 拍板并发写账绝不同号覆盖
+- Policy/Connector 笼子收口：写接口审批门接线（默认拒绝、token 一次性消费、step=None 内部调用
+  不豁免）；binding 按包隔离、卸载即清理；包停触达在途剧集（步间取消点 + 调用全拒）；
+  kill switch 每次唤醒前按现账本重算；max_tool_calls 受限记法解析；剧集执行异常兜底终态、
+  不再永久 running；enable 幂等（不重复布防）
+- lint 收紧：OSCA030 证据限定包内存在的 C-xxxx；OSCA031 自指与成环取代链报错；
+  OSCA040 objective 必填 optimize
+- osca pack/load 安全：符号链接拒绝进包（防宿主机文件泄入交付件）；zip 解压三重上限
+  （成员数 / 单成员 / 总解压量，zip bomb 防护）
+- CI 与 pre-commit：脱敏内容扫描加 `-i`——大小写变体不再绕过门禁
+- 文档：README（中英）、CONTRIBUTING 状态修正（M2 七组件齐 + replay，SPEC v0.3 定稿）
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC

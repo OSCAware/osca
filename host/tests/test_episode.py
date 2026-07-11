@@ -39,7 +39,7 @@ def test_context_sections(episode):
     assert "身份" in ctx["agent"] or len(ctx["agent"]) > 0  # AGENT.md 全文
     assert ctx["structure"]["structure_id"] == "STR-001"
     assert "计划外唤醒" in ctx["discretion"]  # 命中 Aware 的 discretion 原文
-    assert set(ctx["objects"]) == {"OBJ-001", "OBJ-002"}  # structure 引用 ∪ 判断签名指向
+    assert set(ctx["objects"]) == {"OBJ-001", "OBJ-002", "OBJ-003"}  # structure 引用 ∪ 判断签名指向
     assert [j["judgment_id"] for j in ctx["judgments"]] == ["J-0417", "J-0423"]
 
 
@@ -55,7 +55,7 @@ def test_episode_metadata(episode):
     assert episode.fired_trigger == "AW-001/T3"
     summary = episode.summary()
     assert summary["judgments"] == ["J-0417", "J-0423"]
-    assert summary["objects"] == ["OBJ-001", "OBJ-002"]
+    assert summary["objects"] == ["OBJ-001", "OBJ-002", "OBJ-003"]
 
 
 def test_assembly_is_deterministic(loaded):

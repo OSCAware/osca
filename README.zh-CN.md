@@ -65,7 +65,7 @@ osca/
 ├── docs/OSCA-LINT-RULES.md       # lint 规则清单（账本纪律的机器化）
 ├── examples/oper-diagnosis.osca/  # 完整脱敏样例包（含 supersedes 链与口述 case）
 ├── cli/                           # osca lint / pack / load（三件套可用）
-├── host/                          # 运行框架 Host 参考实现（进行中：七组件已通六个，对账器与 replay 在路上）
+├── host/                          # 运行框架 Host 参考实现（M2 收官：七组件齐 + 剧集执行器）
 ├── site/                          # oscaware.com 单页源文件
 ├── CONTRIBUTING.md                # pre-1.0 参与方式
 └── CHANGELOG.md
@@ -73,9 +73,10 @@ osca/
 
 ## 状态与路线
 
-- 当前：**SPEC v0.3** ＋ 完整样例包 ＋ CLI 三件套（`lint / pack / load`）。
-  样例包通过全部 22 条 lint 规则；交付件可复现打包、可校验完整性。
-- 进行中：运行框架（参考实现）——装载、触发表、闸门、剧集装配、Policy 拦截。
+- 当前：**SPEC v0.3**（＋ v0.4 草案）＋ 完整样例包 ＋ CLI（`lint / pack / load / replay`）
+  ＋ 运行框架 Host 参考实现（七组件齐：装载、触发表、闸门、剧集装配、Policy 拦截、
+  Connector 代理、对账器）。样例包通过全部 22 条 lint 规则；交付件可复现打包、可校验完整性。
+- 进行中：把专家反馈蒸馏成账本条目的蒸馏管道，其后是审核界面。
 - 1.0 的发布凭据：规范 ＋ 参考实现 ＋ 一个可回放的脱敏样例账本——机制完整、当场可验。
 
 ## 参与

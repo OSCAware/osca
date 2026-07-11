@@ -31,3 +31,47 @@ def test_reject_invalid_pack(tmp_path):
     result, loaded = load_for_host(tmp_path)
     assert not result.ok
     assert loaded is None
+
+
+# ── runtime 契约校验（format_version 支持集 + requires.runtime 受限形式） ──
+
+
+def _pack_with_manifest(sample_pack, tmp_path, **overrides):
+    """样例包副本 + 改写 osca.yaml 字段（校验链其余环节保持绿灯）。"""
+    import shutil
+
+    import yaml
+
+    root = tmp_path / "pack"
+    shutil.copytree(sample_pack, root, ignore=shutil.ignore_patterns("indexes"))
+    manifest = yaml.safe_load((root / "osca.yaml").read_text(encoding="utf-8"))
+    manifest.update(overrides)
+    (root / "osca.yaml").write_text(yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return root
+
+
+def test_reject_unsupported_format_version(sample_pack, tmp_path):
+    root = _pack_with_manifest(sample_pack, tmp_path, format_version="0.2")
+    result, loaded = load_for_host(root)
+    assert loaded is None
+    assert any("format_version 0.2 不受支持" in line for line in result.lines)
+
+
+def test_reject_unmet_runtime_requirement(sample_pack, tmp_path):
+    root = _pack_with_manifest(sample_pack, tmp_path, requires={"runtime": ">=9.9", "bindings": ["FINANCE_DB"]})
+    result, loaded = load_for_host(root)
+    assert loaded is None
+    assert any("requires.runtime" in line or "包要求 runtime" in line for line in result.lines)
+
+
+def test_reject_unparseable_runtime_requirement(sample_pack, tmp_path):
+    root = _pack_with_manifest(sample_pack, tmp_path, requires={"runtime": "latest", "bindings": ["FINANCE_DB"]})
+    result, loaded = load_for_host(root)
+    assert loaded is None
+    assert any("不可解析" in line for line in result.lines)
+
+
+def test_sample_pack_runtime_requirement_satisfied(sample_pack):
+    result, loaded = load_for_host(sample_pack)
+    assert loaded is not None
+    assert any("runtime 契约校验通过" in line for line in result.lines)

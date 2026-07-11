@@ -232,9 +232,15 @@ def _judgments(pkg: OscaPackage) -> list[YamlFile]:
     return [f for f in pkg.typed_files("judgments") if not f.parse_error]
 
 
+CASE_ID = re.compile(r"C-\d{3,4}")
+
+
 @rule
 def osca030_evidence(pkg: OscaPackage) -> list[Finding]:
-    """OSCA030 每条判断 ≥1 条出生证据，且引用的 case 存在（纪律第 2 条）。"""
+    """OSCA030 每条判断 ≥1 条出生证据，且必须是包内存在的 case（C-xxxx，纪律第 2 条）。
+
+    只认 C- 前缀：证据物种只有 case——引用别的 ID（对象/判断）碰巧存在也不算证据。
+    """
     findings = []
     for f in _judgments(pkg):
         evidence = f.mapping.get("evidence")
@@ -242,31 +248,52 @@ def osca030_evidence(pkg: OscaPackage) -> list[Finding]:
             findings.append(_err("OSCA030", f.relpath, "无出生证据的判断不准入账（evidence 至少 1 条）"))
             continue
         for ev in evidence:
-            if not (isinstance(ev, str) and ev in pkg.declared_ids):
-                findings.append(_err("OSCA030", f.relpath, f"evidence 引用的 case 不存在：{ev}"))
+            if not (isinstance(ev, str) and CASE_ID.fullmatch(ev) and ev in pkg.declared_ids):
+                findings.append(_err("OSCA030", f.relpath, f"evidence 必须是包内存在的 case（C-xxxx）：{ev}"))
     return findings
 
 
 @rule
 def osca031_supersedes(pkg: OscaPackage) -> list[Finding]:
-    """OSCA031 supersedes 链双向一致：推翻不删除（纪律第 1 条）。"""
+    """OSCA031 supersedes 链双向一致且无环：推翻不删除（纪律第 1 条）。
+
+    自指与环是「互相取代」的账本悖论——没有一条现役判断，回放无锚点，一律报错。
+    """
     findings = []
     judgments = _judgments(pkg)
     by_id = {f.mapping.get("judgment_id"): f for f in judgments}
     superseded_by: dict[str, str] = {}
+    chain: dict[str, str] = {}  # jid → 它取代的 jid（环检测输入）
     for f in judgments:
         target = f.mapping.get("supersedes")
         if target is None:
+            continue
+        jid = f.mapping.get("judgment_id", f.relpath)
+        if target == jid:
+            findings.append(_err("OSCA031", f.relpath, "supersedes 指向自身——取代链必须指向别的判断"))
             continue
         old = by_id.get(target)
         if old is None:
             findings.append(_err("OSCA031", f.relpath, f"supersedes 指向的 {target} 不存在"))
         else:
-            superseded_by[target] = f.mapping.get("judgment_id", f.relpath)
+            chain[jid] = target
+            superseded_by[target] = jid
             if old.mapping.get("status") != "superseded":
                 findings.append(
                     _err("OSCA031", old.relpath, f"被 {f.mapping.get('judgment_id')} 取代，status 必须改为 superseded")
                 )
+    # 环检测：沿取代链走，回到走过的节点即环（每个环只报一次，以环内最小 ID 为代表）
+    for start in sorted(chain):
+        path: list[str] = []
+        cur = start
+        while cur in chain and cur not in path:
+            path.append(cur)
+            cur = chain[cur]
+        if cur in path:
+            cycle = path[path.index(cur) :]
+            if start == min(cycle):
+                loop = " → ".join([*cycle, cur])
+                findings.append(_err("OSCA031", by_id[start].relpath, f"supersedes 成环：{loop}——取代链必须无环"))
     for f in judgments:
         jid = f.mapping.get("judgment_id")
         if f.mapping.get("status") == "superseded" and jid not in superseded_by:
@@ -345,7 +372,7 @@ def osca036_case_effective_set(pkg: OscaPackage) -> list[Finding]:
 
 # ───────────────────────── 各类文件必填字段 ─────────────────────────
 
-OBJECT_KINDS = {"entity", "artifact", "metric", "composite"}
+OBJECT_KINDS = {"entity", "artifact", "metric", "composite", "objective"}
 CONNECTOR_KINDS = {"mcp", "openapi", "sql_readonly", "code"}
 TRIGGER_KINDS = {"schedule", "event", "watch"}
 
@@ -368,6 +395,10 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
         kind = f.mapping.get("kind")
         if kind is not None and kind not in OBJECT_KINDS:
             findings.append(_err("OSCA040", f.relpath, f"kind={kind} 不在 {sorted(OBJECT_KINDS)} 中"))
+        if kind == "objective" and f.mapping.get("optimize") not in ("maximize", "minimize"):
+            findings.append(
+                _err("OSCA040", f.relpath, "objective 必填 optimize: maximize | minimize（寻优方向，SPEC v0.4 §8）")
+            )
         examples = f.mapping.get("examples") or {}
         for i, neg in enumerate(examples.get("negative") or []):
             if isinstance(neg, dict) and not neg.get("why"):

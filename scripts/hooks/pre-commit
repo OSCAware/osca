@@ -14,20 +14,20 @@ FORBIDDEN="${W1}|${W2}|${W3}"
 staged_files=$(git diff --cached --name-only --diff-filter=ACM)
 if [ -n "$staged_files" ]; then
   # 1. 挡违禁词：只查本次暂存的新增行，不误伤历史
-  if git diff --cached -U0 | grep -E '^\+' | grep -qE "$FORBIDDEN"; then
+  if git diff --cached -U0 | grep -E '^\+' | grep -qiE "$FORBIDDEN"; then
     echo "✗ 提交被拒绝：暂存内容中检出脱敏违禁词（见《开仓指南》第 2 节清单）。" >&2
-    git diff --cached -U0 | grep -E '^\+' | grep -nE "$FORBIDDEN" >&2
+    git diff --cached -U0 | grep -E '^\+' | grep -niE "$FORBIDDEN" >&2
     exit 1
   fi
 
   # 2. 挡文件名本身含违禁词的文件
-  if echo "$staged_files" | grep -qE "$FORBIDDEN"; then
+  if echo "$staged_files" | grep -qiE "$FORBIDDEN"; then
     echo "✗ 提交被拒绝：暂存文件名含脱敏违禁词。" >&2
     exit 1
   fi
 
   # 3. 挡本地敏感目录/文件被意外加入跟踪
-  if echo "$staged_files" | grep -qE '^Core_docs/|(^|/)key\.md$'; then
+  if echo "$staged_files" | grep -qiE '^Core_docs/|(^|/)key\.md$'; then
     echo "✗ 提交被拒绝：Core_docs/ 与 key.md 是本地私有内容，永不入库。" >&2
     exit 1
   fi

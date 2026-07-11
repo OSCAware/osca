@@ -72,6 +72,45 @@ def test_approval_gate_one_shot():
     assert not p.grant_approval("不存在的动作")[0]
 
 
+def test_revoke_stops_all_calls():
+    """包停触达认知平面：撤销后模型调用与运行时内部调用全部拒绝。"""
+    p = make()
+    assert p.authorize_tool("取数", "CON-001.拉取费用明细")[0]
+    p.revoke("unload 包停")
+    ok, reason = p.authorize_tool("取数", "CON-001.拉取费用明细")
+    assert not ok and "包已停" in reason
+    assert not p.authorize_tool(None, "CON-001.拉取费用明细")[0]  # 内部调用同样全拒
+
+
+def test_kill_switch_refreshes_with_ledger():
+    """账本健康度即安全信号（公理 A10）：M3 落账后计数恶化，Host 不重启也要看见。"""
+    p = make()
+    assert not p.kill_tripped  # 装载时健康
+    p.refresh_kill_switch({"confirmed": 10, "overruled": 4})  # 0.4 > 0.3
+    assert p.kill_tripped and "kill switch" in p.kill_reason
+    p.refresh_kill_switch({"confirmed": 10, "overruled": 1})  # 账本自愈（推翻→重审→新判断）即恢复
+    assert not p.kill_tripped
+
+
+def test_unparsable_max_tool_calls_warns_and_disables_cap():
+    p = make(policy={**POLICY, "budgets": {"per_episode": {"max_tool_calls": "十次"}}})
+    assert p.max_tool_calls is None
+    assert any("max_tool_calls 不可解析" in a["reason"] for a in p.audit)
+    assert p.authorize_tool("取数", "CON-001.拉取费用明细", episode_id="EP-1")[0]  # 顶不生效但不误伤调用
+
+
+def test_write_approval_defaults_to_deny():
+    """写动作默认拒绝：不在 approvals 清单的写接口没有合法路径；token 一次性消费。"""
+    p = make()
+    ok, reason = p.require_write_approval("CON-009.回写工单")
+    assert not ok and "默认拒绝" in reason
+    p.approvals["CON-009.回写工单"] = "专家"
+    assert not p.require_write_approval("CON-009.回写工单")[0]  # 在清单但未授予 → 拦
+    p.grant_approval("CON-009.回写工单")
+    assert p.require_write_approval("CON-009.回写工单")[0]  # 授予后放行一次
+    assert not p.require_write_approval("CON-009.回写工单")[0]  # token 已消费
+
+
 def test_redaction():
     p = make()
     payload = {"rows": [{"经办": "张三 13812345678", "证件": "110101199001011234"}]}

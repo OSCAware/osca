@@ -23,7 +23,7 @@ jobs:
           if git ls-files | grep -iE "$PATTERN"; then
             echo "::error::文件名检出脱敏违禁词"; exit 1
           fi
-          if git grep -nE "$PATTERN" -- ':!.github/workflows/ci.yml' ':!scripts/hooks/pre-commit'; then
+          if git grep -niE "$PATTERN" -- ':!.github/workflows/ci.yml' ':!scripts/hooks/pre-commit'; then
             echo "::error::文件内容检出脱敏违禁词"; exit 1
           fi
           echo "✓ 脱敏检索零命中"

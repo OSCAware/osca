@@ -52,7 +52,12 @@ class PolicyInterceptor:
         }
         budgets = policy.get("budgets") or {}
         per_episode = budgets.get("per_episode") or {}
-        self.max_tool_calls = per_episode.get("max_tool_calls")
+        self.max_tool_calls = (
+            parse_quantity(per_episode.get("max_tool_calls")) if "max_tool_calls" in per_episode else None
+        )
+        if "max_tool_calls" in per_episode and self.max_tool_calls is None:
+            detail = "max_tool_calls 不可解析（受限形式：<正整数>[k]），硬顶不生效"
+            self._record("warn", "budgets", str(per_episode["max_tool_calls"]), detail)
         self._tool_calls: dict[str, int] = {}  # episode_id → 已用
         self.max_tokens = parse_quantity(per_episode.get("max_tokens")) if "max_tokens" in per_episode else None
         if "max_tokens" in per_episode and self.max_tokens is None:
@@ -65,6 +70,9 @@ class PolicyInterceptor:
             str(a.get("action")): str(a.get("approver")) for a in policy.get("approvals") or [] if isinstance(a, dict)
         }
         self._granted: set[str] = set()
+        self.revoked = ""  # 非空即包停/撤销原因——在途剧集在步间与每次调用点看它（三级停之「包停」触达认知平面）
+        self._policy = policy  # kill switch 重算用（账本计数变了，条件不变）
+        self._warned_conditions: set[str] = set()  # 不可求值条件只警告一次，重算不刷屏
         self.kill_tripped, self.kill_reason = self._eval_kill_switch(policy, ledger_stats)
 
     # ── kill switch（公理 A10：账本健康度即安全信号） ──────────────────
@@ -74,9 +82,14 @@ class PolicyInterceptor:
             condition = str(entry.get("when", "")) if isinstance(entry, dict) else str(entry)
             m = KILL_RATIO.fullmatch(condition)
             if m is None:
-                self._record(
-                    "warn", "kill_switch", condition, "条件不可机器求值，不生效（受限形式：overruled/confirmed > X）"
-                )
+                if condition not in self._warned_conditions:
+                    self._warned_conditions.add(condition)
+                    self._record(
+                        "warn",
+                        "kill_switch",
+                        condition,
+                        "条件不可机器求值，不生效（受限形式：overruled/confirmed > X）",
+                    )
                 continue
             confirmed, overruled = stats.get("confirmed", 0), stats.get("overruled", 0)
             if confirmed > 0 and overruled / confirmed > float(m.group(1)):
@@ -85,10 +98,22 @@ class PolicyInterceptor:
                 return True, reason
         return False, ""
 
+    def refresh_kill_switch(self, ledger_stats: dict[str, int]) -> None:
+        """账本计数变了（M3 采集器落账）Host 不重启也要看见——每次唤醒前用现账本重算。"""
+        self.kill_tripped, self.kill_reason = self._eval_kill_switch(self._policy, ledger_stats)
+
+    # ── 包停触达认知平面（三级停之三：撤销后在途剧集步间即停、调用全拒） ──
+
+    def revoke(self, reason: str) -> None:
+        self.revoked = reason
+        self._record("deny", None, self.package_id, f"包停/撤销：{reason}——在途剧集步间即停，后续调用全部拒绝")
+
     # ── 工具白名单（默认拒绝） ─────────────────────────────────────────
 
     def authorize_tool(self, step: str | None, tool: str, episode_id: str | None = None) -> tuple[bool, str]:
         """step=None 表示运行时内部调用（precondition/watch 轮询），不走模型白名单。"""
+        if self.revoked:
+            return self._deny(step, tool, f"包已停：{self.revoked}")
         if self.kill_tripped:
             return self._deny(step, tool, self.kill_reason)
         if episode_id is not None and self.max_tool_calls is not None:
@@ -131,6 +156,18 @@ class PolicyInterceptor:
             self._granted.discard(action)
             return self._allow(None, action, f"审批已获（{approver}），一次性放行")
         return self._deny(None, action, f"审批门拦截：动作「{action}」需 {approver} 审批")
+
+    def require_write_approval(self, interface_ref: str) -> tuple[bool, str]:
+        """写接口的审批门（Connector 代理写路径必经，内部调用不豁免）。
+
+        与 require_approval 的缺省放行相反：写动作**默认拒绝**——不在审批清单的
+        写接口连审批的机会都没有（policy 没给名分的写动作不存在合法路径）。
+        """
+        if interface_ref not in self.approvals:
+            return self._deny(
+                None, interface_ref, f"写接口「{interface_ref}」不在 policy approvals 清单——写动作默认拒绝"
+            )
+        return self.require_approval(interface_ref)
 
     def grant_approval(self, action: str) -> tuple[bool, str]:
         if action not in self.approvals:

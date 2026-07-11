@@ -14,9 +14,11 @@ import contextlib
 import logging
 import signal
 from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 
 import yaml
+from osca_cli.package import load_package
 
 from osca_host import __version__
 from osca_host.connector import ConnectorProxy
@@ -43,7 +45,7 @@ class Host:
         self.gates: dict[tuple[str, str], Gate] = {}  # (package_id, aware_id) → Gate
         self.policies: dict[str, PolicyInterceptor] = {}
         self.proxies: dict[str, ConnectorProxy] = {}
-        self.bindings: dict = {}  # 部署环境注入的 binding 表（--bindings，永不进包）
+        self.bindings: dict[str, dict] = {}  # package_id → 部署注入的 binding 表（按包隔离，永不进包）
         self.episodes: OrderedDict[str, Episode] = OrderedDict()  # 剧集台账（近期）
         self._episode_seq = 0
         self._episode_tasks: set[asyncio.Task] = set()  # 在跑剧集（认知平面，独立线程）
@@ -102,9 +104,12 @@ class Host:
         )
         if loaded is None:
             return {"ok": False, "detail": result.lines}
-        if request.get("bindings"):  # 部署 binding 进 Host 运行时表（Connector 代理解析用）
-            self.bindings.update(yaml.safe_load(Path(str(request["bindings"])).read_text(encoding="utf-8")) or {})
+        # binding 按包隔离：本次 --bindings 只归本包——同名 binding 不跨包串线、卸载即清理
+        pkg_bindings: dict = {}
+        if request.get("bindings"):
+            pkg_bindings = yaml.safe_load(Path(str(request["bindings"])).read_text(encoding="utf-8")) or {}
         lines = result.lines + self.registry.register(loaded)
+        self.bindings[loaded.package_id] = pkg_bindings
 
         # 笼子先立起来：policy 拦截器 + connector 代理，然后才布防
         policy_file = loaded.pack.yaml_files.get("policy.yaml")
@@ -114,7 +119,7 @@ class Host:
             ledger_stats(loaded.pack),
         )
         self.policies[loaded.package_id] = policy
-        self.proxies[loaded.package_id] = ConnectorProxy(loaded, self.bindings, policy)
+        self.proxies[loaded.package_id] = ConnectorProxy(loaded, pkg_bindings, policy)
         if policy.kill_tripped:
             lines.append(f"⚠ {policy.kill_reason}——包已装载但唤醒与调用全部拒绝（三级停语义，公理 A10）")
 
@@ -148,8 +153,12 @@ class Host:
         removed = self.table.unsubscribe(package_id)
         for key in [k for k in self.gates if k[0] == package_id]:
             del self.gates[key]
-        self.policies.pop(package_id, None)
+        policy = self.policies.pop(package_id, None)
+        if policy is not None:
+            # 包停触达认知平面：在途剧集持有此 policy 引用——步间即停、后续调用全拒
+            policy.revoke("unload 包停")
         self.proxies.pop(package_id, None)
+        self.bindings.pop(package_id, None)  # binding 随包清理，不留给后来者
         lines = [f"触发表撤防 {len(removed)} 条"] + self.registry.unregister(package_id)
         for line in lines:
             log.info(line)
@@ -161,6 +170,8 @@ class Host:
         if gate is None or pkg is None:
             return {"ok": False, "detail": f"未找到 {package_id} 的 {aware_id}"}
         aware = next(a for a in pkg.awares if a.aware_id == aware_id)
+        if enabled and gate.enabled:
+            return {"ok": True, "detail": f"{aware_id} 已是启用状态——幂等，不重复布防（防止双份订阅双份唤醒）"}
         gate.enabled = enabled
         if enabled:
             for t in aware.triggers:
@@ -189,6 +200,10 @@ class Host:
             if gate is None:
                 return
             policy = self.policies.get(package_id)
+            loaded = self.registry.packages.get(package_id)
+            if policy and loaded:
+                # 账本健康度即安全信号（公理 A10）：计数被 M3 采集器改过就要看见——唤醒前重算
+                policy.refresh_kill_switch(ledger_stats(load_package(loaded.root)))
             if policy and policy.kill_tripped:
                 log.warning(f"[{package_id}/{aware_id}] {trigger_id} 命中 → 拒绝唤醒：{policy.kill_reason}")
                 return
@@ -253,17 +268,27 @@ class Host:
         task.add_done_callback(self._episode_tasks.discard)
 
     async def _execute_episode(self, episode: Episode, loaded, proxy, policy) -> None:
-        await asyncio.to_thread(run_episode, episode, loaded, proxy, policy)
+        try:
+            await asyncio.to_thread(run_episode, episode, loaded, proxy, policy)
+        except Exception:
+            # 执行器内部错误不许让剧集永远停在 running——终态入台账，异常进日志
+            episode.status = "failed"
+            episode.stop_reason = "执行器内部错误（见 Host 日志）"
+            episode.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            log.exception(f"剧集 {episode.episode_id} 执行器内部错误")
         tail = f"（{episode.stop_reason}）" if episode.stop_reason else ""
         log.info(f"剧集 {episode.episode_id} 终态 {episode.status}{tail}：tokens {episode.tokens_used}")
         if episode.status != "completed":
             return
         # 对账器（组件 7）：objective 型对象自动落 outcome case，不消耗剧集
-        for entry in await asyncio.to_thread(settle_episode, loaded, proxy, episode):
-            if entry["settled"]:
-                log.info(f"对账落账：{entry['object']} → {entry['case']}（现实是第二位专家，公理 A2）")
-            else:
-                log.info(f"对账未执行：{entry['object']}——{entry['note']}")
+        try:
+            for entry in await asyncio.to_thread(settle_episode, loaded, proxy, episode):
+                if entry["settled"]:
+                    log.info(f"对账落账：{entry['object']} → {entry['case']}（现实是第二位专家，公理 A2）")
+                else:
+                    log.info(f"对账未执行：{entry['object']}——{entry['note']}")
+        except Exception:
+            log.exception(f"剧集 {episode.episode_id} 对账器内部错误（剧集本身已 completed）")
 
     def _sync_slots(self, package_id: str) -> None:
         """注册表槽位状态跟随布防事实：armed（已挂 watcher/待人工发射）或 disabled。"""

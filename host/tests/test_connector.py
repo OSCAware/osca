@@ -70,6 +70,23 @@ def test_egress_default_deny_for_real_endpoint(sample_pack):
     assert not receipt.ok and "egress 默认全禁" in receipt.error  # allow_domains 为空
 
 
+def test_write_path_gated_by_approval_even_for_internal_calls(proxy):
+    """写接口审批门：step=None 的内部调用不豁免；不在清单默认拒绝；token 一次性消费。"""
+    proxy.connectors["CON-001"]["permissions"]["write"] = "allowed_with_approval"
+
+    receipt = proxy.call("CON-001.拉取费用明细", step=None)
+    assert not receipt.ok and "默认拒绝" in receipt.error  # 不在 approvals 清单——内部调用也没有旁路
+
+    proxy.policy.approvals["CON-001.拉取费用明细"] = "专家"
+    receipt = proxy.call("CON-001.拉取费用明细", step="取数")
+    assert not receipt.ok and "审批门拦截" in receipt.error  # 在清单但未授予
+
+    proxy.policy.grant_approval("CON-001.拉取费用明细")
+    assert proxy.call("CON-001.拉取费用明细", step="取数").ok  # 授予后放行一次（mock 执行）
+    receipt = proxy.call("CON-001.拉取费用明细", step="取数")
+    assert not receipt.ok and "审批门拦截" in receipt.error  # token 已消费
+
+
 def test_mock_fixture_missing(proxy, sample_pack):
     receipt = proxy.call("CON-001.拉取检修计划期", step=None)  # 固件目录里没有这个接口的文件
     assert not receipt.ok and "mock 固件缺失" in receipt.error

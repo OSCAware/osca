@@ -3,6 +3,7 @@
 # 如果你发现自己想在这里写 if/else，停下——那是一条该进 judgments/ 的判断。
 
 structure_id: STR-001
+objective: OBJ-003    # 寻优目标（SPEC v0.4 §8）：剧集完成后按其 settle 声明自动对账落 outcome case
 pipeline:
 
   - step: 取数

@@ -18,24 +18,13 @@ import re
 from datetime import datetime
 
 import yaml
+from osca_cli.ledger import allocate_case_path
 
 from osca_host.connector import ConnectorProxy
 from osca_host.episode import Episode
 from osca_host.loader import LoadedPackage
 
 INTERFACE_REF = re.compile(r"CON-\d{3,4}\.\S+")
-CASE_NUM = re.compile(r"C-(\d+)")
-
-
-def _next_case_id(loaded: LoadedPackage) -> str:
-    """账本只追加：新 case 编号顺延现有最大号。"""
-    cases_dir = loaded.root / "cases"
-    numbers = (
-        [int(m.group(1)) for p in cases_dir.glob("*.yaml") if (m := CASE_NUM.match(p.stem)) is not None]
-        if cases_dir.is_dir()
-        else []
-    )
-    return f"C-{max(numbers, default=0) + 1:04d}"
 
 
 def _decision(episode: Episode) -> object:
@@ -68,7 +57,8 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
             results.append({"object": object_id, "settled": False, "note": f"对账取数失败：{receipt.error}"})
             continue
 
-        case_id = _next_case_id(loaded)
+        # 编号分配即占位（O_EXCL）：并发剧集/采集器同时落账也绝不同号覆盖
+        case_id, path = allocate_case_path(loaded.root)
         case = {
             "case_id": case_id,
             "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -89,10 +79,11 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
             },
             "distillation": {"status": "pending"},
         }
-        cases_dir = loaded.root / "cases"
-        cases_dir.mkdir(exist_ok=True)
-        path = cases_dir / f"{case_id}.yaml"
-        path.write_text(yaml.safe_dump(case, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        try:
+            path.write_text(yaml.safe_dump(case, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        except OSError:
+            path.unlink(missing_ok=True)  # 写入失败不留空壳占位进账本
+            raise
         results.append({"object": object_id, "settled": True, "case": case_id, "path": str(path)})
 
     episode.settlements.extend(results)
