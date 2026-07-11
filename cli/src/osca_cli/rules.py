@@ -88,6 +88,12 @@ def osca004_manifest(pkg: OscaPackage) -> list[Finding]:
         findings.append(
             _err("OSCA004", "osca.yaml", f"requires 必须是 mapping（runtime/bindings，现为 {type(requires).__name__}）")
         )
+    elif isinstance(requires, dict):
+        bindings_decl = requires.get("bindings")
+        if bindings_decl is not None and not (
+            isinstance(bindings_decl, list) and all(isinstance(x, str) for x in bindings_decl)
+        ):
+            findings.append(_err("OSCA004", "osca.yaml", "requires.bindings 必须是字符串列表（binding 名）"))
     pid = m.get("package_id")
     if isinstance(pid, str) and not re.fullmatch(r"[a-z0-9][a-z0-9-]*", pid):
         findings.append(_warn("OSCA004", "osca.yaml", "package_id 建议仅用小写字母、数字、连字符"))
@@ -192,7 +198,8 @@ def osca022_requires_bindings(pkg: OscaPackage) -> list[Finding]:
     if manifest is None:
         return []
     requires = manifest.mapping.get("requires") or {}
-    declared = set(requires.get("bindings") or []) if isinstance(requires, dict) else set()
+    raw_declared = requires.get("bindings") if isinstance(requires, dict) else None
+    declared = {x for x in raw_declared if isinstance(x, str)} if isinstance(raw_declared, list) else set()
     actual = {
         f.mapping.get("binding_ref")
         for f in pkg.typed_files("connectors")
@@ -216,14 +223,15 @@ def osca023_policy_steps(pkg: OscaPackage) -> list[Finding]:
     pipeline = structure.mapping.get("pipeline")
     if not isinstance(pipeline, list):
         pipeline = []  # 形状缺陷由 OSCA040 报，这里不迭代非序列
-    steps = {s.get("step") for s in pipeline if isinstance(s, dict)}
+    steps = {s.get("step") for s in pipeline if isinstance(s, dict) and isinstance(s.get("step"), str)}
     findings = []
     permissions = policy.mapping.get("permissions")
     for perm in permissions if isinstance(permissions, list) else []:
-        if isinstance(perm, dict) and perm.get("step") not in steps:
-            findings.append(
-                _warn("OSCA023", "policy.yaml", f"权限表 step「{perm.get('step')}」在 structure pipeline 中不存在")
-            )
+        if not isinstance(perm, dict):
+            continue  # 元素形状由 OSCA040 报
+        step = perm.get("step")
+        if not isinstance(step, str) or step not in steps:
+            findings.append(_warn("OSCA023", "policy.yaml", f"权限表 step「{step}」在 structure pipeline 中不存在"))
     return findings
 
 
@@ -276,14 +284,15 @@ def osca031_supersedes(pkg: OscaPackage) -> list[Finding]:
     """
     findings = []
     judgments = _judgments(pkg)
-    by_id = {f.mapping.get("judgment_id"): f for f in judgments}
+    by_id = {f.mapping.get("judgment_id"): f for f in judgments if isinstance(f.mapping.get("judgment_id"), str)}
     superseded_by: dict[str, list[str]] = defaultdict(list)
     chain: dict[str, str] = {}  # jid → 它取代的 jid（环检测输入）
     for f in judgments:
         target = f.mapping.get("supersedes")
         if target is None:
             continue
-        jid = f.mapping.get("judgment_id", f.relpath)
+        jid = f.mapping.get("judgment_id")
+        jid = jid if isinstance(jid, str) else f.relpath  # ID 形状缺陷由 OSCA011 报；这里保持可定位
         if not isinstance(target, str):
             findings.append(
                 _err("OSCA031", f.relpath, f"supersedes 必须是判断 ID 字符串（现为 {type(target).__name__}）")
@@ -326,7 +335,7 @@ def osca031_supersedes(pkg: OscaPackage) -> list[Finding]:
                 findings.append(_err("OSCA031", by_id[start].relpath, f"supersedes 成环：{loop}——取代链必须无环"))
     for f in judgments:
         jid = f.mapping.get("judgment_id")
-        if f.mapping.get("status") == "superseded" and jid not in superseded_by:
+        if f.mapping.get("status") == "superseded" and (not isinstance(jid, str) or jid not in superseded_by):
             findings.append(_err("OSCA031", f.relpath, "status=superseded 但没有任何判断通过 supersedes 指向它"))
     return findings
 
@@ -344,8 +353,8 @@ def osca032_trust(pkg: OscaPackage) -> list[Finding]:
             continue  # 形状缺陷由 OSCA040 报——本规则自身对任意形状保持总函数
         confirmed, overruled = meta.get("confirmed"), meta.get("overruled")
         trust = meta.get("trust")
-        if not isinstance(confirmed, int) or not isinstance(overruled, int):
-            continue  # 字段缺失由 OSCA040 报
+        if type(confirmed) is not int or type(overruled) is not int:
+            continue  # 字段缺失/形状缺陷（含 bool——Python 里 bool 是 int 子类）由 OSCA040 报
         earned_high = confirmed >= 5 and overruled == 0
         if earned_high and trust != "high":
             findings.append(
@@ -449,7 +458,9 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
             bad_shape(f, "examples.negative", negatives, "list")
             negatives = None
         for i, neg in enumerate(negatives or []):
-            if isinstance(neg, dict) and not neg.get("why"):
+            if not isinstance(neg, dict):
+                findings.append(_err("OSCA040", f.relpath, f"负样例第 {i + 1} 条必须是 mapping（摘录 + why）"))
+            elif not neg.get("why"):
                 findings.append(
                     _err("OSCA040", f.relpath, f"负样例第 {i + 1} 条缺少 why（每条负样例必须带 why，SPEC §3）")
                 )
@@ -494,8 +505,12 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
         if not triggers:
             findings.append(_err("OSCA040", f.relpath, "至少需要 1 个触发原语（triggers 或 trigger）"))
         for i, t in enumerate(triggers):
-            kind = t.get("kind") if isinstance(t, dict) else None
-            if isinstance(t, dict) and not (isinstance(kind, str) and kind in TRIGGER_KINDS):
+            if not isinstance(t, dict):
+                # 非 mapping 元素会被运行时静默丢弃 → 「显示启用、实际永不触发」的包，必须在此挡下
+                findings.append(_err("OSCA040", f.relpath, f"触发原语第 {i + 1} 条必须是 mapping（id/kind/…）"))
+                continue
+            kind = t.get("kind")
+            if not (isinstance(kind, str) and kind in TRIGGER_KINDS):
                 findings.append(
                     _err("OSCA040", f.relpath, f"触发原语第 {i + 1} 条 kind 不在 {sorted(TRIGGER_KINDS)} 中")
                 )
@@ -511,13 +526,19 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
         if isinstance(meta, dict):
             need(f, "author", "trust", where=meta, prefix="meta.")
             for key in ("confirmed", "overruled"):
-                if not isinstance(meta.get(key), int):
-                    findings.append(_err("OSCA040", f.relpath, f"meta.{key} 必须是整数计数"))
+                if type(meta.get(key)) is not int:  # bool 是 int 子类——true/false 混进计数会污染 trust 与 kill switch
+                    findings.append(_err("OSCA040", f.relpath, f"meta.{key} 必须是整数计数（布尔值不算）"))
         elif meta is not None:
             bad_shape(f, "meta", meta, "mapping（机器管账的计数与 trust）")
         replay = f.mapping.get("replay")
         if replay is not None and not isinstance(replay, list):
             bad_shape(f, "replay", replay, "list（回放断言序列）")
+            replay = None
+        for i, assertion in enumerate(replay or []):
+            if not isinstance(assertion, dict):
+                findings.append(
+                    _err("OSCA040", f.relpath, f"replay 第 {i + 1} 条必须是 mapping（given/with_this_judgment）")
+                )
 
     for f in pkg.typed_files("cases"):
         if f.parse_error:
@@ -543,6 +564,49 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
             per = budgets.get("per_episode")
             if per is not None and not isinstance(per, dict):
                 findings.append(_err("OSCA040", "policy.yaml", "budgets.per_episode 必须是 mapping"))
+        # 运行时消费的叶子字段：形状错误会静默改变笼子语义（如关闭脱敏），必须逐项验型
+        permissions = m.get("permissions")
+        for i, p in enumerate(permissions if isinstance(permissions, list) else []):
+            if not isinstance(p, dict) or not isinstance(p.get("step"), str):
+                findings.append(
+                    _err("OSCA040", "policy.yaml", f"permissions 第 {i + 1} 项必须是含 step 字符串的 mapping")
+                )
+                continue
+            allow = p.get("allow")
+            if allow is not None and not (isinstance(allow, list) and all(isinstance(a, str) for a in allow)):
+                findings.append(
+                    _err(
+                        "OSCA040",
+                        "policy.yaml",
+                        f"permissions「{p.get('step')}」的 allow 必须是字符串列表（工具白名单）",
+                    )
+                )
+        approvals = m.get("approvals")
+        for i, a in enumerate(approvals if isinstance(approvals, list) else []):
+            if (
+                not isinstance(a, dict)
+                or not isinstance(a.get("action"), str)
+                or not isinstance(a.get("approver"), str)
+            ):
+                findings.append(
+                    _err("OSCA040", "policy.yaml", f"approvals 第 {i + 1} 项必须是含 action/approver 字符串的 mapping")
+                )
+        kill_switch = m.get("kill_switch")
+        for i, k in enumerate(kill_switch if isinstance(kill_switch, list) else []):
+            if not isinstance(k, dict) or not k.get("when"):
+                findings.append(_err("OSCA040", "policy.yaml", f"kill_switch 第 {i + 1} 项必须是含 when 的 mapping"))
+        data = m.get("data")
+        if isinstance(data, dict):
+            redact = data.get("redact")
+            if redact is not None and not (isinstance(redact, list) and all(isinstance(c, str) for c in redact)):
+                findings.append(
+                    _err("OSCA040", "policy.yaml", "data.redact 必须是字符串列表（脱敏类别）——形状错误会静默关闭脱敏")
+                )
+        egress = m.get("egress")
+        if isinstance(egress, dict):
+            domains = egress.get("allow_domains")
+            if domains is not None and not (isinstance(domains, list) and all(isinstance(d, str) for d in domains)):
+                findings.append(_err("OSCA040", "policy.yaml", "egress.allow_domains 必须是字符串列表（出网白名单）"))
 
     structure = pkg.yaml_files.get("structure.yaml")
     if structure and not structure.parse_error:
@@ -560,6 +624,14 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
                         "OSCA040",
                         "structure.yaml",
                         f"pipeline 第 {i + 1} 项必须是步骤声明 mapping（现为 {type(step).__name__}）",
+                    )
+                )
+            elif step.get("step") is not None and not isinstance(step.get("step"), str):
+                findings.append(
+                    _err(
+                        "OSCA040",
+                        "structure.yaml",
+                        f"pipeline 第 {i + 1} 项的 step 必须是字符串（policy 权限表以它为键）",
                     )
                 )
 

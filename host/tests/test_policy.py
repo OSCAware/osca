@@ -82,6 +82,37 @@ def test_kill_switch_garbage_threshold_does_not_crash():
     assert any("阈值不可解析" in a["reason"] for a in p.audit)
 
 
+def test_interceptor_defends_leaf_shapes_itself():
+    """笼子自防（不依赖 lint 先行）：叶子形状错误留审计警告、绝不静默改语义。"""
+    p = make(
+        policy={
+            **POLICY,
+            "data": {"redact": "身份证号"},  # 字符串 → 逐字符遍历 → 脱敏静默关闭（此前的病灶）
+            "egress": {"allow_domains": "oscaware.com"},
+        }
+    )
+    assert p.redact_categories == []
+    assert any("data.redact 形状错误" in a["reason"] for a in p.audit)  # 关闭有痕，不是静默
+    assert p.egress_allow == set()
+    assert any("egress.allow_domains 形状错误" in a["reason"] for a in p.audit)
+    assert not p.authorize_egress("oscaware.com")[0]  # 白名单未生效 → 默认全禁仍成立
+
+    p2 = make(
+        policy={
+            **POLICY,
+            "permissions": ["oops", {"step": "取数", "allow": "不是列表"}],
+            "approvals": ["oops"],
+            "kill_switch": 42,
+            "budgets": {"per_episode": ["oops"]},
+        },
+        stats={"confirmed": 1, "overruled": 100},
+    )
+    assert p2.permissions == {"取数": set()}  # allow 形状错误 → 空白名单（默认拒绝语义不变）
+    assert p2.approvals == {} and p2.max_tool_calls is None and p2.max_tokens is None
+    assert not p2.kill_tripped  # kill_switch 形状错误 → 不生效并留痕
+    assert any("形状错误" in a["reason"] for a in p2.audit)
+
+
 def test_revoke_stops_all_calls():
     """包停触达认知平面：撤销后模型调用与运行时内部调用全部拒绝。"""
     p = make()

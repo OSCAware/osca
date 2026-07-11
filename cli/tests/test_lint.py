@@ -341,6 +341,69 @@ def test_runtime_critical_shape_errors_reported(make_pkg, base):
         assert not result.ok, f"{relpath} 的 {fieldname}=list 应报 ERROR"
 
 
+def test_policy_leaf_shape_errors_reported(make_pkg, base):
+    """Policy 运行时消费的叶子字段：形状错误必须 ERROR——脱敏/白名单不能被静默关闭。"""
+    import copy
+
+    leaves = [
+        ("data", {"redact": "身份证号"}),  # 字符串会被逐字符遍历 → 脱敏静默关闭
+        ("egress", {"allow_domains": "oscaware.com"}),
+        ("permissions", [{"step": "取数", "allow": "CON-001.取数"}]),
+        ("permissions", ["oops"]),
+        ("approvals", ["oops"]),
+        ("kill_switch", ["oops"]),
+    ]
+    for fieldname, bad in leaves:
+        mutated = copy.deepcopy(base)
+        mutated["policy.yaml"][fieldname] = bad
+        result = lint_package(make_pkg(mutated))
+        assert not result.ok, f"policy.{fieldname}={bad!r} 应报 ERROR"
+
+
+def test_sequence_element_shape_errors_reported(make_pkg, base):
+    """外层 list 合法不等于元素合法：非 mapping 元素会被运行时静默丢弃，必须 ERROR。"""
+    import copy
+
+    element_cases = [
+        ("aware/AW-001-定时.yaml", "triggers", ["oops"]),  # 「显示启用、实际永不触发」
+        ("judgments/J-0001.yaml", "replay", ["oops"]),
+        ("objects/OBJ-001-报告.yaml", "examples", {"negative": ["oops"]}),
+        ("structure.yaml", "pipeline", ["oops"]),
+    ]
+    for relpath, fieldname, bad in element_cases:
+        mutated = copy.deepcopy(base)
+        mutated[relpath][fieldname] = bad
+        result = lint_package(make_pkg(mutated))
+        assert not result.ok, f"{relpath} 的 {fieldname}={bad!r} 应报 ERROR"
+
+
+def test_bool_counts_rejected(make_pkg, base):
+    """bool 是 int 子类：true/false 混进计数会污染 trust 与 kill switch——必须 ERROR。"""
+    import copy
+
+    mutated = copy.deepcopy(base)
+    mutated["judgments/J-0001.yaml"]["meta"]["confirmed"] = True
+    result = lint_package(make_pkg(mutated))
+    assert any(f.rule == "OSCA040" and "布尔" in f.message for f in result.findings)
+
+
+def test_shape_findings_are_locatable_not_backstop(make_pkg, base):
+    """诊断可定位：形状错误报在对应文件的正常 finding，不退化为 run_all 兜底的「.」。"""
+    import copy
+
+    probes = [
+        ("osca.yaml", "requires", {"bindings": 42}),
+        ("structure.yaml", "pipeline", [{"step": ["不可哈希"], "performer": "agent"}]),
+        ("judgments/J-0001.yaml", "judgment_id", ["J-0001"]),
+    ]
+    for relpath, fieldname, bad in probes:
+        mutated = copy.deepcopy(base)
+        mutated[relpath][fieldname] = bad
+        result = lint_package(make_pkg(mutated))
+        assert not any("规则执行异常" in f.message for f in result.findings), f"{relpath}.{fieldname} 走了兜底"
+        assert not result.ok, f"{relpath}.{fieldname}={bad!r} 应报 ERROR"
+
+
 # ── 安全铁律 ──
 
 

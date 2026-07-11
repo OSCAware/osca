@@ -45,13 +45,38 @@ class PolicyInterceptor:
     def __init__(self, package_id: str, policy: dict, ledger_stats: dict[str, int]):
         self.package_id = package_id
         self.audit: list[dict] = []
-        self.permissions: dict[str, set[str]] = {
-            str(p.get("step")): set(p.get("allow") or [])
-            for p in policy.get("permissions") or []
-            if isinstance(p, dict)
-        }
-        budgets = policy.get("budgets") or {}
-        per_episode = budgets.get("per_episode") or {}
+
+        # ── 笼子自防：形状错误绝不静默改语义（如关闭脱敏）——留审计警告，lint 之外的第二道闸 ──
+        def shape_warn(section: str, value, expected: str) -> None:
+            self._record(
+                "warn", section, str(value), f"{section} 形状错误（须为 {expected}）——该段配置未生效，请修 policy"
+            )
+
+        def as_dict(section: str, value) -> dict:
+            if value is None or isinstance(value, dict):
+                return value or {}
+            shape_warn(section, value, "mapping")
+            return {}
+
+        def as_list(section: str, value) -> list:
+            if value is None or isinstance(value, list):
+                return value or []
+            shape_warn(section, value, "list")
+            return []
+
+        self.permissions: dict[str, set[str]] = {}
+        for p in as_list("permissions", policy.get("permissions")):
+            if not isinstance(p, dict) or not isinstance(p.get("step"), str):
+                shape_warn("permissions", p, "含 step 字符串的 mapping")
+                continue
+            allow = p.get("allow")
+            if allow is not None and not isinstance(allow, list):
+                shape_warn(f"permissions[{p['step']}].allow", allow, "字符串列表")
+                allow = []
+            self.permissions[p["step"]] = {a for a in allow or [] if isinstance(a, str)}
+
+        budgets = as_dict("budgets", policy.get("budgets"))
+        per_episode = as_dict("budgets.per_episode", budgets.get("per_episode"))
         self.max_tool_calls = (
             parse_quantity(per_episode.get("max_tool_calls")) if "max_tool_calls" in per_episode else None
         )
@@ -64,11 +89,25 @@ class PolicyInterceptor:
             detail = "max_tokens 不可解析（受限形式：<正整数>[k]），硬顶不生效"
             self._record("warn", "budgets", str(per_episode["max_tokens"]), detail)
         self._tokens: dict[str, int] = {}  # episode_id → 已用
-        self.egress_allow: set[str] = set((policy.get("egress") or {}).get("allow_domains") or [])
-        self.redact_categories = [c for c in (policy.get("data") or {}).get("redact") or [] if c in REDACTORS]
-        self.approvals: dict[str, str] = {
-            str(a.get("action")): str(a.get("approver")) for a in policy.get("approvals") or [] if isinstance(a, dict)
-        }
+
+        domains = as_dict("egress", policy.get("egress")).get("allow_domains")
+        if domains is not None and not isinstance(domains, list):
+            shape_warn("egress.allow_domains", domains, "字符串列表")  # 白名单未生效——默认全禁仍成立
+            domains = []
+        self.egress_allow: set[str] = {d for d in domains or [] if isinstance(d, str)}
+
+        redact = as_dict("data", policy.get("data")).get("redact")
+        if redact is not None and not isinstance(redact, list):
+            shape_warn("data.redact", redact, "字符串列表")  # 脱敏能力绝不静默关闭——留痕可查
+            redact = []
+        self.redact_categories = [c for c in redact or [] if c in REDACTORS]
+
+        self.approvals: dict[str, str] = {}
+        for a in as_list("approvals", policy.get("approvals")):
+            if isinstance(a, dict) and isinstance(a.get("action"), str):
+                self.approvals[a["action"]] = str(a.get("approver"))
+            else:
+                shape_warn("approvals", a, "含 action/approver 字符串的 mapping")
         self._granted: set[str] = set()
         self.revoked = ""  # 非空即包停/撤销原因——在途剧集在步间与每次调用点看它（三级停之「包停」触达认知平面）
         self._policy = policy  # kill switch 重算用（账本计数变了，条件不变）
@@ -78,7 +117,13 @@ class PolicyInterceptor:
     # ── kill switch（公理 A10：账本健康度即安全信号） ──────────────────
 
     def _eval_kill_switch(self, policy: dict, stats: dict[str, int]) -> tuple[bool, str]:
-        for entry in policy.get("kill_switch") or []:
+        entries = policy.get("kill_switch")
+        if entries is not None and not isinstance(entries, list):
+            if "__kill_switch_shape__" not in self._warned_conditions:
+                self._warned_conditions.add("__kill_switch_shape__")
+                self._record("warn", "kill_switch", str(entries), "kill_switch 形状错误（须为 list）——不生效")
+            return False, ""
+        for entry in entries or []:
             condition = str(entry.get("when", "")) if isinstance(entry, dict) else str(entry)
             m = KILL_RATIO.fullmatch(condition)
             if m is None:
@@ -259,6 +304,6 @@ def ledger_stats(pack) -> dict[str, int]:
         meta = f.mapping.get("meta")
         if not isinstance(meta, dict):
             continue  # 形状缺陷由 lint 挡；统计自身对任意形状保持总函数
-        confirmed += meta.get("confirmed") if isinstance(meta.get("confirmed"), int) else 0
-        overruled += meta.get("overruled") if isinstance(meta.get("overruled"), int) else 0
+        confirmed += meta.get("confirmed") if type(meta.get("confirmed")) is int else 0  # bool 是 int 子类，不算数
+        overruled += meta.get("overruled") if type(meta.get("overruled")) is int else 0
     return {"confirmed": confirmed, "overruled": overruled}

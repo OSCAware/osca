@@ -97,5 +97,17 @@
 - episode 模块文档同步四轮架构边界：装配签名表源自 loaded.pack，磁盘缓存只服务
   检索器与人工查看
 
+## [Review 复核 · 六轮] - 2026-07-11
+- Policy 叶子 schema：data.redact / egress.allow_domains / permissions[].allow 必须是
+  字符串列表，permissions[] / approvals[] / kill_switch[] 元素必须是 mapping——
+  `data.redact: 身份证号`（字符串）此前会**静默关闭脱敏**，现 lint 即 ERROR；
+  PolicyInterceptor 自身同步自防（形状错误留审计警告、绝不静默改语义，不依赖 lint 先行）
+- 序列元素与布尔计数：triggers[]/replay[]/negative[]/pipeline[] 非 mapping 元素即 ERROR
+  （此前 `triggers: ["oops"]` 造出「显示启用、实际永不触发」的包）；meta 计数排除 bool
+  （bool 是 int 子类，true/false 会污染 trust 与 kill switch 计数），ledger_stats 同步
+- 诊断可定位：OSCA004/022/023/031 对 requires.bindings 非法形状、不可哈希 step/
+  judgment_id 本地验型——报对应文件的正常 finding，不再退化为 run_all 兜底的「.」；
+  变异矩阵按 GPT 建议收紧（叶子/元素/布尔各有必须 ERROR 的断言）
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC
