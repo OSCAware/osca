@@ -176,3 +176,51 @@ def test_audit_trail_records_decisions():
     p.authorize_tool("成文", "CON-001.拉取费用明细")
     denies = [a for a in p.audit if a["decision"] == "deny"]
     assert denies and denies[-1]["step"] == "成文"
+
+
+# ── kill switch 第二可求值形式：回放红灯率 > X%（数据源 = 回放器健康档案，M3-W4） ──
+
+REPLAY_POLICY = {**POLICY, "kill_switch": [{"when": "回放红灯率 > 20%"}]}
+
+
+def test_replay_red_rate_trips_kill_switch():
+    p = make(policy=REPLAY_POLICY, stats={**HEALTHY, "replay_red_rate": 0.5, "replay_at": "2026-07-11T10:00:00"})
+    assert p.kill_tripped
+    assert "回放红灯率 50%" in p.kill_reason and "2026-07-11" in p.kill_reason
+
+
+def test_replay_red_rate_below_threshold_stays_quiet():
+    p = make(policy=REPLAY_POLICY, stats={**HEALTHY, "replay_red_rate": 0.1})
+    assert not p.kill_tripped
+
+
+def test_replay_health_missing_is_availability_gap_not_config_error():
+    """档案缺失 → 条件不生效留痕（保守默认）——与形状非法的停机是两回事。"""
+    p = make(policy=REPLAY_POLICY, stats=HEALTHY)  # 无 replay_red_rate
+    assert not p.kill_tripped
+    assert any("回放健康档案缺失" in a["reason"] for a in p.audit if a["decision"] == "warn")
+
+
+def test_replay_health_reader_conservative(tmp_path):
+    from osca_host.policy import replay_health
+
+    assert replay_health(tmp_path)["replay_red_rate"] is None  # 档案不存在
+
+    health = tmp_path / "indexes" / "replay-health.json"
+    health.parent.mkdir()
+    health.write_text('{"red_rate": 0.25, "at": "2026-07-11T10:00:00"}', encoding="utf-8")
+    stats = replay_health(tmp_path)
+    assert stats["replay_red_rate"] == 0.25 and "2026-07-11" in stats["replay_at"]
+
+    for bad in ("不是 JSON{{{", '{"red_rate": "多"}', '{"red_rate": 1.5}', '{"red_rate": true}', '["形状不对"]'):
+        health.write_text(bad, encoding="utf-8")
+        assert replay_health(tmp_path)["replay_red_rate"] is None, bad  # 损坏/越界一律保守
+
+
+def test_sample_pack_replay_condition_now_evaluable(sample_pack):
+    """样例包 policy 的「回放红灯率 > 20%」从 W4 起可求值：健康档案在场即真裁决。"""
+    import yaml as _yaml
+
+    policy_doc = _yaml.safe_load((sample_pack / "policy.yaml").read_text(encoding="utf-8"))
+    p = PolicyInterceptor("demo", policy_doc, {"confirmed": 9, "overruled": 0, "replay_red_rate": 0.5})
+    assert p.kill_tripped and "回放红灯率" in p.kill_reason

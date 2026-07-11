@@ -121,5 +121,11 @@
   步骤必须有非空字符串 step
 - parse_quantity 上移 osca_cli.triggers（lint 与 Host 同源），并收紧为「正整数」
 
+## [Host 0.1 · M3-W4 配套] - 2026-07-11
+- kill switch 第二可求值形式「回放红灯率 > X%」（SPEC v0.4 §4）：数据源为回放器
+  （M3 私仓 checkup）生成的健康档案缓存 `indexes/replay-health.json`（契约入规范）；
+  档案缺失/损坏/越界 → 条件不生效留痕——数据可用性缺口走保守默认，与配置形状非法
+  （fail-closed 停机）是两回事。样例包 policy 的「回放红灯率 > 20%」自此可真裁决
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC
