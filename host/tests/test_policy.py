@@ -116,6 +116,10 @@ def test_interceptor_fails_closed_on_broken_safety_config():
     assert set(p3.redact_categories) == set(REDACTORS)  # 未知类别同样保守全开
     p4 = make(policy={**POLICY, "kill_switch": [{"when": ["not", "string"]}]})
     assert p4.kill_tripped and "配置错误" in p4.kill_reason  # when 非字符串 → 停机
+    p5 = make(policy={**POLICY, "data": "oops"})  # 父段本身非法——不得压成 {} 与「未声明」混同
+    assert set(p5.redact_categories) == set(REDACTORS)
+    p6 = make(policy={**POLICY, "kill_switch": [{"when": "   "}]})  # 空白 when 与 lint 谓词对齐
+    assert p6.kill_tripped and "配置错误" in p6.kill_reason
 
 
 def test_revoke_stops_all_calls():
@@ -169,6 +173,33 @@ def test_redaction():
     text = str(redacted)
     assert "13812345678" not in text and "110101199001011234" not in text
     assert "手机号已脱敏" in text and "身份证号已脱敏" in text
+
+
+def test_redaction_matches_numbers_adjacent_to_chinese():
+    """中文与数字同属正则 \\w——「手机号13812345678」在 \\b 边界下会整条漏掉（八轮实测病灶）。"""
+    p = make()
+    text, hits = p.redact("手机号13812345678；身份证号11010519491231002X")
+    assert hits == 2
+    assert "13812345678" not in text and "11010519491231002X" not in text
+    # 长数字串里的片段不是完整号码——数字负向断言不误伤
+    _, none_hits = p.redact("订单号 913812345678901")
+    assert none_hits == 0
+
+
+def test_zero_token_budget_denies_before_any_call():
+    """额度撤销后「任何调用即拒」：预检在 LLM 调用之前拦，不是调用之后止损。"""
+    p = make(policy={**POLICY, "budgets": {"per_episode": {"max_tokens": "unlimited"}}})
+    assert p.max_tokens == 0
+    ok, reason = p.precheck_tokens("EP-1")
+    assert not ok and "拒绝发起" in reason
+
+
+def test_grant_refused_and_status_honest_when_approvals_broken():
+    """P2：配置损坏时授予必须失败——授出永不生效的 token、status 显示 granted 都是控制面撒谎。"""
+    p = make(policy={**POLICY, "approvals": ["oops"]})
+    ok, reason = p.grant_approval("终稿发送管理层")
+    assert not ok and "配置非法" in reason
+    assert p.snapshot()["approvals"] == "config_error/deny_all"
 
 
 def test_audit_trail_records_decisions():

@@ -408,6 +408,22 @@ def test_legal_shape_illegal_value_rejected(make_pkg, base):
         assert not result.ok, f"{relpath} 的 {fieldname}={bad!r} 应报 ERROR"
 
 
+def test_budget_keys_split_by_runtime_contract(make_pkg, base):
+    """预算键按运行时真实契约拆分：声明了没人执行的硬顶 = fail-open，必须 ERROR。"""
+    import copy
+
+    cases_ = [
+        ("aware/AW-001-定时.yaml", "budget", {"max_tool_calls": 1}),  # 剧集执行器不执行它
+        ("aware/AW-001-定时.yaml", "budget", {"banana": 1}),  # 未知键
+        ("policy.yaml", "budgets", {"per_episode": {"max_steps": 1}}),  # Policy 拦截器不执行它
+    ]
+    for relpath, fieldname, bad in cases_:
+        mutated = copy.deepcopy(base)
+        mutated[relpath][fieldname] = bad
+        result = lint_package(make_pkg(mutated))
+        assert not result.ok, f"{relpath} 的 {fieldname}={bad!r} 应报 ERROR"
+
+
 def test_shape_findings_are_locatable_not_backstop(make_pkg, base):
     """诊断可定位：形状错误报在对应文件的正常 finding，不退化为 run_all 兜底的「.」。"""
     import copy

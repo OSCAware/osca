@@ -127,5 +127,19 @@
   档案缺失/损坏/越界 → 条件不生效留痕——数据可用性缺口走保守默认，与配置形状非法
   （fail-closed 停机）是两回事。样例包 policy 的「回放红灯率 > 20%」自此可真裁决
 
+## [Review 复核 · 八轮] - 2026-07-12
+- 脱敏正则边界修正：`\b` 在中文紧邻数字处无边界（中文与数字同属 \w），
+  「手机号13812345678」会整条漏掉——改用数字负向断言，fail-closed 全开时不再漏
+- 预算键按运行时真实契约拆分：Aware（max_steps/max_minutes/max_tokens）与
+  Policy（max_tool_calls/max_tokens）各自受限、未知键报错——「声明了没人执行的
+  硬顶」不再 0 错通过
+- tokens 额度预检：零额度（含配置错误撤销的）在 llm.complete 之前拒绝——
+  「额度撤销、任何调用即拒」真正成立；止损顶只管合法正数预算的超顶；
+  runner 对绕过 lint 的非法 aware 预算同样撤销自防
+- 自防与 lint 对齐：data 父段非法不再压成 {}（与「未声明」混同）→ 保守全开；
+  kill_switch 空白 when 与 lint 同谓词 → 配置错误停机
+- 审批配置损坏时 grant_approval 拒绝授予、status 明示 config_error/deny_all
+  ——不再展示永不生效的 granted
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC

@@ -418,7 +418,9 @@ CONNECTOR_KINDS = {"mcp", "openapi", "sql_readonly", "code"}
 TRIGGER_KINDS = {"schedule", "event", "watch"}
 # 受支持的脱敏类别枚举——与参考实现 Host 的 REDACTORS 同步（合法形状但未知类别 = 脱敏静默失效）
 REDACT_CATEGORIES = {"身份证号", "手机号"}
-BUDGET_KEYS = ("max_steps", "max_minutes", "max_tokens", "max_tool_calls")  # 数量记法受限形式（SPEC v0.4 §5）
+# 预算键按运行时真实契约拆分（SPEC v0.4 §5）：接受运行时不执行的键 = 「声明了硬顶但没人执行」的 fail-open
+AWARE_BUDGET_KEYS = ("max_steps", "max_minutes", "max_tokens")  # 剧集执行器裁决
+POLICY_BUDGET_KEYS = ("max_tool_calls", "max_tokens")  # Policy 拦截器裁决
 
 
 @rule
@@ -498,13 +500,22 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
         if budget is not None and not isinstance(budget, dict):
             bad_shape(f, "budget", budget, "mapping（max_steps/max_minutes/max_tokens）")
         elif isinstance(budget, dict):
-            for key in BUDGET_KEYS:
-                if key in budget and parse_quantity(budget[key]) is None:
+            for key, value in sorted(budget.items()):
+                if key not in AWARE_BUDGET_KEYS:
                     findings.append(
                         _err(
                             "OSCA040",
                             f.relpath,
-                            f"budget.{key}={budget[key]!r} 不合数量记法（<正整数>[k]）——错误预算不得放行",
+                            f"budget 含运行时不执行的键「{key}」（Aware 预算只认 {list(AWARE_BUDGET_KEYS)}）"
+                            "——声明了没人执行的硬顶是 fail-open",
+                        )
+                    )
+                elif parse_quantity(value) is None:
+                    findings.append(
+                        _err(
+                            "OSCA040",
+                            f.relpath,
+                            f"budget.{key}={value!r} 不合数量记法（<正整数>[k]）——错误预算不得放行",
                         )
                     )
         gate = f.mapping.get("gate")
@@ -578,13 +589,22 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
             if per is not None and not isinstance(per, dict):
                 findings.append(_err("OSCA040", "policy.yaml", "budgets.per_episode 必须是 mapping"))
             elif isinstance(per, dict):
-                for key in BUDGET_KEYS:
-                    if key in per and parse_quantity(per[key]) is None:
+                for key, value in sorted(per.items()):
+                    if key not in POLICY_BUDGET_KEYS:
                         findings.append(
                             _err(
                                 "OSCA040",
                                 "policy.yaml",
-                                f"per_episode.{key}={per[key]!r} 不合数量记法（<正整数>[k]）——错误预算不得放行",
+                                f"per_episode 含运行时不执行的键「{key}」（Policy 预算只认 {list(POLICY_BUDGET_KEYS)}）"
+                                "——声明了没人执行的硬顶是 fail-open",
+                            )
+                        )
+                    elif parse_quantity(value) is None:
+                        findings.append(
+                            _err(
+                                "OSCA040",
+                                "policy.yaml",
+                                f"per_episode.{key}={value!r} 不合数量记法（<正整数>[k]）——错误预算不得放行",
                             )
                         )
         # 运行时消费的叶子字段：形状错误会静默改变笼子语义（如关闭脱敏），必须逐项验型

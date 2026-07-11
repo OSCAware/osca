@@ -35,9 +35,11 @@ from osca_cli.triggers import parse_quantity  # 数量记法单一真理源（SP
 
 __all__ = ["PolicyInterceptor", "REDACTORS", "ledger_stats", "parse_quantity", "replay_health"]
 
+# 边界用数字负向断言而非 \b：中文与数字同属正则「单词字符」，
+# 「手机号13812345678」这类紧邻写法在 \b 下无边界、会整条漏掉（Review 八轮实测）
 REDACTORS: dict[str, re.Pattern[str]] = {
-    "身份证号": re.compile(r"\b\d{17}[\dXx]\b"),
-    "手机号": re.compile(r"\b1[3-9]\d{9}\b"),
+    "身份证号": re.compile(r"(?<![\dXx])\d{17}[\dXx](?![\dXx])"),
+    "手机号": re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
 }
 
 KILL_RATIO = re.compile(r".*overruled\s*/\s*confirmed\s*>\s*([\d.]+).*")
@@ -122,10 +124,16 @@ class PolicyInterceptor:
             domains = []
         self.egress_allow: set[str] = set(domains or [])
 
-        # 脱敏：配置非法（形状/混合元素/未知类别）→ 保守启用全部已知类别——宁可多脱，不可泄露
-        redact = as_dict("data", policy.get("data")).get("redact")
-        redact_broken = redact is not None and (
-            not isinstance(redact, list) or any(not isinstance(c, str) or c not in REDACTORS for c in redact)
+        # 脱敏：配置非法（父段/形状/混合元素/未知类别）→ 保守启用全部已知类别——宁可多脱，不可泄露。
+        # 父段 data 本身非法不得压成 {}——那会与合法的「未声明 redact」混同，退化成 fail-open
+        data_raw = policy.get("data")
+        data_broken = data_raw is not None and not isinstance(data_raw, dict)
+        if data_broken:
+            shape_warn("data", data_raw, "mapping")
+        redact = data_raw.get("redact") if isinstance(data_raw, dict) else None
+        redact_broken = data_broken or (
+            redact is not None
+            and (not isinstance(redact, list) or any(not isinstance(c, str) or c not in REDACTORS for c in redact))
         )
         if redact_broken:
             detail = "脱敏配置非法（须为受支持类别的字符串列表）——保守启用全部已知脱敏类别（fail-closed）"
@@ -177,8 +185,9 @@ class PolicyInterceptor:
         if entries is not None and not isinstance(entries, list):
             return self._config_error_kill(str(entries), "必须是 list")
         for entry in entries or []:
-            if not isinstance(entry, dict) or not isinstance(entry.get("when"), str):
-                return self._config_error_kill(str(entry), "每项必须是含 when 字符串的 mapping")
+            # 谓词与 lint OSCA040 对齐：when 必须是非空字符串（空串/纯空格同为配置错误）
+            if not isinstance(entry, dict) or not isinstance(entry.get("when"), str) or not entry["when"].strip():
+                return self._config_error_kill(str(entry), "每项必须是含 when 非空字符串的 mapping")
             condition = entry["when"]
             ratio = KILL_RATIO.fullmatch(condition)
             replay = REPLAY_RED.fullmatch(condition) if ratio is None else None
@@ -255,6 +264,19 @@ class PolicyInterceptor:
             return self._deny(step, tool, f"步骤「{step}」白名单不含 {tool}（模型越权，直接拒绝）")
         return self._allow(step, tool, "白名单放行")
 
+    def precheck_tokens(self, episode_id: str) -> tuple[bool, str]:
+        """LLM 调用前的额度预检：额度已尽（含配置错误撤销成 0 的额度）就不发起调用。
+
+        止损顶（charge_tokens）管的是「超顶那次调用已发生」；预检管的是「额度为零/
+        已用尽时连第一次调用都不许发生」——「额度撤销、任何调用即拒」由此才成立。
+        """
+        used = self._tokens.get(episode_id, 0)
+        if self.max_tokens is not None and used >= self.max_tokens:
+            return self._deny(
+                None, episode_id, f"预算硬顶：tokens 额度已尽（{used}/{self.max_tokens}），拒绝发起 LLM 调用"
+            )
+        return True, "tokens 额度预检通过"
+
     def charge_tokens(self, episode_id: str, tokens: int) -> tuple[bool, str]:
         """LLM 用量记账（网关调用后回报）。超顶即拒——止损顶：超顶那次调用已发生，剧集就地停。"""
         used = self._tokens.get(episode_id, 0) + tokens
@@ -297,6 +319,9 @@ class PolicyInterceptor:
         return self.require_approval(interface_ref)
 
     def grant_approval(self, action: str) -> tuple[bool, str]:
+        if self._approvals_broken:
+            # 配置损坏时授予必须失败——授出一个 require 永远拒绝的 token 是控制面撒谎
+            return False, "approvals 配置非法——授予拒绝（fail-closed），修好 policy 再来"
         if action not in self.approvals:
             return False, f"动作「{action}」不在审批清单中"
         self._granted.add(action)
@@ -351,7 +376,11 @@ class PolicyInterceptor:
             "kill_reason": self.kill_reason or None,
             "max_tool_calls": self.max_tool_calls,
             "max_tokens": self.max_tokens,
-            "approvals": {a: ("granted" if a in self._granted else "pending") for a in self.approvals},
+            "approvals": (
+                "config_error/deny_all"  # 控制面不撒谎：配置损坏时明示一律拒绝，而非展示永不生效的 granted
+                if self._approvals_broken
+                else {a: ("granted" if a in self._granted else "pending") for a in self.approvals}
+            ),
             "redact": self.redact_categories,
             "audit_tail": self.audit[-AUDIT_TAIL:],
         }
