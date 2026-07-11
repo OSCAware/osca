@@ -262,7 +262,7 @@ footer { min-height: 240px; padding: 55px max(24px, calc((100vw - 1320px) / 2));
       </div>
     </div>
 
-    <div class="flow-visual" role="img" aria-label="A diagram: human feedback enters the workflow and changes its downstream path">
+    <div class="flow-visual" id="flow-diagram" role="img" aria-label="A diagram: human feedback enters the workflow and changes its downstream path">
       <div class="flow-label flow-label-a">AI WORKFLOW</div>
       <div class="flow-line flow-line-a"><i></i><i></i><i></i></div>
       <div class="feedback-chip"><span>HUMAN</span><strong class="lx-en" lang="en">Feedback</strong><strong class="lx-zh" lang="zh">反馈</strong></div>
@@ -319,7 +319,7 @@ footer { min-height: 240px; padding: 55px max(24px, calc((100vw - 1320px) / 2));
     </div>
 
     <p class="ledger-intro" data-reveal><span class="lx-en" lang="en">What a ledger entry looks like · a real entry from the public ops-diagnosis sample pack</span><span class="lx-zh" lang="zh">账本条目长这样 · 运维诊断公开样例包中的一条真实条目</span></p>
-    <article class="ledger-card" data-reveal aria-label="Contribution ledger entry example J-0417">
+    <article class="ledger-card" id="ledger-card" data-reveal aria-label="Contribution ledger entry example J-0417">
       <div class="ledger-head">
         <span class="ledger-lab"><span class="lx-en" lang="en">Contribution ledger · entry (JUDGMENT)</span><span class="lx-zh" lang="zh">贡献账本 · 条目（JUDGMENT）</span></span>
         <span class="ledger-id">J-0417</span>
@@ -329,7 +329,7 @@ footer { min-height: 240px; padding: 55px max(24px, calc((100vw - 1320px) / 2));
         <div><div class="k"><span class="lx-en" lang="en">AUTHOR</span><span class="lx-zh" lang="zh">作者</span></div><div class="v"><span class="lx-en" lang="en">Eng. Wang</span><span class="lx-zh" lang="zh">王工</span></div></div>
         <div><div class="k"><span class="lx-en" lang="en">CONFIRMED</span><span class="lx-zh" lang="zh">被确认</span></div><div class="v">× 6</div></div>
         <div><div class="k"><span class="lx-en" lang="en">OVERRULED</span><span class="lx-zh" lang="zh">被推翻</span></div><div class="v">0</div></div>
-        <div><div class="k"><span class="lx-en" lang="en">TRUST</span><span class="lx-zh" lang="zh">信任</span></div><div class="v hot">high</div></div>
+        <div><div class="k"><span class="lx-en" lang="en">TRUST</span><span class="lx-zh" lang="zh">信任</span></div><div class="v hot"><span class="lx-en" lang="en">high</span><span class="lx-zh" lang="zh">高</span></div></div>
       </div>
       <p class="ledger-foot"><span class="lx-en" lang="en">From the public sample pack </span><span class="lx-zh" lang="zh">出自公开样例包 </span><a href="https://github.com/OSCAware/osca/blob/main/examples/oper-diagnosis.osca/judgments/J-0417.yaml" target="_blank" rel="noopener">examples/oper-diagnosis.osca/judgments/J-0417.yaml</a></p>
     </article>
@@ -344,7 +344,7 @@ footer { min-height: 240px; padding: 55px max(24px, calc((100vw - 1320px) / 2));
       <article class="example-step" data-reveal>
         <span class="step-number">01</span>
         <div class="step-node" aria-hidden="true"></div>
-        <h3><span class="lx-en" lang="en">The system does the routine</span><span class="lx-zh" lang="zh">系统照常规办</span></h3>
+        <h3><span class="lx-en" lang="en">The system follows its routine</span><span class="lx-zh" lang="zh">系统照常规办</span></h3>
         <p><span class="lx-en" lang="en">This month 10 new SKUs arrive; the system routes them into near-expiry discounting and past-expiry write-off, and confirms with the store manager.</span><span class="lx-zh" lang="zh">这个月新上 10 个品，系统把它们排进临期打折和过期报废流程，并向店长确认。</span></p>
       </article>
       <article class="example-step" data-reveal>
@@ -380,7 +380,7 @@ footer { min-height: 240px; padding: 55px max(24px, calc((100vw - 1320px) / 2));
       <article data-reveal><span>01</span><h3><span class="lx-en" lang="en">Runs as-is</span><span class="lx-zh" lang="zh">放进来就能跑</span></h3><p><span class="lx-en" lang="en">One text file is a fully running AI agent.</span><span class="lx-zh" lang="zh">一份文本，就是一个正常运行的 AI Agent。</span></p></article>
       <article data-reveal><span>02</span><h3><span class="lx-en" lang="en">Composable</span><span class="lx-zh" lang="zh">能互相调用</span></h3><p><span class="lx-en" lang="en">Agents can call and combine with one another.</span><span class="lx-zh" lang="zh">Agent 之间可以互相调用、互相组合。</span></p></article>
       <article data-reveal><span>03</span><h3><span class="lx-en" lang="en">Works with people</span><span class="lx-zh" lang="zh">能与人协作</span></h3><p><span class="lx-en" lang="en">It asks when it should; the calls that are a human's stay a human's.</span><span class="lx-zh" lang="zh">该问人的时候问人；该人拍板的，永远人拍板。</span></p></article>
-      <article data-reveal><span>04</span><h3><span class="lx-en" lang="en">Evolves<sup>most important</sup></span><span class="lx-zh" lang="zh">能进化<sup>最重要</sup></span></h3><p><span class="lx-en" lang="en">It keeps adjusting itself from human feedback.</span><span class="lx-zh" lang="zh">根据人的反馈，不断调整自己。</span></p></article>
+      <article data-reveal><span>04</span><h3><span class="lx-en" lang="en">Evolves<sup>most important</sup></span><span class="lx-zh" lang="zh">能进化<sup>最重要</sup></span></h3><p><span class="lx-en" lang="en">It keeps adjusting itself in response to human feedback.</span><span class="lx-zh" lang="zh">根据人的反馈，不断调整自己。</span></p></article>
     </div>
     <p class="evolve-note" data-reveal><span class="lx-en" lang="en"><b>“Evolve” is a neutral word:</b> no promise it gets smarter or better — only that it stays a better fit, because it keeps aligning with your environment as it is now.</span><span class="lx-zh" lang="zh"><b>进化是中性词：</b>不承诺越用越好，只承诺越用越顺手——因为它始终在贴合当下的环境。</span></p>
   </section>
@@ -389,7 +389,7 @@ footer { min-height: 240px; padding: 55px max(24px, calc((100vw - 1320px) / 2));
     <div class="section-heading" data-reveal><p class="section-index">05 / FOR WHOM</p><h2><span class="lx-en" lang="en">Built for people who actually know the work</span><span class="lx-zh" lang="zh">为真正懂工作的人而做</span></h2></div>
     <div class="people-grid">
       <article data-reveal><span>01</span><h3><span class="lx-en" lang="en">Frontline experts</span><span class="lx-zh" lang="zh">一线专家</span></h3><p><span class="lx-en" lang="en">Learn nothing new: work as usual, edit as usual. Your experience gets recorded — under your name.</span><span class="lx-zh" lang="zh">不用学任何新东西：照常干活、照常改稿。你的经验被记下、记你的名。</span></p><i aria-hidden="true">↗</i></article>
-      <article data-reveal><span>02</span><h3><span class="lx-en" lang="en">Service providers &amp; delivery teams</span><span class="lx-zh" lang="zh">服务商与交付团队</span></h3><p><span class="lx-en" lang="en">A renewable delivery model: the client's ledger grows thicker, the service goes deeper.</span><span class="lx-zh" lang="zh">一套能续费的交付模式：客户的账本越用越厚，服务越做越深。</span></p><i aria-hidden="true">↗</i></article>
+      <article data-reveal><span>02</span><h3><span class="lx-en" lang="en">Service providers &amp; delivery teams</span><span class="lx-zh" lang="zh">服务商与交付团队</span></h3><p><span class="lx-en" lang="en">A recurring-revenue delivery model: the client's ledger grows thicker, the service goes deeper.</span><span class="lx-zh" lang="zh">一套能续费的交付模式：客户的账本越用越厚，服务越做越深。</span></p><i aria-hidden="true">↗</i></article>
       <article data-reveal><span>03</span><h3><span class="lx-en" lang="en">Organizations &amp; managers</span><span class="lx-zh" lang="zh">组织与管理者</span></h3><p><span class="lx-en" lang="en">Controllable, auditable, real; swap the model without starting over.</span><span class="lx-zh" lang="zh">可控、可审计、真落地；换模型不报废。</span></p><i aria-hidden="true">↗</i></article>
     </div>
   </section>
@@ -401,7 +401,7 @@ footer { min-height: 240px; padding: 55px max(24px, calc((100vw - 1320px) / 2));
     <div class="governance-list">
       <article data-reveal><span>01</span><h3><span class="lx-en" lang="en">Every conclusion is traceable</span><span class="lx-zh" lang="zh">每条结论可追溯</span></h3><p><span class="lx-en" lang="en">Back to who decided it, on what basis, and from which case.</span><span class="lx-zh" lang="zh">追到谁定的、凭什么、当时的案例。</span></p><b aria-hidden="true">●</b></article>
       <article data-reveal><span>02</span><h3><span class="lx-en" lang="en">The ledger is plain text</span><span class="lx-zh" lang="zh">账本是纯文本</span></h3><p><span class="lx-en" lang="en">Printable, signable, yours to keep.</span><span class="lx-zh" lang="zh">可打印、可签名、归你所有。</span></p><b aria-hidden="true">●</b></article>
-      <article data-reveal><span>03</span><h3><span class="lx-en" lang="en">Permissions enforced by the system</span><span class="lx-zh" lang="zh">权限由系统硬管</span></h3><p><span class="lx-en" lang="en">Not by the AI's goodwill; irreversible actions always need a human.</span><span class="lx-zh" lang="zh">不靠 AI 自觉；不可逆操作永远人拍板。</span></p><b aria-hidden="true">●</b></article>
+      <article data-reveal><span>03</span><h3><span class="lx-en" lang="en">Permissions enforced by the system</span><span class="lx-zh" lang="zh">权限由系统硬管</span></h3><p><span class="lx-en" lang="en">Not on the AI policing itself; irreversible actions always need a human.</span><span class="lx-zh" lang="zh">不靠 AI 自觉；不可逆操作永远人拍板。</span></p><b aria-hidden="true">●</b></article>
       <article data-reveal><span>04</span><h3><span class="lx-en" lang="en">Model swaps come with a checkup</span><span class="lx-zh" lang="zh">换模型有体检单</span></h3><p><span class="lx-en" lang="en">Re-verify the ledger entry by entry, spelling out what still holds and what needs patching.</span><span class="lx-zh" lang="zh">逐条重验账本，明明白白列出哪些还灵、哪些要补。</span></p><b aria-hidden="true">●</b></article>
     </div>
   </section>
@@ -457,7 +457,10 @@ footer { min-height: 240px; padding: 55px max(24px, calc((100vw - 1320px) / 2));
     langNext: { en: "中文", zh: "EN" },
     langAria: { en: "Switch to Chinese / 切换到中文", zh: "Switch to English / 切换到英文" },
     menuOpen: { en: "Open menu", zh: "打开菜单" },
-    menuClose: { en: "Close menu", zh: "关闭菜单" }
+    menuClose: { en: "Close menu", zh: "关闭菜单" },
+    navAria: { en: "Primary", zh: "主导航" },
+    flowAria: { en: "A diagram: human feedback enters the workflow and changes its downstream path", zh: "示意图：人的反馈进入工作流并改变其下游路径" },
+    ledgerAria: { en: "Contribution ledger entry example J-0417", zh: "贡献账本条目示例 J-0417" }
   };
   var themeOrder = { auto: "light", light: "dark", dark: "auto" };
 
@@ -492,6 +495,17 @@ footer { min-height: 240px; padding: 55px max(24px, calc((100vw - 1320px) / 2));
     if (langLabel) langLabel.textContent = I18N.langNext[lang];
     if (langToggle) langToggle.setAttribute("aria-label", I18N.langAria[lang]);
     if (menuBtn) menuBtn.setAttribute("aria-label", (nav && nav.classList.contains("is-open") ? I18N.menuClose : I18N.menuOpen)[lang]);
+    if (nav) nav.setAttribute("aria-label", I18N.navAria[lang]);
+    var flow = document.getElementById("flow-diagram");
+    if (flow) flow.setAttribute("aria-label", I18N.flowAria[lang]);
+    var ledger = document.getElementById("ledger-card");
+    if (ledger) ledger.setAttribute("aria-label", I18N.ledgerAria[lang]);
+    var setMeta = function (sel, v) { var m = document.querySelector(sel); if (m) m.setAttribute("content", v); };
+    setMeta('meta[property="og:title"]', I18N.title[lang]);
+    setMeta('meta[name="twitter:title"]', I18N.title[lang]);
+    setMeta('meta[property="og:description"]', I18N.desc[lang]);
+    setMeta('meta[name="twitter:description"]', I18N.desc[lang]);
+    setMeta('meta[property="og:locale"]', lang === "zh" ? "zh_CN" : "en_US");
     renderTheme();
   }
 
