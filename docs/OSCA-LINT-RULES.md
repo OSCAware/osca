@@ -46,7 +46,7 @@
 
 | 规则 | 级别 | 内容 | 依据 |
 |---|---|---|---|
-| OSCA040 | 错误 | 各类文件必填字段：object（name/kind/version/definition，负样例必带 why；kind=objective 必填 optimize: maximize\|minimize）；connector（name/kind/interfaces/permissions.write）；aware（name/enabled 布尔/then/budget/≥1 触发原语）；judgment（status/signature 三件/body/meta 计数）；case（captured_at/capture_source/input）；policy（policy_version） | SPEC §4–§10 + v0.4 §8 |
+| OSCA040 | 错误 | 各类文件必填字段：object（name/kind/version/definition，负样例必带 why；kind=objective 必填 optimize: maximize\|minimize）；connector（name/kind/interfaces/permissions.write）；aware（name/enabled 布尔/then/budget/≥1 触发原语）；judgment（status/signature 三件/body/meta 计数）；case（captured_at/capture_source/input）；policy（policy_version）。**嵌套形状约束**：运行时按键取值的字段（examples/permissions/budget/gate/triggers/meta/replay/policy 各段/pipeline 及其步骤项）必须是声明的 mapping/list 形状——lint 是总函数，任意 YAML 形状只报错、不崩溃（规则自带类型防御 + run_all 兜底） | SPEC §4–§10 + v0.4 §8 |
 
 ## 触发原语与闸门
 

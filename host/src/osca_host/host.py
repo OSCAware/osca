@@ -251,7 +251,8 @@ class Host:
                     log.warning(f"[{loaded.package_id}] 账本刷新失败（lint {len(errors)} 错误：{head}）——保留旧快照")
                     return False
                 rebuild_index(loaded.root, fresh)
-                stats = ledger_stats(fresh)
+                # kill switch 在保护区内纯计算——评估异常也走下面的兜底，旧 pack/旧 policy 原样
+                tripped, reason = policy.evaluate_kill_switch(ledger_stats(fresh))
         except LedgerLockBusy:
             log.warning(f"[{loaded.package_id}] 账本写锁被占用（写入者事务进行中）——保留旧快照")
             return False
@@ -260,8 +261,9 @@ class Host:
             # 共享 watcher 的循环任务，修好磁盘也不会自然再试。留完整异常，拒绝本次唤醒。
             log.exception(f"[{loaded.package_id}] 账本刷新异常——保留旧快照，本次唤醒拒绝")
             return False
-        loaded.pack = fresh  # 原子替换：校验/索引/统计全部成功之后才动快照
-        policy.refresh_kill_switch(stats)
+        # 发布：两个纯赋值一起生效——pack 与 policy 同进退，不存在半发布状态
+        loaded.pack = fresh
+        policy.publish_kill_switch(tripped, reason)
         return True
 
     # ── 运行时内部取数（precondition / watch 轮询，经 Connector 代理 + Policy） ──

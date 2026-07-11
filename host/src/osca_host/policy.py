@@ -106,9 +106,17 @@ class PolicyInterceptor:
                 return True, reason
         return False, ""
 
+    def evaluate_kill_switch(self, ledger_stats: dict[str, int]) -> tuple[bool, str]:
+        """按现账本纯计算 kill switch 状态，不改自身（仅审计留痕）——在刷新事务的保护区内调用。"""
+        return self._eval_kill_switch(self._policy, ledger_stats)
+
+    def publish_kill_switch(self, tripped: bool, reason: str) -> None:
+        """纯赋值发布——与 loaded.pack 的替换配对执行，pack 与 policy 同进退、不存在半发布。"""
+        self.kill_tripped, self.kill_reason = tripped, reason
+
     def refresh_kill_switch(self, ledger_stats: dict[str, int]) -> None:
         """账本计数变了（M3 采集器落账）Host 不重启也要看见——每次唤醒前用现账本重算。"""
-        self.kill_tripped, self.kill_reason = self._eval_kill_switch(self._policy, ledger_stats)
+        self.publish_kill_switch(*self.evaluate_kill_switch(ledger_stats))
 
     # ── 包停触达认知平面（三级停之三：撤销后在途剧集步间即停、调用全拒） ──
 
@@ -248,7 +256,9 @@ def ledger_stats(pack) -> dict[str, int]:
     for f in pack.typed_files("judgments"):
         if f.mapping.get("status") != "active":
             continue
-        meta = f.mapping.get("meta") or {}
-        confirmed += meta.get("confirmed") or 0
-        overruled += meta.get("overruled") or 0
+        meta = f.mapping.get("meta")
+        if not isinstance(meta, dict):
+            continue  # 形状缺陷由 lint 挡；统计自身对任意形状保持总函数
+        confirmed += meta.get("confirmed") if isinstance(meta.get("confirmed"), int) else 0
+        overruled += meta.get("overruled") if isinstance(meta.get("overruled"), int) else 0
     return {"confirmed": confirmed, "overruled": overruled}

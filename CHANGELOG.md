@@ -85,5 +85,17 @@
 - oscapipe 签名表形状校验补严：先取原值再验 `isinstance(list)`——
   `judgments: {}/""/0/false/null` 等 falsy 变体不再被吞成合法空表
 
+## [Review 复核 · 五轮] - 2026-07-11
+- lint 总函数化：包解析边界面对不可信 YAML 只报错、绝不崩溃——OSCA040 补齐全部
+  嵌套 mapping/list 形状约束（examples/permissions/budget/gate/triggers/meta/replay/
+  policy 各段/pipeline 步骤项），各规则自带类型防御（OSCA021/022/023/024/031/032/033
+  不再假设别的规则先执行），`run_all` 兜底把规则异常转 ERROR finding；
+  新增 YAML 类型变异矩阵测试（23 字段 × 5 形状断言不抛异常）
+- kill switch 评估/发布分离：评估（纯计算）在刷新事务保护区内、发布（纯赋值）与
+  `loaded.pack` 替换配对执行——pack 与 policy 同进退，评估异常保留旧快照旧状态，
+  不存在半发布
+- episode 模块文档同步四轮架构边界：装配签名表源自 loaded.pack，磁盘缓存只服务
+  检索器与人工查看
+
 ## [Unreleased]
 - Phase 0 内容线：首个真实场景 ≥20 条账本条目，反哺 SPEC

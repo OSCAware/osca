@@ -281,6 +281,66 @@ def test_osca040_judgment_signature_incomplete(make_pkg, base):
     assert "OSCA040" in rules_hit(lint_package(make_pkg(base)))
 
 
+# ── 总函数纪律：任意 YAML 形状只报错、不崩溃 ──
+
+SHAPE_MUTATIONS = [
+    ("osca.yaml", "requires"),
+    ("policy.yaml", "permissions"),
+    ("policy.yaml", "budgets"),
+    ("policy.yaml", "approvals"),
+    ("policy.yaml", "egress"),
+    ("policy.yaml", "data"),
+    ("policy.yaml", "kill_switch"),
+    ("structure.yaml", "pipeline"),
+    ("objects/OBJ-001-报告.yaml", "examples"),
+    ("objects/OBJ-001-报告.yaml", "kind"),
+    ("connectors/CON-001-数据源.yaml", "interfaces"),
+    ("connectors/CON-001-数据源.yaml", "permissions"),
+    ("connectors/CON-001-数据源.yaml", "binding_ref"),
+    ("aware/AW-001-定时.yaml", "triggers"),
+    ("aware/AW-001-定时.yaml", "gate"),
+    ("aware/AW-001-定时.yaml", "budget"),
+    ("judgments/J-0001.yaml", "meta"),
+    ("judgments/J-0001.yaml", "signature"),
+    ("judgments/J-0001.yaml", "evidence"),
+    ("judgments/J-0001.yaml", "replay"),
+    ("judgments/J-0001.yaml", "supersedes"),
+    ("judgments/J-0001.yaml", "status"),
+    ("cases/C-0001.yaml", "input"),
+]
+
+
+def test_lint_total_over_arbitrary_shapes(make_pkg, base):
+    """lint 是总函数（YAML 类型变异矩阵）：任意字段形状只产出 findings，绝不抛异常——
+    包解析边界面对不可信 YAML 不许崩，Host 首次 load 的控制请求也就不会断。"""
+    import copy
+
+    for relpath, fieldname in SHAPE_MUTATIONS:
+        for bad in ([1, 2], {"意外": 1}, "文本", 42, True):
+            mutated = copy.deepcopy(base)
+            mutated[relpath][fieldname] = bad
+            lint_package(make_pkg(mutated))  # 不抛异常即通过（多数形状同时应报错，见下条）
+
+
+def test_runtime_critical_shape_errors_reported(make_pkg, base):
+    """运行时按键取值的字段，形状错误必须在 lint 就挡下——不能等剧集线程里炸。"""
+    import copy
+
+    critical = [
+        ("judgments/J-0001.yaml", "meta"),
+        ("objects/OBJ-001-报告.yaml", "examples"),
+        ("connectors/CON-001-数据源.yaml", "permissions"),
+        ("aware/AW-001-定时.yaml", "budget"),
+        ("policy.yaml", "budgets"),
+        ("structure.yaml", "pipeline"),
+    ]
+    for relpath, fieldname in critical:
+        mutated = copy.deepcopy(base)
+        mutated[relpath][fieldname] = ["列表不是这里该有的形状"]
+        result = lint_package(make_pkg(mutated))
+        assert not result.ok, f"{relpath} 的 {fieldname}=list 应报 ERROR"
+
+
 # ── 安全铁律 ──
 
 

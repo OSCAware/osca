@@ -319,6 +319,28 @@ async def test_refresh_exception_refuses_wakeup_and_callback_survives(running_ho
     assert len((await _send({"cmd": "episodes"}, host))["episodes"]) == 1
 
 
+async def test_policy_publish_inside_refresh_transaction(running_host, sample_pack, deploy, monkeypatch):
+    """pack 与 policy 同进退：kill switch 评估在保护区内纯计算，评估异常 → 旧快照原样保留。"""
+    from osca_host.policy import PolicyInterceptor
+
+    host = running_host
+    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    pid = "demo-group-oper-diagnosis"
+    old_pack = host.registry.packages[pid].pack
+
+    def boom(self, stats):
+        raise RuntimeError("评估失败（测试注入）")
+
+    monkeypatch.setattr(PolicyInterceptor, "evaluate_kill_switch", boom)
+    await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    assert (await _send({"cmd": "episodes"}, host))["episodes"] == []  # 唤醒拒绝
+    assert host.registry.packages[pid].pack is old_pack  # 新 pack 未发布——不存在半发布状态
+
+    monkeypatch.undo()
+    await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    assert len((await _send({"cmd": "episodes"}, host))["episodes"]) == 1
+
+
 async def test_enable_failure_rolls_back_and_stays_retryable(running_host, sample_pack, deploy, monkeypatch):
     """enable 全部订阅成功才置位：半路失败即补偿回滚，不留「显示启用、实际半布防」，且可重试修复。"""
     host = running_host
