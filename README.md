@@ -67,11 +67,11 @@ Markdown + YAML — printable, signable, deliverable.
 
 ```
 osca/
-├── docs/OSCA-SPEC-v0.3.md         # the specification (CC BY 4.0); v0.2 kept for history
+├── docs/OSCA-SPEC-v0.3.md         # the specification (CC BY 4.0); v0.4 draft alongside, v0.2 kept for history
 ├── docs/OSCA-LINT-RULES.md        # lint rule catalogue (ledger discipline, machine-enforced)
 ├── examples/oper-diagnosis.osca/  # a full de-identified sample pack (with supersedes chains and spoken-language cases)
 ├── cli/                           # osca lint / pack / load (all three working)
-├── host/                          # runtime host reference implementation (in progress: loader/registry done, triggers next)
+├── host/                          # runtime host reference implementation (in progress: loader/triggers/gates done, episodes next)
 ├── site/                          # oscaware.com single-page source
 ├── CONTRIBUTING.md                # how to take part, pre-1.0
 └── CHANGELOG.md
@@ -80,7 +80,7 @@ osca/
 ## Status & roadmap
 
 - Now: **SPEC v0.3** + a full sample pack + the CLI trio (`lint / pack / load`).
-  The sample pack passes all 21 lint rules; deliverables pack reproducibly and verify integrity.
+  The sample pack passes all 22 lint rules; deliverables pack reproducibly and verify integrity.
 - In progress: the runtime host (reference implementation) — loading, triggers, gates, episode assembly, policy enforcement.
 - The bar for 1.0: spec + reference implementation + one replayable de-identified sample ledger — mechanism complete, verifiable on the spot.
 

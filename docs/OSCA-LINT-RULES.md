@@ -1,4 +1,4 @@
-# osca lint 规则清单 v0.2
+# osca lint 规则清单 v0.3
 
 > 本文档以 CC BY 4.0 开放。lint 是账本纪律的机器化：每条规则注明依据（SPEC 指 v0.3 章节）。
 > 错误（ERROR）挡住通过；警告（WARN）提示但不挡。实现：`cli/src/osca_cli/rules.py`，与本清单一一对应。
@@ -48,6 +48,12 @@
 |---|---|---|---|
 | OSCA040 | 错误 | 各类文件必填字段：object（name/kind/version/definition，负样例必带 why）；connector（name/kind/interfaces/permissions.write）；aware（name/enabled 布尔/then/budget/≥1 触发原语）；judgment（status/signature 三件/body/meta 计数）；case（captured_at/capture_source/input）；policy（policy_version） | SPEC §4–§10 |
 
+## 触发原语与闸门
+
+| 规则 | 级别 | 内容 | 依据 |
+|---|---|---|---|
+| OSCA041 | 错误 | 触发原语与闸门的受限语法：schedule 结构化字段 {every, day, time[, tz]}（自由文本废止）；watch 必有 uses + every（时长语法 `<整数><s\|m\|h\|d>`）；event 必有 source；各 kind 允许字段集外的键报错；gate 仅 combine/precondition/debounce/on_fail，combine=all/sequence 要求 ≥2 条触发原语（编译期矛盾）。解析器 `osca_cli.triggers` 与运行框架 Host 共用——lint 过 ＝ Host 编译期能布防 | SPEC v0.4 草案 §5 |
+
 ## 安全铁律
 
 | 规则 | 级别 | 内容 | 依据 |
@@ -64,5 +70,6 @@
 
 ## 变更记录
 
+- **v0.3**（2026-07-11）：新增 OSCA041——触发原语与闸门受限语法（SPEC v0.4 草案 §5），共 22 条规则。
 - **v0.2**（2026-07-11）：OSCA050 按 SPEC v0.3 §13 精确化——扫描范围扩到全部文本文件；区分连接串（绝对禁止）与文档链接（https 白名单放行、http 一律禁止）。依据栏改指 SPEC v0.3 章节。
 - **v0.1**（2026-07-11）：首版 21 条规则。

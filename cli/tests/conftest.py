@@ -55,7 +55,7 @@ def minimal_package() -> dict[str, object]:
             "aware_id": "AW-001",
             "name": "定时",
             "enabled": True,
-            "triggers": [{"id": "T1", "kind": "schedule", "schedule": "每月9日 09:00"}],
+            "triggers": [{"id": "T1", "kind": "schedule", "schedule": {"every": "month", "day": 9, "time": "09:00"}}],
             "then": "STR-001",
             "budget": {"max_steps": 10, "max_minutes": 5},
         },

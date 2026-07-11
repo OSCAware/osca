@@ -263,3 +263,27 @@ def test_osca050_connection_string(make_pkg, base):
 def test_osca050_private_key(make_pkg, base):
     base["cases/C-0001.yaml"]["input"]["附件"] = "-----BEGIN RSA PRIVATE KEY-----"
     assert "OSCA050" in rules_hit(lint_package(make_pkg(base)))
+
+
+# ── 触发原语与闸门受限语法（SPEC v0.4 草案 §5） ──
+
+
+def test_osca041_free_text_schedule(make_pkg, base):
+    base["aware/AW-001-定时.yaml"]["triggers"] = [{"id": "T1", "kind": "schedule", "schedule": "每月9日 09:00"}]
+    result = lint_package(make_pkg(base))
+    assert "OSCA041" in rules_hit(result)
+    assert any("自由文本已废止" in f.message for f in result.findings)
+
+
+def test_osca041_gate_contradiction(make_pkg, base):
+    base["aware/AW-001-定时.yaml"]["gate"] = {"combine": "sequence"}
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA041" and "矛盾" in f.message for f in result.findings)
+
+
+def test_osca041_watch_duration(make_pkg, base):
+    base["aware/AW-001-定时.yaml"]["triggers"] = [
+        {"id": "T2", "kind": "watch", "uses": "CON-001.取数", "every": "一天"}
+    ]
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA041" and "every=一天" in f.message for f in result.findings)

@@ -6,7 +6,8 @@ enabled: true
 triggers:
   - id: T1
     kind: schedule
-    schedule: "每月9日 09:00"          # 财务关账次日
+    schedule: {every: month, day: 9, time: "09:00"}   # 每月9日 09:00,财务关账次日
+    note: 财务关账次日;day 超出当月天数时取当月最后一天(SPEC v0.4 §5)
   - id: T2
     kind: watch
     uses: CON-001.拉取费用明细

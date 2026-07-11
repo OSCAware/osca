@@ -40,6 +40,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_unload = sub.add_parser("unload", help="包停：注销全部 watcher 并移除包")
     p_unload.add_argument("package_id")
 
+    p_disable = sub.add_parser("disable", help="触发器停：撤防单个 Aware 的全部触发原语（三级停之二）")
+    p_disable.add_argument("package_id")
+    p_disable.add_argument("aware_id")
+
+    p_enable = sub.add_parser("enable", help="触发器启：重新布防单个 Aware")
+    p_enable.add_argument("package_id")
+    p_enable.add_argument("aware_id")
+
+    p_fire = sub.add_parser("fire", help="人工发射一个 event 触发原语（操作者控制台）")
+    p_fire.add_argument("package_id")
+    p_fire.add_argument("trigger_id", help="全局触发 ID，如 AW-001/T3")
+
     sub.add_parser("stop", help="关停 Host（等价于全体包停后退出）")
 
     return parser
@@ -76,6 +88,10 @@ def main(argv: list[str] | None = None) -> int:
         return _client({"cmd": "load", "path": args.package, "bindings": args.bindings, "dest": args.dest}, args.socket)
     if args.command == "unload":
         return _client({"cmd": "unload", "package_id": args.package_id}, args.socket)
+    if args.command in ("enable", "disable"):
+        return _client({"cmd": args.command, "package_id": args.package_id, "aware_id": args.aware_id}, args.socket)
+    if args.command == "fire":
+        return _client({"cmd": "fire", "package_id": args.package_id, "trigger_id": args.trigger_id}, args.socket)
     if args.command == "stop":
         return _client({"cmd": "stop"}, args.socket)
 

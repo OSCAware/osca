@@ -8,14 +8,15 @@ OSCA 运行框架 Host 参考实现——**确定性常驻进程，无 LLM**。
 | 组件（架构 §4） | 状态 |
 |---|---|
 | 1. Loader + Linter | ✅ 复用 cli 装载核心（完整性 / lint / binding 比对 / 索引重建）+ 运行时结构解析 |
-| 2. 触发表 | ⬜ W2 — 槽位已登记（`declared`），定时器 / 轮询器待编译布防 |
-| 3. 闸门 gate | ⬜ W2 — gate 声明已解析保留，编译期矛盾检查待做 |
-| 4. 剧集装配器 | ⬜ W3 |
+| 2. 触发表 | ✅ 定时器 / 轮询器编译布防，哈希去重共享（引用计数）；event 由控制通道人工发射。轮询的 emit_when 求值待 W4 Connector 代理，本周只计 tick 不发射 |
+| 3. 闸门 gate | ✅ combine（any/all/sequence）+ debounce + enabled，语义见 SPEC v0.4 草案 §3；precondition 求值待 W4，暂记录声明、默认放行。编译期矛盾检查在 lint（OSCA041）与装载时共用 `osca_cli.triggers` |
+| 4. 剧集装配器 | ⬜ W3 — 过闸唤醒暂为计数 + 日志 |
 | 5. Policy 拦截器 | ⬜ W4 |
 | 6. Connector 代理 | ⬜ W4 |
 | 7. 对账器 settle | ⬜ W5 |
 
-已可演示：Host 起停、包装载 / 注销、**三级停之「包停」**（注销 = 释放全部 watcher 槽位）。
+已可演示：Host 起停、包装载 / 注销、定时布防（status 可见 next_fire）、人工发射 event 穿透闸门唤醒、
+三级停之**包停**（unload）与**触发器停**（disable 单 Aware，撤防全部 watcher）。
 
 ## 用法
 
@@ -30,6 +31,11 @@ uv run osca-host status
 uv run osca-host load ../examples/oper-diagnosis.osca
 uv run osca-host unload demo-group-oper-diagnosis
 uv run osca-host stop
+
+# 三级停之「触发器停」＋ 操作者人工触发（对应样例 T3）
+uv run osca-host disable demo-group-oper-diagnosis AW-001
+uv run osca-host enable demo-group-oper-diagnosis AW-001
+uv run osca-host fire demo-group-oper-diagnosis AW-001/T3
 ```
 
 控制通道是本机 unix socket（默认 `~/.osca/host.sock`，`--socket` 可改），

@@ -19,6 +19,7 @@ from osca_cli.package import (
     YamlFile,
     referenced_ids,
 )
+from osca_cli.triggers import validate_gate, validate_trigger
 
 Rule = Callable[[OscaPackage], list[Finding]]
 RULES: list[Rule] = []
@@ -426,6 +427,23 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
     if policy and not policy.parse_error and not policy.mapping.get("policy_version"):
         findings.append(_err("OSCA040", "policy.yaml", "缺少必填字段 policy_version"))
 
+    return findings
+
+
+@rule
+def osca041_trigger_gate_syntax(pkg: OscaPackage) -> list[Finding]:
+    """OSCA041 触发原语与闸门的受限语法（SPEC v0.4 草案 §5）。
+    解析器与运行框架 Host 共用（osca_cli.triggers）——lint 过 = Host 编译期能布防。"""
+    findings = []
+    for f in pkg.typed_files("aware"):
+        if f.parse_error:
+            continue
+        triggers = [t for t in (f.mapping.get("triggers") or []) if isinstance(t, dict)]
+        for t in triggers:
+            findings.extend(_err("OSCA041", f.relpath, msg) for msg in validate_trigger(t))
+        gate = f.mapping.get("gate")
+        if isinstance(gate, dict):
+            findings.extend(_err("OSCA041", f.relpath, msg) for msg in validate_gate(gate, len(triggers)))
     return findings
 
 
