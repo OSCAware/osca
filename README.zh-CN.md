@@ -10,9 +10,9 @@
 OSCA 是一套用纯文本定义 AI 认知工作流程的开放规范——控制平面确定性运行，在关键决策点保留人类判断，并随人的反馈不断进化；反馈被记入一本可署名的**贡献账本**。
 
 📘 **白皮书：** [English](docs/OSCA-WHITEPAPER-v1.1.en.md) ·
-[简体中文](docs/OSCA-WHITEPAPER-v1.1.zh-CN.md) · [日本語](docs/OSCA-WHITEPAPER-v1.1.ja.md)——覆盖
-设计动机、O/S/C/A/J、Runtime、反馈飞轮，以及如何开始实现自己的 OSCA Agent。白皮书 v1.0
-不等于软件 1.0 已发布。
+[简体中文](docs/OSCA-WHITEPAPER-v1.1.zh-CN.md) · [日本語](docs/OSCA-WHITEPAPER-v1.1.ja.md) ·
+[中文 PDF 下载](docs/OSCA-WHITEPAPER-v1.1.zh-CN.pdf)——覆盖设计动机、O/S/C/A/J、Runtime、反馈飞轮，
+以及如何开始实现自己的 OSCA Agent。白皮书 v1.1 是文档版本，不等于软件 1.0 已发布。
 
 ## OSCA 与 Oscaware
 
@@ -78,6 +78,7 @@ osca/
 ├── docs/OSCA-WHITEPAPER-v1.1.en.md    # 开放规范白皮书：English
 ├── docs/OSCA-WHITEPAPER-v1.1.zh-CN.md # 开放规范白皮书：简体中文
 ├── docs/OSCA-WHITEPAPER-v1.1.ja.md    # 开放规范白皮书：日本語
+├── docs/OSCA-WHITEPAPER-v1.1.zh-CN.pdf # 中文白皮书 PDF 下载版
 ├── docs/OSCA-SPEC-v0.3.md        # 规范正文（CC BY 4.0）；v0.4 草案与历史版本 v0.2 同目录
 ├── docs/OSCA-LINT-RULES.md       # lint 规则清单（账本纪律的机器化）
 ├── examples/oper-diagnosis.osca/  # 完整合成演示包（含 supersedes 链与口述 case）
@@ -101,7 +102,7 @@ osca/
   其中一部分在后续独立批次再次适用、得到支持；月度慢场景单独报告、不得混池。公开样例与
   合成夹具不计数，其后再推进产品界面、Creator 与生产集成。
 - **软件 1.0 发布门槛**：完成上述真实内容证据、产品界面、Creator 与生产集成，并交付规范、
-  参考实现和一个可回放的受控真实样例账本；不要求公开客户原始账本。上面的“白皮书 v1.0”
+  参考实现和一个可回放的受控真实样例账本；不要求公开客户原始账本。上面的“白皮书 v1.1”
   只是文档版本。
 
 ## 参与
