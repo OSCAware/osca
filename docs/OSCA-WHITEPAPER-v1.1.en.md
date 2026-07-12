@@ -506,6 +506,12 @@ Public readers cannot inspect the whole first-party flywheel. “M3 implemented�
 
 Software 1.0 requires P0-A evidence, M4–M6, the specification, reference implementation, and a replayable controlled real sample ledger. Whitepaper 1.0 is only this document version; the real ledger remains subject to customer data rights and does not mean a published raw ledger.
 
+The maintainers are separately exploring an internal R-line design for preserving raw observations that the
+current system cannot assimilate, together with long-term guardrails and controlled shadow comparisons. It is
+not currently part of the OSCA SPEC, a public Profile, or an implemented capability. The residual ledger,
+four gauges, shadow comparison, and quarterly review must not be read as delivery commitments or existing
+evidence in this whitepaper.
+
 #### How implementation feeds the specification
 
 Implementation has changed the specification: Lint exposed invalid YAML, missing `binding_ref`, Object Kind, and SQL; external payload URI became a Binding-resolved logical pointer; free-text Schedule became structured; data Watch stopped sharing across packages; Kill counts Active Judgments only; health archives bind package Tree OID and treat 0/0 as Unavailable.
