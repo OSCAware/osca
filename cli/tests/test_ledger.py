@@ -113,3 +113,45 @@ def test_ledger_dirty_sees_ignored_and_inner_indexes(tmp_path):
     (tmp_path / "judgments" / "indexes").mkdir()
     (tmp_path / "judgments" / "indexes" / "x.yaml").write_text("x: 1", encoding="utf-8")
     assert ledger_dirty(tmp_path)  # 内层 indexes/ 不豁免——loader 读 judgments/**/*.yaml
+
+
+def test_nested_package_root_indexes_exempt(tmp_path):
+    """嵌套包：porcelain 路径带 repo 前缀（pkg/indexes/…）——归一化后包根缓存仍豁免。"""
+    from osca_cli.ledger import ledger_dirty
+
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "测试")
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "a.txt").write_text("1", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "1")
+    assert ledger_dirty(pkg) == []
+
+    (pkg / "indexes").mkdir()
+    (pkg / "indexes" / "cache.json").write_text("{}", encoding="utf-8")
+    assert ledger_dirty(pkg) == []  # 嵌套包的包根缓存不再被永久判脏
+
+    (pkg / "b.txt").write_text("2", encoding="utf-8")
+    assert ledger_dirty(pkg)  # 真脏照常可见
+
+
+def test_lock_shared_across_linked_worktrees(tmp_path):
+    """linked worktree 的同一个包必须拿到同一把锁——哈希仓库稳定身份 + repo 相对路径。"""
+    import subprocess
+
+    from osca_cli.ledger import _lock_path
+
+    main = tmp_path / "main"
+    main.mkdir()
+    _git(main, "init", "-q")
+    _git(main, "config", "user.email", "t@example.com")
+    _git(main, "config", "user.name", "测试")
+    (main / "a.txt").write_text("1", encoding="utf-8")
+    _git(main, "add", "-A")
+    _git(main, "commit", "-q", "-m", "1")
+    wt = tmp_path / "wt"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True, capture_output=True)
+
+    assert _lock_path(main) == _lock_path(wt)  # 两个 checkout，同一把锁

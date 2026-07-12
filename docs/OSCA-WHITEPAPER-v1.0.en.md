@@ -21,13 +21,13 @@ Oscaware is the reference tooling, Runtime, and first-party feedback-flywheel im
 
 ## OSCA in Ten Minutes
 
-#### One question
+### One question
 
 > **After work ends, how does an expert's decision become an asset that can execute next time and still be inspected and revoked?**
 
 Prompts, knowledge bases, conversation memory, code exceptions, and fine-tuning can all change Agent behavior. They rarely answer all of these questions together: who made the decision, from which real task, under what conditions, whether it is still valid, and what happens after a model change. OSCA gives those questions an explicit home: the Judgment Ledger.
 
-#### One example
+### One example
 
 A monthly operating-diagnosis Agent sees a 45% increase in travel expenses and adds it to the anomaly list. The expert knows that the month is an overhaul period, removes the paragraph, and adds:
 
@@ -37,7 +37,7 @@ A conventional workflow ends there. OSCA saves the real edit as a Case. AI disti
 
 The public operating-diagnosis pack contains synthetic products of this chain. Its people, data, Cases, and Judgments are format and behavior fixtures, not real-business P0 evidence. Lint can verify references; it cannot prove that evidence came from real work.
 
-#### One formula
+### One formula
 
 ```text
 OSCA Agent
@@ -50,7 +50,7 @@ OSCA Agent
 
 O/S/C/A define the stable work skeleton. J stores contextual decisions that change with the operating environment. A model supplies cognitive ability; it is not the whole pipeline.
 
-#### One run and one feedback loop
+### One run and one feedback loop
 
 ```mermaid
 flowchart LR
@@ -70,7 +70,7 @@ flowchart LR
 
 Three authority boundaries hold throughout: machines preserve source evidence, AI may only distill, and an authorized expert must Confirm a Candidate before it becomes a formal Judgment. Policy is enforced outside the model. Replay checks health; it never rewrites the ledger automatically.
 
-#### Current capability summary
+### Current capability summary
 
 | Layer | Status |
 |---|---|
@@ -83,7 +83,7 @@ Three authority boundaries hold throughout: machines preserve source evidence, A
 
 This is only a capability summary. Chapter 10 contains the dated stage snapshot and its evidence ceiling.
 
-#### Three reading paths
+### Three reading paths
 
 - **Decide whether OSCA is relevant (about 10 minutes):** this section, Chapters 1–2, 8, and 12.
 - **Define your first Agent (about 30 minutes):** Chapters 3–9, then run the public sample.
@@ -144,7 +144,7 @@ OSCA does not mandate a model, cloud, vector store, or Agent framework. It defin
 #### OSCA and Oscaware
 
 ```text
-OSCA       Open specification, package format, ledger discipline, runtime contracts
+OSCA      Open specification, package format, ledger discipline, runtime contracts
 Oscaware  Reference tooling, Runtime, and first-party feedback-flywheel implementation
 ```
 
@@ -289,7 +289,7 @@ An expert edit is not a Judgment. It first becomes preserved evidence; only dist
 4. **Meta:** author, batch, status, `confirmed`, `overruled`, and Trust.
 5. **Expiry / Replay:** what requires review and how to check behavior.
 
-Confirm is the expert act that admits a Candidate; it is not `confirmed +1`. A new Judgment enters with `confirmed: 0` and Provisional Trust. Only later real use retained by the responsible expert—or, in a future profile, supported through defined Outcome attribution—can increase the counter. The current first-party implementation updates `confirmed/overruled` only from expert Diff; Outcome Sweep records a Case but does not update counters. Reference thresholds for High and Review still require P0 calibration.
+Confirm is the expert act that admits a Candidate; it is not `confirmed +1`. A new Judgment enters with `confirmed: 0` and Provisional Trust. Only later real use retained by the responsible expert—or, in a future profile, supported through defined Outcome attribution—can increase the counter. The current first-party implementation updates `confirmed/overruled` only from expert Diff; Outcome Sweep records a Case but does not update counters. The reference discipline promotes Trust to High when confirmations reach a threshold without overruling, and moves a Judgment into Review when overruling accumulates to its threshold; both thresholds still require P0 calibration.
 
 #### Five ledger disciplines
 
@@ -332,9 +332,9 @@ Capture is deliberately unintelligent: one feedback event becomes one Case and o
 
 The private first-party `oscapipe` Distill currently processes only Pending Diff Cases containing both `agent_draft` and `expert_final`; it skips Outcome and spoken Cases. It groups by expert action and shared context, then may merge semantically similar clusters through Embedding. An LLM may draft Signature, Body, Expiry, Replay, and the confirmation question, but Evidence equals the Cases selected by deterministic clustering, and machines fill Meta and ID. A reference outside the cluster or to a missing Object invalidates the Candidate.
 
-Candidates remain outside the package. The private `oscapipe` CLI supports Confirm and Reject; the public `osca` CLI does not. Rewriting currently means editing and redistilling, not a separate Rewrite action. Confirm rechecks evidence, allocates a J-ID, updates Supersedes and Case state, runs Lint, and commits one Judgment per Commit. Reject reason and time should remain; structured Reject audit is still incomplete.
+Candidates remain outside the package. The private `oscapipe` CLI supports Confirm and Reject; the public `osca` CLI does not. Rewriting currently means editing and redistilling, not a separate Rewrite action. Confirm verifies under the lock that the evidence is still fresh, allocates a J-ID, updates Supersedes and Case state, runs Lint, and commits one Judgment per Commit. Reject reason and time should remain; structured Reject audit is still incomplete.
 
-In the synthetic operating example, `C-0091` removes an ordinary overhaul-period travel alert while `C-0094` keeps an above-peak exception. Together they illustrate how “normally suppress, unless above the peak” becomes Candidate `J-0417` through expert Confirm. They demonstrate asset relationships, not P0 evidence.
+In the synthetic operating-diagnosis example, `C-0091` removes an ordinary overhaul-period travel alert while `C-0094` keeps an above-peak exception. Together they illustrate how the Candidate “normally suppress, unless above the peak” becomes Judgment `J-0417` through expert Confirm. They demonstrate asset relationships, not P0 evidence.
 
 #### Index and Retrieve
 
@@ -422,7 +422,7 @@ uv run osca pack ../examples/oper-diagnosis.osca
 uv run osca load demo-group-oper-diagnosis.osca.zip --dest ./deploy
 ```
 
-Expect 0 Errors and 0 Warnings and a reproducible archive. Because `load` has no `--bindings`, it verifies static package content, integrity, and index rebuild only; it will list the capabilities still requiring injection.
+Expect 0 Errors and 0 Warnings and a reproducible archive. Because `load` has no `--bindings`, it verifies static package content, integrity, and index rebuild only; it will list the capabilities still requiring injection, which does not mean the environment connections are ready.
 
 To observe Host loading and registry state:
 
@@ -446,7 +446,7 @@ A full Episode also needs deployment Binding, Connector Mock fixtures, and an LL
 
 #### Your minimum Starter
 
-The public repository does not yet provide `osca init` or a productized Creator. The honest route is to follow the sample directory shape while removing its business context, Cases, and Judgments:
+The public repository does not yet provide `osca init` or a productized Creator. The honest route is to hand-create a smaller package that follows the sample directory shape without copying its business context, Cases, and Judgments:
 
 | First asset | Minimum content |
 |---|---|
@@ -472,7 +472,7 @@ Success does not mean “already smart.” It means Lint 0/0; two Packs have the
 9. Rebuild Index and Retrieve in a later real batch.
 10. Replay new Judgments and run periodic Checkup.
 
-An empty ledger is not a defect. P0-A's ≥20 L1 real Judgments are a content gate, not a Runtime prerequisite. With only the public repository, steps 8–10 require manual specification-compliant transactions or an independently implemented flywheel; private first-party commands are not promised by this Quickstart.
+An empty ledger is not a defect. P0-A's ≥20 L1 real Judgments are a content gate, not a Runtime prerequisite; only real runs produce credible Cases. With only the public repository, steps 8–10 require manual specification-compliant transactions or an independently implemented flywheel; private first-party commands are not promised by this Quickstart.
 
 ## Part V: Reference Implementation, Compatibility, and Validation
 
@@ -488,7 +488,7 @@ A reference implementation proves feasibility, exposes ambiguity through failure
 | First-party private | `oscapipe` clustering, distillation, retrieval, whole Checkup | Implementation/commercial choice, not a required OSCA dependency |
 | Customer private | Real Cases, authors, Judgments, Bindings, Secrets, runtime archives | Controlled by customer or authorized environment |
 
-Public readers cannot inspect the whole first-party flywheel. “M3 implemented” is therefore a maintainer implementation claim; public CLI and Host can be inspected directly. Real P0 material remains in a controlled customer/local Corpus, not an engineering repository.
+Public readers cannot inspect the whole first-party flywheel. “M3 implemented” is therefore a maintainer implementation claim; public CLI and Host can be inspected directly. Real P0 material enters neither the public repository nor the private engineering repository; it remains in a controlled customer/local Corpus.
 
 #### Sole stage snapshot as of 2026-07-12
 
@@ -503,7 +503,7 @@ Public readers cannot inspect the whole first-party flywheel. “M3 implemented�
 | M5 | Creator interview assistant and editor | Incomplete |
 | M6 | Real Connector conventions, production integration, software 1.0 | Incomplete |
 
-Software 1.0 requires P0-A evidence, M4–M6, the specification, reference implementation, and a replayable controlled real sample ledger. Whitepaper 1.0 is only this document version; customer data rights do not require publishing a raw ledger.
+Software 1.0 requires P0-A evidence, M4–M6, the specification, reference implementation, and a replayable controlled real sample ledger. Whitepaper 1.0 is only this document version; the real ledger remains subject to customer data rights and does not mean a published raw ledger.
 
 #### How implementation feeds the specification
 
@@ -567,7 +567,9 @@ Monthly operating diagnosis cannot honestly supply four rounds in two to four we
 - **P0-A high-frequency calibration:** low-risk, naturally reviewed report/QA/script work; at least four independent batches in two to four weeks; owns the ≥20 real-Judgment content gate.
 - **P0-B slow-scenario asset line:** monthly diagnosis and other high-value slow work accumulate Cases and Judgments at natural pace and cannot claim short-cycle convergence.
 
-A P0 Judgment must come from authorized real work, not sample/synthetic data; retain Evidence, author, time, and context; for Episode-born evidence, retain the active Judgment set; receive authorized expert Confirm; pass Lint and an independent Commit; enter with `confirmed: 0` and Provisional Trust; include Replay; and avoid copying or synonym-splitting. Expiry is recommended. Until spoken-evidence rules stabilize, spoken Case is supplemental only. Until Outcome attribution and an executable Replay Profile stabilize, Outcome Case is supplemental too; a P0-A Judgment must include at least one replayable expert Diff Case.
+A P0 Judgment must come from authorized real work, not sample/synthetic data; retain Evidence, author, time, and context; for Episode-born evidence, retain the active Judgment set; receive authorized expert Confirm; pass Lint and enter through an independent Commit; enter with `confirmed: 0` and Provisional Trust; include Replay; and avoid copying or synonym-splitting. Expiry is recommended. Until spoken-evidence rules stabilize, spoken Case is supplemental only. Until Outcome attribution and an executable Replay Profile stabilize, Outcome Case is supplemental too; a P0-A Judgment must include at least one replayable expert Diff Case.
+
+Maturity has five levels:
 
 ```text
 L0  Real Case captured
@@ -604,7 +606,7 @@ This is not a promise to “get smarter with use.” Evolution on demand may add
 
 The specification, sample, public tools, reference Host, and first-party flywheel engineering exist. What is missing is a real pipeline, a real ledger, and later-use evidence. The next step is P0, not a larger claim.
 
-Openness depends on another team reproducing public CLI/Host behavior and implementing or replacing the flywheel from the public specification alone, then using real Cases to force further correction. That has not been proven until a second implementation exists.
+Openness depends on another team reproducing public CLI/Host behavior and implementing or replacing the flywheel from the public specification alone, then using real Cases to force further correction. Until a second implementation exists, that remains unproven.
 
 ## Appendix A: Ten Design Axioms
 
@@ -634,7 +636,7 @@ These are design choices, not business-proven laws.
 | Candidate | AI-distilled draft with no runtime authority |
 | Judgment | Formal entry after expert Confirm, Lint, and Commit |
 | Confirm / `confirmed` | Act admitting Candidate / count of later real uses retained |
-| Trust | State driven by later-use counters, not typed confidence |
+| Trust | State driven by later-use counters, not hand-entered confidence |
 | Supersedes | One-way chain where a new Judgment replaces an old one without erasing history |
 | Replay / Checkup | A/B check for one Judgment / whole-Active-ledger check |
 

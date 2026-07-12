@@ -99,3 +99,14 @@ def test_fetch_failure_leaves_trace_without_case(loaded):
     (result,) = settle_episode(loaded, proxy, _episode({"OBJ-009": OBJECTIVE}))
     assert result["settled"] is False and "对账取数失败" in result["note"]
     assert not (loaded.root / "cases" / "C-0103.yaml").exists()
+
+
+def test_settle_no_overwrite_on_number_collision(loaded, proxy):
+    """无覆盖发布：编号被对手先占（完整文件）→ 顺移下一号，绝不截断他人内容。"""
+    rival = loaded.root / "cases" / "C-0103.yaml"
+    rival.write_text("case_id: C-0103\n# 对手的完整内容\n", encoding="utf-8")
+    (result,) = settle_episode(loaded, proxy, _episode({"OBJ-009": OBJECTIVE}))
+    assert result["case"] == "C-0104"  # 撞号顺移
+    assert "对手的完整内容" in rival.read_text(encoding="utf-8")  # 原文件原样
+    published = yaml.safe_load((loaded.root / "cases" / "C-0104.yaml").read_text(encoding="utf-8"))
+    assert published["case_id"] == "C-0104"  # 内容里的编号与文件名一致（重试后重写）

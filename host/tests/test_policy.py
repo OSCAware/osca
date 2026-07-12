@@ -510,3 +510,42 @@ def test_replay_health_huge_int_rate_degrades_not_crashes(tmp_path):
     }
     health.write_text(json.dumps(doc), encoding="utf-8")
     assert replay_health(tmp_path)["replay_green"] is None  # 不炸、不采信
+
+
+def test_replay_health_broken_git_index_is_unavailable(tmp_path):
+    """git index 损坏 → dirty=None（不可判定）——显式拒绝，不当「干净」采信（十二轮）。"""
+    import json
+    import subprocess
+
+    from osca_cli.ledger import ledger_stamp
+
+    from osca_host.policy import replay_health
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "测试")
+    (tmp_path / "a.txt").write_text("1", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "1")
+    doc = {
+        "generated_by": "oscapipe checkup",
+        "at": "2026-07-12T10:00:00",
+        "model": "mock",
+        "ledger_tree": ledger_stamp(tmp_path),
+        "total": 1,
+        "green": 1,
+        "red": 0,
+        "error": 0,
+        "red_rate": 0.0,
+        "judgments": {"J-1": {"light": "green", "assertions": 1}},
+    }
+    health = tmp_path / "indexes" / "replay-health.json"
+    health.parent.mkdir()
+    health.write_text(json.dumps(doc), encoding="utf-8")
+    assert replay_health(tmp_path)["replay_green"] == 1  # 完好时采信
+
+    (tmp_path / ".git" / "index").write_bytes(b"garbage-not-an-index")
+    assert replay_health(tmp_path)["replay_green"] is None  # 不可判定 ≠ 干净

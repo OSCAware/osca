@@ -562,7 +562,10 @@ def replay_health(root: Path | str) -> dict:
     if decidable == 0:
         return absent  # unavailable：全部不可回放不是「0% 红灯」
     # 版本归属：tree OID + 干净区，两端与 checkup 同一协议（osca_cli.ledger）。
-    # 无法验证（非 git/git 失败）≠ 可以采信——一律不可用（fail-closed，Review 十轮）
-    if ledger_stamp(root) != data["ledger_tree"] or ledger_dirty(root):
+    # 无法验证（非 git / git 失败 / index 损坏）≠ 可以采信——None 必须显式拒绝，
+    # 不许走 truthiness（Review 十二轮：None 被当 falsy 会假干净）
+    stamp = ledger_stamp(root)
+    dirty = ledger_dirty(root)
+    if stamp is None or stamp != data["ledger_tree"] or dirty is None or dirty:
         return absent
     return {"replay_green": counts["green"], "replay_red": counts["red"], "replay_at": data["at"]}

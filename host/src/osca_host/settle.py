@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 import yaml
-from osca_cli.ledger import allocate_case_path, ledger_lock
+from osca_cli.ledger import CASE_NUM, ledger_lock
 
 from osca_host.connector import ConnectorProxy
 from osca_host.episode import Episode
@@ -61,9 +61,15 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
             continue
 
         # 入账本锁协议（Review 十一轮）：对账落账与 capture/confirm/checkup 终检互斥——
-        # 不在 checkup 锁内终检通过之后偷写工作区；编号分配即占位（O_EXCL）绝不同号覆盖
+        # 不在 checkup 锁内终检通过之后偷写工作区。发布协议（十二轮）：内容先写满
+        # 临时 inode 并 fsync，再以 os.link 无覆盖落名——最终文件名一旦出现即是完整
+        # 内容，外部读者看不到零字节 C-xxxx.yaml
         with ledger_lock(loaded.root):
-            case_id, path = allocate_case_path(loaded.root)
+            cases_dir = loaded.root / "cases"
+            cases_dir.mkdir(exist_ok=True)
+            taken = [int(m.group(1)) for p in cases_dir.glob("*.yaml") if (m := CASE_NUM.match(p.stem)) is not None]
+            n = max(taken, default=0) + 1
+            case_id, path = f"C-{n:04d}", cases_dir / f"C-{n:04d}.yaml"
             case = {
                 "case_id": case_id,
                 "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -84,8 +90,9 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
                 },
                 "distillation": {"status": "pending"},
             }
-            try:
-                fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f"{case_id}.", suffix=".tmp")
+            while True:
+                case["case_id"] = case_id
+                fd, tmp_name = tempfile.mkstemp(dir=str(cases_dir), prefix=f".{case_id}.", suffix=".tmp")
                 tmp = Path(tmp_name)
                 try:
                     os.fchmod(fd, 0o644)
@@ -93,13 +100,20 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
                         fh.write(yaml.safe_dump(case, allow_unicode=True, sort_keys=False))
                         fh.flush()
                         os.fsync(fh.fileno())
-                    os.replace(tmp, path)  # 原子落位到占位文件——读方看不到半个 case
-                except BaseException:
+                    try:
+                        os.link(tmp, path)  # 无覆盖发布：撞号即重试下一号，绝不截断他人内容
+                    except FileExistsError:
+                        n += 1
+                        case_id, path = f"C-{n:04d}", cases_dir / f"C-{n:04d}.yaml"
+                        continue
+                    break
+                finally:
                     tmp.unlink(missing_ok=True)
-                    raise
-            except BaseException:
-                path.unlink(missing_ok=True)  # 写入失败不留空壳占位进账本
-                raise
+            dfd = os.open(str(cases_dir), os.O_RDONLY)
+            try:
+                os.fsync(dfd)  # link 的目录项耐久——崩溃后账本条目不失踪
+            finally:
+                os.close(dfd)
         results.append({"object": object_id, "settled": True, "case": case_id, "path": str(path)})
 
     episode.settlements.extend(results)
