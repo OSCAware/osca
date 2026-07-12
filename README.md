@@ -13,7 +13,9 @@ recorded in an attributable **contribution ledger**.
 
 📘 **Whitepaper:** [English](docs/OSCA-WHITEPAPER-v1.1.en.md) ·
 [简体中文](docs/OSCA-WHITEPAPER-v1.1.zh-CN.md) · [日本語](docs/OSCA-WHITEPAPER-v1.1.ja.md) ·
-[中文 PDF download](docs/OSCA-WHITEPAPER-v1.1.zh-CN.pdf) — the design
+[English PDF](docs/OSCA-WHITEPAPER-v1.1.en.pdf) ·
+[中文 PDF](docs/OSCA-WHITEPAPER-v1.1.zh-CN.pdf) ·
+[日本語 PDF](docs/OSCA-WHITEPAPER-v1.1.ja.pdf) — the design
 rationale, O/S/C/A/J model, Runtime, feedback flywheel, and how to begin implementing your own OSCA Agent.
 Whitepaper v1.1 is a document version, not a software 1.0 release.
 
@@ -84,7 +86,9 @@ osca/
 ├── docs/OSCA-WHITEPAPER-v1.1.en.md    # open-spec whitepaper: English
 ├── docs/OSCA-WHITEPAPER-v1.1.zh-CN.md # open-spec whitepaper: Simplified Chinese
 ├── docs/OSCA-WHITEPAPER-v1.1.ja.md    # open-spec whitepaper: Japanese
+├── docs/OSCA-WHITEPAPER-v1.1.en.pdf    # downloadable English PDF
 ├── docs/OSCA-WHITEPAPER-v1.1.zh-CN.pdf # downloadable Chinese PDF
+├── docs/OSCA-WHITEPAPER-v1.1.ja.pdf    # downloadable Japanese PDF
 ├── docs/OSCA-SPEC-v0.3.md         # the specification (CC BY 4.0); v0.4 draft alongside, v0.2 kept for history
 ├── docs/OSCA-LINT-RULES.md        # lint rule catalogue (ledger discipline, machine-enforced)
 ├── examples/oper-diagnosis.osca/  # a full synthetic demo pack (with supersedes chains and spoken-language cases)
