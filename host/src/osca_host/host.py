@@ -19,7 +19,7 @@ from pathlib import Path
 
 import yaml
 from osca_cli.findings import Severity
-from osca_cli.ledger import LedgerLockBusy, ledger_lock
+from osca_cli.ledger import LedgerLockBusy, ledger_lock, ledger_stamp
 from osca_cli.package import load_package
 from osca_cli.packer import rebuild_index
 from osca_cli.rules import run_all
@@ -31,7 +31,7 @@ from osca_host.episode import Episode, assemble
 from osca_host.expr import parse_precondition
 from osca_host.gate import Gate
 from osca_host.loader import load_for_host
-from osca_host.policy import PolicyInterceptor, ledger_stats
+from osca_host.policy import REPLAY_RED, PolicyInterceptor, ledger_stats
 from osca_host.registry import Registry, RegistryError
 from osca_host.runner import run_episode
 from osca_host.settle import settle_episode
@@ -137,6 +137,17 @@ class Host:
             self.gates[(pid, aware_id)] = gate
         if policy.kill_tripped:
             lines.append(f"⚠ {policy.kill_reason}——包已装载但唤醒与调用全部拒绝（三级停语义，公理 A10）")
+        # 部署契约提示（M4 前拍板）：zip 解压目录无 git 账本 → 回放红灯率条件永远 unavailable（默认不触发）
+        kill_entries = (policy_file.mapping.get("kill_switch") if policy_file else None) or []
+        has_replay_condition = any(
+            isinstance(e, dict) and isinstance(e.get("when"), str) and REPLAY_RED.fullmatch(e["when"])
+            for e in kill_entries
+        )
+        if has_replay_condition and ledger_stamp(loaded.root) is None:
+            lines.append(
+                "⚠ policy 声明了「回放红灯率」kill 条件，但包根不是 git 账本（zip 部署形态）——"
+                "该条件永远不可求值（unavailable 默认不触发）。生产账本建议以 git 目录部署并定期 checkup"
+            )
 
         # 布防：enabled 的 Aware 逐条触发原语进触发表；任一条失败即补偿回滚——不留半装载包
         armed = 0

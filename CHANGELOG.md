@@ -170,6 +170,25 @@
 - authorize_llm 三检入授权锁（与 revoke/kill 发布同一线性化边界）；permit 成功留审计痕
 - Host 版本 0.1.0 → 0.2.0（replay_health 返回键与档案契约为破坏性变更）
 
+## [Review 复核 · 十一轮] - 2026-07-12
+- 体检快照真读：checkup 从 tree OID 导出不可变快照**全程回放快照**——盖章内容 =
+  读取内容，「中途改写、事后恢复」的瞬时内容无从进入健康档案
+- ledger_dirty 三漏修复：`--ignored=matching` 把 untracked/gitignored 全部纳入
+  （loader 会读它们）；豁免收窄到**包根** indexes/（judgments/indexes/ 不豁免）；
+  所有调用点显式区分 None（不可判定 = 不可信）与空（干净）
+- settle 入账本锁协议 + mkstemp 原子落位——对账不再能在 checkup 锁内终检后偷写
+- 锁文件移至 git common dir（按包路径哈希）：不随缓存目录删除重建产生第二个
+  inode；O_NOFOLLOW 且不截断——预置符号链接即报错，不覆写链接目标
+- ratio 条件三态：0/0 = unavailable（不解除既有红灯）；overruled>0 而 confirmed=0
+  = 保守停机；lint 拒绝负计数
+- authorize_tool/charge/precheck/approvals 全部进授权锁——工具决策与预算预留和
+  revoke/kill 发布同一线性化边界，并发预算预留不超发
+- 纯整数交叉相乘（as_integer_ratio）：28 位 Decimal 上下文的乘法舍入不再翻转
+  严格 > 判定；red_rate 数百位大整数不再炸读取器（总函数契约）
+- Host 装载提示部署契约：zip 形态（非 git 账本）下回放红灯率条件永远 unavailable
+- 兼容：CheckupReport.ledger_head 弃用别名保留；oscapipe 版本 0.2.0；
+  README/样例注释同步
+
 ## [Unreleased]
 - 发布 OSCA 开放规范白皮书 v1.0：以 OSCA 为核心、Oscaware 为参考实现，覆盖 O/S/C/A/J、
   双平面 Runtime、判断飞轮、采用路径、兼容与证据边界；历史 v0.1 扩展稿留档

@@ -5,8 +5,9 @@
 
 - allocate_case_path：O_EXCL 独占创建，编号分配即占位——并发分配者绝不同号，
   「扫最大号 + 1 再普通写入」的后写覆盖先写由此根除；
-- ledger_lock：包级 flock（indexes/.ledger.lock，跨进程），计数回写 / J-ID 分配
-  等多文件临界区互斥。锁文件住 indexes/——缓存目录，不进交付件、不进账本扫描。
+- ledger_lock：包级 flock（跨进程），计数回写 / J-ID 分配等多文件临界区互斥。
+  锁文件住 git common dir（按包路径哈希命名）——不随缓存目录被删重建，
+  也不给包内容留预置符号链接的机会；非 git 根退回 indexes/。
 
 私仓 oscapipe 与本模块共用同一协议（同一锁文件路径、同一占位语义）；
 本模块是协议的单一真理源。
@@ -15,12 +16,15 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import os
 import re
 import subprocess
 from contextlib import contextmanager
 from pathlib import Path
 
 CASE_NUM = re.compile(r"C-(\d+)")
+JUNK_NAMES = {".DS_Store"}  # 系统垃圾文件：loader 永不读取，不作为脏区证据
 
 
 def _git_out(root: Path, *args: str) -> str | None:
@@ -48,17 +52,28 @@ def ledger_stamp(root: Path | str) -> str | None:
 
 
 def ledger_dirty(root: Path | str) -> list[str] | None:
-    """包范围未提交改动清单（indexes/ 缓存除外）；非 git / git 失败 → None（不可判定）。
+    """包范围未提交/未跟踪/被忽略的改动清单；非 git / git 失败 → None（不可判定）。
 
-    健康档案等版本敏感产物的生产端与消费端共用：未提交的判断/case 不在版本快照里，
-    干净区不成立时戳不能证明内容。
+    健康档案等版本敏感产物的生产端与消费端共用：不在版本快照里的内容（含 gitignored
+    的判断/case——loader 照样会读它们）让戳无法证明内容。豁免只给**包根** `indexes/`
+    （缓存目录，公理 A4）与系统垃圾文件；`judgments/indexes/` 这类内层目录不豁免。
+    调用方必须显式区分 None（不可判定 → 按不可信处理）与 []（干净）。
     """
     root = Path(root)
-    porcelain = _git_out(root, "status", "--porcelain", "--", ".")
+    porcelain = _git_out(root, "status", "--porcelain", "--ignored=matching", "--", ".")  # 逐文件列出，不折叠目录
     if porcelain is None:
         return None
-    cache = re.compile(r"(^|/)indexes/")  # 任意层级的 indexes/ 都是缓存
-    return [line for line in porcelain.splitlines() if line.strip() and not cache.search(line[3:].strip().strip('"'))]
+    entries = []
+    for line in porcelain.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip().strip('"')
+        if path == "indexes/" or path.startswith("indexes/"):
+            continue  # 仅包根缓存目录豁免
+        if path.rsplit("/", 1)[-1] in JUNK_NAMES:
+            continue
+        entries.append(line)
+    return entries
 
 
 class LedgerLockBusy(Exception):
@@ -85,21 +100,43 @@ def allocate_case_path(root: Path) -> tuple[str, Path]:
             n += 1  # 并发抢号：顺移下一号
 
 
+def _lock_path(root: Path) -> Path:
+    """锁文件位置：git common dir 下按包路径哈希命名——不住可丢弃的 indexes/
+    （删除重建缓存目录会造出第二个锁 inode），也不给包内容留预置符号链接的机会。
+    非 git 根（测试/临时目录）退回 indexes/，但拒绝符号链接目录。
+    """
+    common = _git_out(root, "rev-parse", "--git-common-dir")
+    if common:
+        common_path = Path(common)
+        if not common_path.is_absolute():
+            common_path = (root / common_path).resolve()
+        digest = hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:16]
+        return common_path / f"osca-ledger-{digest}.lock"
+    lock_dir = root / "indexes"
+    if lock_dir.is_symlink():
+        raise OSError(f"{lock_dir} 是符号链接——拒绝在链接目录建账本锁")
+    lock_dir.mkdir(exist_ok=True)
+    return lock_dir / ".ledger.lock"
+
+
 @contextmanager
 def ledger_lock(root: Path, *, blocking: bool = True):
     """包级账本写锁（flock，跨进程互斥）。锁不住单文件时序的场合用它包住整个临界区。
 
     blocking=False 用于「不该等的读方」（如 Host 唤醒前刷新快照）：写入者事务
     进行中即抛 LedgerLockBusy——宁可拒绝本次唤醒，不可读半截账本。
+    打开方式 O_NOFOLLOW 且不截断：锁文件被预置成符号链接即报错，不覆写链接目标。
     """
-    lock_dir = root / "indexes"
-    lock_dir.mkdir(exist_ok=True)
-    with (lock_dir / ".ledger.lock").open("w") as fh:
+    path = _lock_path(Path(root))
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    try:
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as e:
             raise LedgerLockBusy(f"账本写锁被占用：{root}（写入者事务进行中）") from e
         try:
             yield
         finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
