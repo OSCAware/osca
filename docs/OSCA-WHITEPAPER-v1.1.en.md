@@ -2,12 +2,12 @@
 
 > An open specification for AI cognitive workflows that are runnable, auditable, replayable, and able to adapt through real feedback
 
-- **Whitepaper version:** 1.0 (not a software 1.0 release)
+- **Whitepaper version:** 1.1 (document version, not a software release)
 - **Published:** 2026-07-12
 - **Specification baseline:** OSCA SPEC v0.3 + v0.4 draft (2026-07-12 Profile)
 - **Reference implementation status:** public Host 0.2.0; first-party feedback-flywheel engineering (M3) complete; real-world validation not complete
 
-**Languages:** **English** · [简体中文](OSCA-WHITEPAPER-v1.0.zh-CN.md) · [日本語](OSCA-WHITEPAPER-v1.0.ja.md)
+**Languages:** **English** · [简体中文](OSCA-WHITEPAPER-v1.1.zh-CN.md) · [日本語](OSCA-WHITEPAPER-v1.1.ja.md)
 
 ## Abstract
 
@@ -211,6 +211,7 @@ my-agent.osca/
 ├── aware/
 ├── judgments/       # may be empty in the first version
 ├── cases/           # produced by real runs
+├── indexes/         # machine-generated cache; rebuildable; excluded from delivery
 └── bindings.example.yaml
 ```
 
@@ -224,7 +225,7 @@ A package has three states:
 
 Files are the asset truth; indexes are caches. Judgments, Cases, and Policy remain readable, while signature/vector indexes can be deleted and rebuilt. Git retains append-only history, attribution, and version replay. Checksums detect content changes but do not prove publisher identity; trusted signing and supply-chain controls remain deployment responsibilities.
 
-Customers should be able to hold their own package and Judgment Ledger. That design goal does not itself solve contracts, author rights, or privacy deletion; deployments still need governance.
+A running Agent is only the compiled artifact; the textual package and its Judgment Ledger are the source code, and the model and Runtime act as a replaceable compiler. Customers should be able to hold that source code—their own package and Judgment Ledger. That design goal does not itself solve contracts, author rights, or privacy deletion; deployments still need governance.
 
 ### Chapter 5: The Dual-Plane Runtime Model
 
@@ -286,7 +287,7 @@ An expert edit is not a Judgment. It first becomes preserved evidence; only dist
 1. **Signature:** Object, Aware, and Guard where it applies.
 2. **Body:** one to three sentences of decision, including necessary “unless.”
 3. **Evidence:** one or more birth Cases.
-4. **Meta:** author, batch, status, `confirmed`, `overruled`, and Trust.
+4. **Meta:** author, batch, `confirmed`, `overruled`, and Trust (lifecycle status is a top-level file field).
 5. **Expiry / Replay:** what requires review and how to check behavior.
 
 Confirm is the expert act that admits a Candidate; it is not `confirmed +1`. A new Judgment enters with `confirmed: 0` and Provisional Trust. Only later real use retained by the responsible expert—or, in a future profile, supported through defined Outcome attribution—can increase the counter. The current first-party implementation updates `confirmed/overruled` only from expert Diff; Outcome Sweep records a Case but does not update counters. The reference discipline promotes Trust to High when confirmations reach a threshold without overruling, and moves a Judgment into Review when overruling accumulates to its threshold; both thresholds still require P0 calibration.
@@ -332,7 +333,7 @@ Capture is deliberately unintelligent: one feedback event becomes one Case and o
 
 The private first-party `oscapipe` Distill currently processes only Pending Diff Cases containing both `agent_draft` and `expert_final`; it skips Outcome and spoken Cases. It groups by expert action and shared context, then may merge semantically similar clusters through Embedding. An LLM may draft Signature, Body, Expiry, Replay, and the confirmation question, but Evidence equals the Cases selected by deterministic clustering, and machines fill Meta and ID. A reference outside the cluster or to a missing Object invalidates the Candidate.
 
-Candidates remain outside the package. The private `oscapipe` CLI supports Confirm and Reject; the public `osca` CLI does not. Rewriting currently means editing and redistilling, not a separate Rewrite action. Confirm verifies under the lock that the evidence is still fresh, allocates a J-ID, updates Supersedes and Case state, runs Lint, and commits one Judgment per Commit. Reject reason and time should remain; structured Reject audit is still incomplete.
+Candidates remain outside the package. The private `oscapipe` CLI supports Confirm and Reject; the public `osca` CLI does not. Rewriting currently means editing and redistilling, not a separate Rewrite action. Confirm verifies under the lock that the evidence is still fresh, allocates a J-ID, updates Supersedes and Case state, runs Lint, and commits one Judgment per Commit. Reject reason and time should remain; the first-party implementation does not yet record this structured audit.
 
 In the synthetic operating-diagnosis example, `C-0091` removes an ordinary overhaul-period travel alert while `C-0094` keeps an above-peak exception. Together they illustrate how the Candidate “normally suppress, unless above the peak” becomes Judgment `J-0417` through expert Confirm. They demonstrate asset relationships, not P0 evidence.
 
@@ -567,7 +568,15 @@ Monthly operating diagnosis cannot honestly supply four rounds in two to four we
 - **P0-A high-frequency calibration:** low-risk, naturally reviewed report/QA/script work; at least four independent batches in two to four weeks; owns the ≥20 real-Judgment content gate.
 - **P0-B slow-scenario asset line:** monthly diagnosis and other high-value slow work accumulate Cases and Judgments at natural pace and cannot claim short-cycle convergence.
 
-A P0 Judgment must come from authorized real work, not sample/synthetic data; retain Evidence, author, time, and context; for Episode-born evidence, retain the active Judgment set; receive authorized expert Confirm; pass Lint and enter through an independent Commit; enter with `confirmed: 0` and Provisional Trust; include Replay; and avoid copying or synonym-splitting. Expiry is recommended. Until spoken-evidence rules stabilize, spoken Case is supplemental only. Until Outcome attribution and an executable Replay Profile stabilize, Outcome Case is supplemental too; a P0-A Judgment must include at least one replayable expert Diff Case.
+A Judgment that counts toward P0 must, at minimum:
+
+- come from authorized real work, not sample or synthetic data;
+- retain Evidence, author, time, and context—and, if born in an Episode, the active Judgment set at that time;
+- receive authorized expert Confirm, pass Lint, and enter through an independent Commit;
+- enter with `confirmed: 0` and Provisional Trust, and carry Replay;
+- involve no copying or synonym-splitting to inflate the count.
+
+Expiry is recommended but distinct from mandatory Replay. Until spoken-evidence rules stabilize, a spoken Case is supplemental Evidence only and cannot alone give birth to or count as a P0 Judgment; until Outcome attribution and an executable Replay Profile stabilize, an Outcome Case is likewise supplemental. A P0-A Judgment must include at least one replayable expert Diff Case.
 
 Maturity has five levels:
 
@@ -589,7 +598,7 @@ P0 is small and can show feasibility and direction, not general causality. Model
 - **Outcome attribution:** one good result cannot legislate; windows, confounding, and minimum evidence are undefined.
 - **Spoken Case:** attributable, but independent birth and Replay rules remain weak.
 - **Multi-expert governance:** conflict, delegation, tenure, authorship, and dispute lack common semantics.
-- **Reject audit:** the first-party structured Reject reason remains incomplete.
+- **Reject audit:** the first party does not yet retain structured Reject reasons and times.
 - **Production engineering:** real Executors, events, recovery, HA, security, and identity are unfinished.
 - **Health archive age:** Host validates content version, not wall-clock expiry; deployment owns cadence.
 - **Ecosystem:** no second implementation, extension negotiation, Conformance, or formal governance yet.
@@ -650,7 +659,7 @@ These are design choices, not business-proven laws.
 | [Operating-diagnosis sample](../examples/oper-diagnosis.osca/README.md) | Synthetic/demo package; not real P0 |
 | [CLI guide](../cli/README.md) | Lint, Pack, Load, single Replay |
 | [Host guide](../host/README.md) | Reference Runtime capabilities and boundaries |
-| [Historical v0.1 extended draft](OSCA-WHITEPAPER-v0.1.zh-CN.md) | Design background only; v1.0 controls status and conclusions |
+| [Historical v0.1 extended draft](OSCA-WHITEPAPER-v0.1.zh-CN.md) | Design background only; v1.1 controls status and conclusions |
 
 This paper uses four evidence levels:
 
