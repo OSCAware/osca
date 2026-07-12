@@ -56,6 +56,17 @@ def test_episode_metadata(episode):
     summary = episode.summary()
     assert summary["judgments"] == ["J-0417", "J-0423"]
     assert summary["objects"] == ["OBJ-001", "OBJ-002", "OBJ-003"]
+    assert summary["operation_id"] == episode.operation_id
+
+
+def test_episode_operation_id_is_unique_beyond_display_sequence(loaded):
+    """EP 展示编号可在 Host 重启后复用；不可变 operation_id 才是跨进程身份。"""
+    aware = next(a for a in loaded.awares if a.aware_id == "AW-001")
+    first = assemble("EP-0001", loaded, aware, "AW-001/T3")
+    restarted = assemble("EP-0001", loaded, aware, "AW-001/T3")
+    assert first.operation_id.startswith("EO-")
+    assert restarted.operation_id.startswith("EO-")
+    assert first.operation_id != restarted.operation_id
 
 
 def test_assembly_reads_pack_not_disk_cache(loaded):

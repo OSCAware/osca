@@ -36,7 +36,7 @@ ROLE_CAPS: dict[str, frozenset[str]] = {
     "host_admin": frozenset({"status", "load", "unload", "enable", "disable", "fire", "episodes", "episode", "stop"}),
     "operator": frozenset({"status", "enable", "disable", "fire", "episodes"}),
     "approver": frozenset(),  # W3 审批 challenge 前为空——旧 approve RPC 对全角色关闭，不留无绑定授予面
-    "expert": frozenset(),  # M4-W1：查看分配稿件/Diff 的命令落地时归入
+    "expert": frozenset({"episodes", "episode"}),  # M4-W1 专家端：只读交付面（摘要 + 全量导出——draft 正是要交付之物）
 }
 
 # 命令 → 参数字段（全部必填、非空 str）。请求顶层除 v/cmd/token 与这些字段外不许有别的键

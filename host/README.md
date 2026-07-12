@@ -109,7 +109,7 @@ shasum -a 256 operator.token           # 将摘要写入 Host 侧 principals 文
 | `host_admin` | status / load / unload / enable / disable / fire / episodes / episode / stop | 授予业务审批 |
 | `operator` | status / enable / disable / fire / episodes（摘要；脱敏 DTO 属 W2，当前与 admin 同构——勿授予不可信进程） | load、approve、完整 episode、stop |
 | `approver` | （空集：W3 审批 challenge——pending→approved\|denied→consumed、绑定 approver/episode/digest/expiry/nonce——落地前，旧 approve RPC 对全角色关闭） | 其余全部 |
-| `expert` | （M4-W1 专家端命令落地时归入） | 其余全部 |
+| `expert` | episodes / episode（M4-W1 专家端只读交付面——draft 即交付物；episodes 摘要当前覆盖 Host 上全部包，per-principal 包域收窄未做，勿在多租户 Host 上授予） | 其余全部 |
 
 `load` 只收 `deployment_id`：包路径、bindings、解压目录一律由 Host 侧
 `--deployments` 清单解析（相对路径按清单文件所在目录解析），绝不从连接者

@@ -44,7 +44,18 @@ def test_role_caps_matrix_pinned():
     # W3 审批 challenge（pending→approved|denied→consumed，绑定 approver/episode/
     # digest/expiry/nonce）落地前，旧 set[action] 授予不从控制通道暴露——approver 空集
     assert ROLE_CAPS["approver"] == frozenset()
-    assert ROLE_CAPS["expert"] == frozenset()  # M4-W1 专家端命令落地时显式归入
+    # M4-W1 专家端：只读交付面——episodes 摘要 + episode 全量（draft 即交付物）；写命令一律不给
+    assert ROLE_CAPS["expert"] == {"episodes", "episode"}
+
+
+def test_expert_role_readonly_delivery_surface():
+    """expert 只读：能取剧集（交付面），任何状态变更命令一律被拒。"""
+    az = Authorizer()
+    expert = Principal("专家桥", "expert")
+    assert az.authorize(expert, "episodes")
+    assert az.authorize(expert, "episode")
+    for denied in ("status", "load", "unload", "enable", "disable", "fire", "approve", "stop"):
+        assert not az.authorize(expert, denied)
 
 
 def test_authorizer_register_identify_authorize():

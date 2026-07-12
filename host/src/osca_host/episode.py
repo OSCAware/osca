@@ -16,6 +16,7 @@ Aware 或本剧集引用的 object → 按 trust（high 优先）+ confirmed 降
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
@@ -40,6 +41,7 @@ class Episode:
     then: str | None
     budget: dict
     context: dict = field(repr=False)
+    operation_id: str = ""  # 跨 Host 重启唯一的机器身份；EP-xxxx 只是短展示编号
     # ── 执行态（runner 写入）：assembled → running → completed | stopped | failed ──
     status: str = "assembled"
     steps: list[dict] = field(default_factory=list)  # 逐步留痕（performer/回执/产出/tokens）
@@ -52,6 +54,7 @@ class Episode:
     def summary(self) -> dict:
         return {
             "episode_id": self.episode_id,
+            "operation_id": self.operation_id,
             "package_id": self.package_id,
             "aware_id": self.aware_id,
             "fired_trigger": self.fired_trigger,
@@ -145,6 +148,7 @@ def assemble(episode_id: str, loaded: LoadedPackage, aware: AwareDecl, fired_tri
     }
     return Episode(
         episode_id=episode_id,
+        operation_id=f"EO-{uuid.uuid4().hex}",
         package_id=loaded.package_id,
         aware_id=aware.aware_id,
         fired_trigger=fired_trigger,
