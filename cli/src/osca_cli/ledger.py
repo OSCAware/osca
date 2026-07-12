@@ -161,28 +161,37 @@ def _lock_path(root: Path) -> Path:
 
 @contextmanager
 def open_ledger_dir(root: Path, name: str):
-    """安全打开包内发布目录（cases/、indexes/）——发布路径不许逃出包根（Review 十三轮）。
+    """安全打开包内发布目录（cases/、indexes/）——发布路径不许逃出包根（Review 十三/十四轮）。
 
-    lstat 明确拒绝符号链接（ledger_dirty 豁免包根缓存目录，链接可借此通过全部版本检查）；
-    O_DIRECTORY|O_NOFOLLOW 打开拿 dir_fd——之后的创建/link/rename/fsync 全部基于该 fd，
-    检查后目录项被替换也只作用于已持有的真实目录 inode。
+    两层 fd 锚定：先 O_DIRECTORY|O_NOFOLLOW 打开**包根**拿 root_fd（包根本身被换成
+    符号链接在此即拒），再经 dir_fd=root_fd 创建/打开发布目录（最后一段 O_NOFOLLOW
+    拒符号链接）。单层 O_NOFOLLOW 只保护路径最后一段——包根这类祖先在检查后被换成
+    外部目录链接，仍可把发布导出包根（十四轮探针）；持有 fd 后目录项再被替换，
+    只作用于已持有的真实目录 inode。name 限单一目录名：路径分隔符与 ./.. 一律拒绝。
     """
-    path = root / name
-    if path.is_symlink():
-        raise OSError(f"{path} 是符号链接——发布目录必须是包内真实目录，拒绝写入")
-    path.mkdir(exist_ok=True)
+    if name != os.path.basename(name) or name in ("", ".", ".."):
+        raise OSError(f"发布目录名必须是单一目录名（不含路径分隔符与 ./..）：{name!r}")
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+    root_fd = os.open(root, flags)
     try:
-        yield fd
+        try:
+            os.mkdir(name, dir_fd=root_fd)
+        except FileExistsError:
+            pass  # 已存在真实目录照常打开；预置符号链接由下面 O_NOFOLLOW 拒绝
+        fd = os.open(name, flags, dir_fd=root_fd)
+        try:
+            yield fd
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(root_fd)
 
 
 def publish_file_in_dir(dir_fd: int, filename: str, data: bytes, *, overwrite: bool) -> bool:
     """在已安全打开的目录 fd 内原子发布文件：唯一临时名（O_EXCL、不跟随链接）→ 写满 +
-    fsync → link（无覆盖，占用返回 False 由调用方顺移）或 replace（覆盖）→ 目录 fsync。
-    临时文件无论成败都清理。"""
+    fsync → link（无覆盖，占用返回 False 由调用方顺移）或 replace（覆盖）→ 清理临时名
+    → 目录 fsync。目录 fsync 放在临时名清理之后、占用/异常路径同样覆盖（十四轮）——
+    否则崩溃恢复可能残留点号临时文件把账本判脏。"""
     tmp_name = f".{filename}.{os.getpid()}.{time.monotonic_ns()}.tmp"
     fd = os.open(tmp_name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o644, dir_fd=dir_fd)
     try:
@@ -197,13 +206,13 @@ def publish_file_in_dir(dir_fd: int, filename: str, data: bytes, *, overwrite: b
                 os.link(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             except FileExistsError:
                 return False
-        os.fsync(dir_fd)  # link/rename 的目录项耐久
         return True
     finally:
         try:
             os.unlink(tmp_name, dir_fd=dir_fd)
         except FileNotFoundError:
             pass  # replace 已把临时名挪走
+        os.fsync(dir_fd)  # link/replace 落名 + 临时名删除，一并耐久
 
 
 @contextmanager

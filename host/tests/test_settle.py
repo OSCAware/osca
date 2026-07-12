@@ -112,6 +112,32 @@ def test_settle_no_overwrite_on_number_collision(loaded, proxy):
     assert published["case_id"] == "C-0104"  # 内容里的编号与文件名一致（重试后重写）
 
 
+def test_settle_collision_after_scan_hits_retry_branch(loaded, proxy, monkeypatch):
+    """撞号重试真分支（十四轮）：对手在编号扫描后、首次 link 前落 C-0103——
+    首次发布必须返回占用（False），对手原样，重试落 C-0104 且 YAML 编号一致。"""
+    from osca_host import settle as settle_mod
+
+    real = settle_mod.publish_file_in_dir
+    rival = loaded.root / "cases" / "C-0103.yaml"
+    outcomes: list[tuple[str, bool]] = []
+
+    def racing(dir_fd, filename, data, *, overwrite):
+        if not outcomes:
+            rival.write_text("case_id: C-0103\n# 对手的完整内容\n", encoding="utf-8")
+        ok = real(dir_fd, filename, data, overwrite=overwrite)
+        outcomes.append((filename, ok))
+        return ok
+
+    monkeypatch.setattr(settle_mod, "publish_file_in_dir", racing)
+    (result,) = settle_episode(loaded, proxy, _episode({"OBJ-009": OBJECTIVE}))
+    assert outcomes[0] == ("C-0103.yaml", False)  # 首次发布：占用，无覆盖
+    assert outcomes[-1] == ("C-0104.yaml", True)  # 顺移重试成功
+    assert result["case"] == "C-0104"
+    assert "对手的完整内容" in rival.read_text(encoding="utf-8")  # 对手文件原样
+    published = yaml.safe_load((loaded.root / "cases" / "C-0104.yaml").read_text(encoding="utf-8"))
+    assert published["case_id"] == "C-0104"  # 内容编号与文件名一致（重试后重写）
+
+
 def test_settle_refuses_symlinked_cases_dir(loaded, proxy, tmp_path):
     """cases/ 被换成外部目录链接 → 拒绝写入，包外零文件（十三轮：无覆盖 link 保完整不保在账本内）。"""
     outside = tmp_path / "outside"

@@ -214,6 +214,18 @@
 - ledger_dirty：porcelain -z 的 rename/copy 双路径成对消费——根缓存内部 rename
   不再误报脏（fail-closed 可用性问题），任一段出豁免区仍算脏
 
+## [Review 复核 · 十四轮] - 2026-07-12
+- 安全目录发布助手包根 fd 锚定：`open_ledger_dir` 改两层 fd——先 O_DIRECTORY|
+  O_NOFOLLOW 打开**包根**拿 root_fd（包根被换成符号链接在此即拒），再经
+  dir_fd=root_fd 创建/打开发布目录；name 限单一目录名（路径分隔符与 ./.. 拒绝）。
+  单层 O_NOFOLLOW 只护路径最后一段——包根这类祖先在检查后被换成外链仍可把发布
+  导出包根（十四轮确定性交错探针）；checkup/settle 经同一助手一并继承。回归：
+  包根预置外链拒绝 + 包根持 fd 后被替换写入仍落原 inode、包外零写入
+- `publish_file_in_dir` 目录 fsync 移到临时名清理之后（占用/异常路径同样覆盖）
+  ——崩溃恢复不再可能残留点号临时文件把账本判脏
+- settle 撞号重试真分支回归：对手在编号扫描后、首次 link 前落号——首次发布
+  返回占用、对手文件原样、顺移 C-0104 且 YAML 内 case_id 一致
+
 ## [Unreleased]
 - 发布 OSCA 开放规范白皮书 v1.0：以 OSCA 为核心、Oscaware 为参考实现，覆盖 O/S/C/A/J、
   双平面 Runtime、判断飞轮、采用路径、兼容与证据边界；历史 v0.1 扩展稿留档

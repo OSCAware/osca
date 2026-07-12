@@ -172,6 +172,46 @@ def test_open_ledger_dir_refuses_symlink(tmp_path):
     assert list(outside.iterdir()) == []
 
 
+def test_open_ledger_dir_refuses_symlinked_root(tmp_path):
+    """包根本身是符号链接（十四轮：单层 O_NOFOLLOW 只护最后一段）→ 拒绝，包外零写入。"""
+    from osca_cli.ledger import open_ledger_dir
+
+    outside = tmp_path / "outside"
+    (outside / "indexes").mkdir(parents=True)
+    (tmp_path / "pack").symlink_to(outside)
+    with pytest.raises(OSError):
+        with open_ledger_dir(tmp_path / "pack", "indexes"):
+            pass
+    assert list((outside / "indexes").iterdir()) == []
+
+
+def test_open_ledger_dir_anchors_root_inode_after_swap(tmp_path):
+    """包根在检查后被替换（原包根改名保存 + 原位放外链、外部有真实 indexes/）——
+    十四轮确定性交错：写入必须仍落在已持有的原包根 inode，包外零写入。"""
+    from osca_cli.ledger import open_ledger_dir, publish_file_in_dir
+
+    outside = tmp_path / "outside"
+    (outside / "indexes").mkdir(parents=True)
+    root = tmp_path / "pack"
+    root.mkdir()
+    with open_ledger_dir(root, "indexes") as dfd:
+        root.rename(tmp_path / "pack-moved")  # 原包根改名保存
+        (tmp_path / "pack").symlink_to(outside)  # 原位放置指向外部目录的链接
+        assert publish_file_in_dir(dfd, "replay-health.json", b"{}", overwrite=True)
+    assert list((outside / "indexes").iterdir()) == []  # outside_written 必须为 False
+    assert (tmp_path / "pack-moved" / "indexes" / "replay-health.json").read_bytes() == b"{}"
+
+
+def test_open_ledger_dir_requires_single_basename(tmp_path):
+    """name 限单一目录名——路径分隔符与 ./.. 一律拒绝，不给相对路径逃出包根的机会。"""
+    from osca_cli.ledger import open_ledger_dir
+
+    for bad in ("a/b", "../escape", ".", "..", ""):
+        with pytest.raises(OSError):
+            with open_ledger_dir(tmp_path, bad):
+                pass
+
+
 def test_publish_file_in_dir_protocol(tmp_path):
     """dir_fd 发布协议：无覆盖 link 占用返回 False；覆盖 replace 生效；临时件不残留。"""
     from osca_cli.ledger import open_ledger_dir, publish_file_in_dir
