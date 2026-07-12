@@ -189,6 +189,19 @@
 - 兼容：CheckupReport.ledger_head 弃用别名保留；oscapipe 版本 0.2.0；
   README/样例注释同步
 
+## [Review 复核 · 十二轮] - 2026-07-12
+- 快照物化协议定稿：弃用 git archive（嵌套包子树空 tar / .gitattributes
+  export-ignore 可抹掉盖章文件 / 3.10-3.11 无保护解包），改 `git ls-tree -rz
+  --full-tree` + `cat-file blob` 精确物化——只收普通 blob，符号链接/submodule/
+  越界路径一律拒绝；快照内容恰是 tree 内容，不多、不少、不被解释
+- None 显式拒绝补齐：checkup 锁内终检与 Host replay_health 消费端不再走
+  truthiness——git index 损坏（dirty=None）不是「干净」；_git_out 捕获 OSError
+- ledger_dirty 前缀归一化（-z + repo 相对路径）：嵌套包的包根 indexes/ 正确豁免
+- 锁身份跨 worktree 稳定：哈希「git common dir 实路径 + 包 repo 相对路径」
+- settle 无覆盖发布：临时 inode + fsync + os.link 落名、撞号顺移、目录 fsync
+  ——零字节 C-xxxx.yaml 不再可见，绝不截断他人内容
+- oscapipe __version__ 从包 metadata 派生（0.2.0），加一致性测试
+
 ## [Unreleased]
 - 发布 OSCA 开放规范白皮书 v1.0：以 OSCA 为核心、Oscaware 为参考实现，覆盖 O/S/C/A/J、
   双平面 Runtime、判断飞轮、采用路径、兼容与证据边界；历史 v0.1 扩展稿留档
