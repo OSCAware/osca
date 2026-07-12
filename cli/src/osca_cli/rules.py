@@ -553,8 +553,9 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
         if isinstance(meta, dict):
             need(f, "author", "trust", where=meta, prefix="meta.")
             for key in ("confirmed", "overruled"):
-                if type(meta.get(key)) is not int:  # bool 是 int 子类——true/false 混进计数会污染 trust 与 kill switch
-                    findings.append(_err("OSCA040", f.relpath, f"meta.{key} 必须是整数计数（布尔值不算）"))
+                # bool 是 int 子类、负数会污染 kill switch 比值——都不是合法计数
+                if type(meta.get(key)) is not int or meta.get(key) < 0:
+                    findings.append(_err("OSCA040", f.relpath, f"meta.{key} 必须是非负整数计数（布尔/负数不算）"))
         elif meta is not None:
             bad_shape(f, "meta", meta, "mapping（机器管账的计数与 trust）")
         replay = f.mapping.get("replay")

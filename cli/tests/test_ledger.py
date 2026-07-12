@@ -58,3 +58,58 @@ def test_ledger_lock_serializes_critical_section(tmp_path):
         list(pool.map(critical, range(8)))
     assert all(log[i] == log[i + 1] for i in range(0, len(log), 2))
     assert not (tmp_path / "indexes" / ".ledger.lock").is_dir()  # 锁文件是文件不是目录
+
+
+def _git(root, *args):
+    import subprocess
+
+    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+
+def test_lock_lives_in_git_common_dir(tmp_path):
+    """锁住 git common dir（按包路径哈希）——不随缓存目录删除重建产生第二个 inode。"""
+    _git(tmp_path, "init", "-q")
+    with ledger_lock(tmp_path):
+        pass
+    assert not (tmp_path / "indexes" / ".ledger.lock").exists()
+    assert list((tmp_path / ".git").glob("osca-ledger-*.lock"))
+
+
+def test_lock_refuses_symlinked_lock_file(tmp_path):
+    """非 git 退回路径上的锁文件被预置成符号链接 → O_NOFOLLOW 报错，不截断链接目标。"""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("不许动的数据", encoding="utf-8")
+    (tmp_path / "indexes").mkdir()
+    (tmp_path / "indexes" / ".ledger.lock").symlink_to(victim)
+    with pytest.raises(OSError):
+        with ledger_lock(tmp_path):
+            pass
+    assert victim.read_text(encoding="utf-8") == "不许动的数据"
+
+
+def test_ledger_dirty_sees_ignored_and_inner_indexes(tmp_path):
+    """脏区三漏（十一轮）：gitignored 的判断、内层 indexes/ 都算脏；仅包根 indexes/ 豁免。"""
+    from osca_cli.ledger import ledger_dirty
+
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "测试")
+    (tmp_path / ".gitignore").write_text("indexes/\njudgments/J-0005.yaml\n", encoding="utf-8")
+    (tmp_path / "judgments").mkdir()
+    (tmp_path / "a.txt").write_text("1", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "1")
+    assert ledger_dirty(tmp_path) == []  # 干净
+
+    (tmp_path / "indexes").mkdir()
+    (tmp_path / "indexes" / "cache.json").write_text("{}", encoding="utf-8")
+    assert ledger_dirty(tmp_path) == []  # 包根缓存豁免
+
+    (tmp_path / "judgments" / "J-0005.yaml").write_text("judgment_id: J-0005\n", encoding="utf-8")
+    dirty = ledger_dirty(tmp_path)
+    assert dirty and any("J-0005" in line for line in dirty)  # gitignored 判断也算脏——loader 会读它
+    (tmp_path / "judgments" / "J-0005.yaml").unlink()
+
+    (tmp_path / "judgments" / "indexes").mkdir()
+    (tmp_path / "judgments" / "indexes" / "x.yaml").write_text("x: 1", encoding="utf-8")
+    assert ledger_dirty(tmp_path)  # 内层 indexes/ 不豁免——loader 读 judgments/**/*.yaml

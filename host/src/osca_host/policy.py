@@ -222,14 +222,26 @@ class PolicyInterceptor:
                 self._warn_once(condition, UNEVALUABLE)
                 continue
             try:
-                threshold = Decimal((ratio or replay).group(1))  # 十进制精确算术——二进制浮点会翻转严格 > 判定
-            except ArithmeticError:  # 正则容忍 "." 这类伪数字——按不可求值处理，绝不许炸装载
+                # 阈值转精确整数比（Decimal 只作解析；乘法走纯整数——默认 28 位上下文的
+                # Decimal 乘法仍会舍入，30 个 9 的阈值会被舍成 1 而翻转严格 > 判定）
+                t_num, t_den = Decimal((ratio or replay).group(1)).as_integer_ratio()
+            except (ArithmeticError, ValueError):  # 正则容忍 "." 这类伪数字——按不可求值处理，绝不许炸装载
                 self._warn_once(condition, "阈值不可解析，不生效（" + UNEVALUABLE.split("（", 1)[1])
                 continue
 
             if ratio is not None:
                 confirmed, overruled = stats.get("confirmed", 0), stats.get("overruled", 0)
-                if confirmed > 0 and Decimal(overruled) > threshold * Decimal(confirmed):
+                if confirmed <= 0:
+                    if overruled > 0:
+                        # 有推翻却零确认：比值分母缺失不是健康——保守停机（fail-closed）
+                        reason = f"kill switch 触发：overruled={overruled} 而 confirmed=0（分母缺失，保守停机）"
+                        self._record("deny", "kill_switch", condition, reason)
+                        return "tripped", reason
+                    gaps = True  # 0/0：计数不可判——unavailable，保留既有状态（不解除已触发的红灯）
+                    self._warn_once(condition, "overruled/confirmed = 0/0——计数不可判，条件无法求值（保留既有状态）")
+                    continue
+                # 纯整数交叉相乘：overruled/confirmed > num/den ⇔ overruled*den > num*confirmed
+                if overruled * t_den > t_num * confirmed:
                     reason = f"kill switch 触发：overruled/confirmed = {overruled}/{confirmed} > {ratio.group(1)}"
                     self._record("deny", "kill_switch", condition, reason)
                     return "tripped", reason
@@ -245,9 +257,9 @@ class PolicyInterceptor:
                     "回放健康档案缺失、契约不符或与账本版本不符（indexes/replay-health.json）——条件无法求值",
                 )
                 continue
-            # 整数 × Decimal 交叉相乘，全程精确：red/(green+red) > X%  ⇔  red*100 > X*(green+red)
-            # （四位小数派生 red_rate 会舍入翻转判定；二进制浮点阈值同样会——18.4*375 == 6899.999…）
-            if Decimal(red) * 100 > threshold * Decimal(green + red):
+            # 纯整数交叉相乘，全程无舍入：red/(green+red) > (num/den)%  ⇔  red*100*den > num*(green+red)
+            # （四位小数派生 red_rate、二进制浮点阈值、28 位 Decimal 上下文乘法都会翻转严格 > 判定）
+            if red * 100 * t_den > t_num * (green + red):
                 stamp = stats.get("replay_at") or "时间未知"
                 reason = f"kill switch 触发：回放红灯率 {red}/{green + red} > {replay.group(1)}%（健康档案 {stamp}）"
                 self._record("deny", "kill_switch", condition, reason)
@@ -285,7 +297,15 @@ class PolicyInterceptor:
     # ── 工具白名单（默认拒绝） ─────────────────────────────────────────
 
     def authorize_tool(self, step: str | None, tool: str, episode_id: str | None = None) -> tuple[bool, str]:
-        """step=None 表示运行时内部调用（precondition/watch 轮询），不走模型白名单。"""
+        """step=None 表示运行时内部调用（precondition/watch 轮询），不走模型白名单。
+
+        整个决策（revoke/kill 读取 + 预算预留）在授权锁内——与 revoke()/kill 发布
+        同一线性化边界（Review 十一轮：锁外读取会在 revoke 返回后仍放行）。
+        """
+        with self._gate:
+            return self._authorize_tool_locked(step, tool, episode_id)
+
+    def _authorize_tool_locked(self, step: str | None, tool: str, episode_id: str | None) -> tuple[bool, str]:
         if self.revoked:
             return self._deny(step, tool, f"包已停：{self.revoked}")
         if self.kill_tripped:
@@ -331,15 +351,20 @@ class PolicyInterceptor:
         止损顶（charge_tokens）管的是「超顶那次调用已发生」；预检管的是「额度为零/
         已用尽时连第一次调用都不许发生」——「额度撤销、任何调用即拒」由此才成立。
         """
-        used = self._tokens.get(episode_id, 0)
-        if self.max_tokens is not None and used >= self.max_tokens:
-            return self._deny(
-                None, episode_id, f"预算硬顶：tokens 额度已尽（{used}/{self.max_tokens}），拒绝发起 LLM 调用"
-            )
-        return True, "tokens 额度预检通过"
+        with self._gate:
+            used = self._tokens.get(episode_id, 0)
+            if self.max_tokens is not None and used >= self.max_tokens:
+                return self._deny(
+                    None, episode_id, f"预算硬顶：tokens 额度已尽（{used}/{self.max_tokens}），拒绝发起 LLM 调用"
+                )
+            return True, "tokens 额度预检通过"
 
     def charge_tokens(self, episode_id: str, tokens: int) -> tuple[bool, str]:
         """LLM 用量记账（网关调用后回报）。超顶即拒——止损顶：超顶那次调用已发生，剧集就地停。"""
+        with self._gate:
+            return self._charge_tokens_locked(episode_id, tokens)
+
+    def _charge_tokens_locked(self, episode_id: str, tokens: int) -> tuple[bool, str]:
         used = self._tokens.get(episode_id, 0) + tokens
         self._tokens[episode_id] = used
         if self.max_tokens is not None and used > self.max_tokens:
@@ -357,6 +382,10 @@ class PolicyInterceptor:
     # ── 审批门（授予一次用一次；授予入口是控制通道，M4 换审批卡界面） ──
 
     def require_approval(self, action: str) -> tuple[bool, str]:
+        with self._gate:  # 一次性 token 的消费与授予跨线程（控制通道 vs 剧集线程）——同一边界
+            return self._require_approval_locked(action)
+
+    def _require_approval_locked(self, action: str) -> tuple[bool, str]:
         if self._approvals_broken:
             return self._deny(None, action, "approvals 配置非法——审批门一律拒绝（fail-closed），修好 policy 再放行")
         approver = self.approvals.get(action)
@@ -380,6 +409,10 @@ class PolicyInterceptor:
         return self.require_approval(interface_ref)
 
     def grant_approval(self, action: str) -> tuple[bool, str]:
+        with self._gate:
+            return self._grant_approval_locked(action)
+
+    def _grant_approval_locked(self, action: str) -> tuple[bool, str]:
         if self._approvals_broken:
             # 配置损坏时授予必须失败——授出一个 require 永远拒绝的 token 是控制面撒谎
             return False, "approvals 配置非法——授予拒绝（fail-closed），修好 policy 再来"
@@ -460,8 +493,9 @@ def ledger_stats(pack) -> dict:
         meta = f.mapping.get("meta")
         if not isinstance(meta, dict):
             continue  # 形状缺陷由 lint 挡；统计自身对任意形状保持总函数
-        confirmed += meta.get("confirmed") if type(meta.get("confirmed")) is int else 0  # bool 是 int 子类，不算数
-        overruled += meta.get("overruled") if type(meta.get("overruled")) is int else 0
+        c, o = meta.get("confirmed"), meta.get("overruled")
+        confirmed += c if type(c) is int and c >= 0 else 0  # bool 是 int 子类、负数污染比值——都不算数
+        overruled += o if type(o) is int and o >= 0 else 0
     return {"confirmed": confirmed, "overruled": overruled, **replay_health(pack.root)}
 
 
@@ -516,7 +550,11 @@ def replay_health(root: Path | str) -> dict:
         return absent  # 逐项灯色与顶层计数不对账——档案不可信
     decidable = counts["green"] + counts["red"]
     rate = data.get("red_rate")
-    if isinstance(rate, bool) or not isinstance(rate, int | float) or not math.isfinite(rate):
+    if isinstance(rate, bool) or not isinstance(rate, int | float):
+        return absent
+    if isinstance(rate, float) and not math.isfinite(rate):
+        return absent
+    if not 0 <= rate <= 1:  # 先做纯数值范围检查——数百位的 JSON 大整数进 math.isfinite/float() 会 OverflowError
         return absent
     expected = round(counts["red"] / decidable, 4) if decidable else 0.0
     if abs(float(rate) - expected) > 1e-9:

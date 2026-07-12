@@ -4,6 +4,6 @@ package_id: demo-group-oper-diagnosis
 name: 示例集团经营诊断
 entry: AGENT.md
 requires:
-  runtime: ">=0.1"              # 参考实现 osca-host 当前 0.1.x；loader 装载时校验，不满足即拒
+  runtime: ">=0.1"              # 参考实现 osca-host 当前 0.2.x；loader 装载时校验，不满足即拒
   bindings: [FINANCE_DB]        # loader 装载时与部署环境比对,缺失即报错
 integrity: indexes/checksums.txt # osca pack 时生成;交付件可对包签名

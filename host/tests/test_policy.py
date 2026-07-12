@@ -451,3 +451,62 @@ def test_llm_permit_leaves_audit_trace():
     ok, _ = p.authorize_llm("EP-1")
     assert ok
     assert any("LLM 调用授权" in a["reason"] and a["decision"] == "allow" for a in p.audit)
+
+
+def test_ratio_zero_denominator_three_state():
+    """比值条件的零分母（十一轮）：0/0 不可判不解除既有红灯；有推翻零确认保守停机。"""
+    p = make(stats={"confirmed": 1, "overruled": 1})  # 1/1 > 0.3 → 触发
+    assert p.kill_tripped
+    p.refresh_kill_switch({"confirmed": 0, "overruled": 0})  # 刷成 0/0——可用性缺口不洗红灯
+    assert p.kill_tripped
+    p2 = make(stats={"confirmed": 0, "overruled": 1})  # 有推翻却零确认 → fail-closed
+    assert p2.kill_tripped and "分母缺失" in p2.kill_reason
+    p3 = make(stats={"confirmed": 0, "overruled": 0})  # 初始 0/0 → 未触发 + 警告留痕
+    assert not p3.kill_tripped
+    assert any("0/0" in a["reason"] for a in p3.audit)
+
+
+def test_threshold_no_decimal_context_rounding():
+    """29 个 9 的阈值：28 位 Decimal 上下文乘法会舍成 1 而漏触发——纯整数交叉相乘不舍入。"""
+    nines = "0." + "9" * 29
+    p = make(
+        policy={**POLICY, "kill_switch": [{"when": f"overruled/confirmed > {nines}"}]},
+        stats={"confirmed": 1, "overruled": 1},
+    )
+    assert p.kill_tripped  # 1/1 = 1 > 0.99…9
+
+
+def test_tool_budget_reservation_is_atomic():
+    """预算预留在授权锁内：并发工具授权不超发（十一轮：锁外 read-modify-write 会超发）。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    p = make(policy={**POLICY, "budgets": {"per_episode": {"max_tool_calls": 5}}})
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        grants = list(
+            pool.map(lambda _: p.authorize_tool("取数", "CON-001.拉取费用明细", episode_id="EP-1")[0], range(32))
+        )
+    assert sum(grants) == 5
+
+
+def test_replay_health_huge_int_rate_degrades_not_crashes(tmp_path):
+    """数百位 JSON 大整数 red_rate：读取器退化不崩（math.isfinite/float() 会 OverflowError）。"""
+    import json
+
+    from osca_host.policy import replay_health
+
+    health = tmp_path / "indexes" / "replay-health.json"
+    health.parent.mkdir()
+    doc = {
+        "generated_by": "oscapipe checkup",
+        "at": "t",
+        "model": "m",
+        "ledger_tree": "a" * 40,
+        "total": 1,
+        "green": 1,
+        "red": 0,
+        "error": 0,
+        "red_rate": 10**400,
+        "judgments": {"J-1": {"light": "green", "assertions": 1}},
+    }
+    health.write_text(json.dumps(doc), encoding="utf-8")
+    assert replay_health(tmp_path)["replay_green"] is None  # 不炸、不采信
