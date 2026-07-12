@@ -921,6 +921,9 @@ async def test_real_different_uid_kernel_probe(sock_path):
         "\nwhile not b.endswith(b'\\n'):\n c=s.recv(65536); b+=c\n"
         "print(b.decode())"
     )
+    # root 集成任务常把 pytest 装在 0700 临时 venv；降权子进程无法执行其中的
+    # sys.executable。探针本身只用标准库，优先走所有 UID 可执行的系统 Python。
+    probe_python = "/usr/bin/python3" if Path("/usr/bin/python3").is_file() else sys.executable
 
     def probe(uid: int, probe_token: str) -> dict:
         def demote():
@@ -929,7 +932,7 @@ async def test_real_different_uid_kernel_probe(sock_path):
             os.setuid(uid)
 
         completed = subprocess.run(
-            [sys.executable, "-c", code, str(sock_path), probe_token],
+            [probe_python, "-c", code, str(sock_path), probe_token],
             capture_output=True,
             text=True,
             timeout=5,
