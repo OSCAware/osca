@@ -549,3 +549,34 @@ def test_replay_health_broken_git_index_is_unavailable(tmp_path):
 
     (tmp_path / ".git" / "index").write_bytes(b"garbage-not-an-index")
     assert replay_health(tmp_path)["replay_green"] is None  # 不可判定 ≠ 干净
+
+
+def test_replay_health_stamp_dirty_stamp_race_rejected(tmp_path, monkeypatch):
+    """stamp→dirty→stamp 三明治：dirty 检查期间 HEAD 原子前进到干净 tree B——A 的旧档案不得蒙混。"""
+    import json
+
+    import osca_host.policy as policy_mod
+
+    doc = {
+        "generated_by": "oscapipe checkup",
+        "at": "2026-07-12T10:00:00",
+        "model": "mock",
+        "ledger_tree": "a" * 40,
+        "total": 1,
+        "green": 1,
+        "red": 0,
+        "error": 0,
+        "red_rate": 0.0,
+        "judgments": {"J-1": {"light": "green", "assertions": 1}},
+    }
+    health = tmp_path / "indexes" / "replay-health.json"
+    health.parent.mkdir()
+    health.write_text(json.dumps(doc), encoding="utf-8")
+
+    stamps = iter(["a" * 40, "b" * 40])  # 第一次读到 A，dirty 后已是 B
+    monkeypatch.setattr(policy_mod, "ledger_stamp", lambda root: next(stamps))
+    monkeypatch.setattr(policy_mod, "ledger_dirty", lambda root: [])
+    assert policy_mod.replay_health(tmp_path)["replay_green"] is None  # 两次戳不一致 → 拒信
+
+    monkeypatch.setattr(policy_mod, "ledger_stamp", lambda root: "a" * 40)
+    assert policy_mod.replay_health(tmp_path)["replay_green"] == 1  # 稳定一致才采信

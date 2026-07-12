@@ -110,3 +110,15 @@ def test_settle_no_overwrite_on_number_collision(loaded, proxy):
     assert "对手的完整内容" in rival.read_text(encoding="utf-8")  # 原文件原样
     published = yaml.safe_load((loaded.root / "cases" / "C-0104.yaml").read_text(encoding="utf-8"))
     assert published["case_id"] == "C-0104"  # 内容里的编号与文件名一致（重试后重写）
+
+
+def test_settle_refuses_symlinked_cases_dir(loaded, proxy, tmp_path):
+    """cases/ 被换成外部目录链接 → 拒绝写入，包外零文件（十三轮：无覆盖 link 保完整不保在账本内）。"""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    cases = loaded.root / "cases"
+    shutil.rmtree(cases)
+    cases.symlink_to(outside)
+    with pytest.raises(OSError):
+        settle_episode(loaded, proxy, _episode({"OBJ-009": OBJECTIVE}))
+    assert list(outside.iterdir()) == []

@@ -155,3 +155,51 @@ def test_lock_shared_across_linked_worktrees(tmp_path):
     subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(wt)], check=True, capture_output=True)
 
     assert _lock_path(main) == _lock_path(wt)  # 两个 checkout，同一把锁
+
+
+def test_open_ledger_dir_refuses_symlink(tmp_path):
+    """发布目录是符号链接（dirty 豁免包根缓存目录，链接可通过全部版本检查）→ 拒绝，包外零写入。"""
+    from osca_cli.ledger import open_ledger_dir
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "pack"
+    root.mkdir()
+    (root / "indexes").symlink_to(outside)
+    with pytest.raises(OSError):
+        with open_ledger_dir(root, "indexes"):
+            pass
+    assert list(outside.iterdir()) == []
+
+
+def test_publish_file_in_dir_protocol(tmp_path):
+    """dir_fd 发布协议：无覆盖 link 占用返回 False；覆盖 replace 生效；临时件不残留。"""
+    from osca_cli.ledger import open_ledger_dir, publish_file_in_dir
+
+    with open_ledger_dir(tmp_path, "cases") as dfd:
+        assert publish_file_in_dir(dfd, "C-0001.yaml", b"first", overwrite=False)
+        assert not publish_file_in_dir(dfd, "C-0001.yaml", b"rival", overwrite=False)  # 无覆盖
+        assert (tmp_path / "cases" / "C-0001.yaml").read_bytes() == b"first"
+        assert publish_file_in_dir(dfd, "C-0001.yaml", b"newer", overwrite=True)  # 覆盖模式
+        assert (tmp_path / "cases" / "C-0001.yaml").read_bytes() == b"newer"
+    assert not list((tmp_path / "cases").glob(".*.tmp"))
+
+
+def test_rename_within_root_indexes_stays_clean(tmp_path):
+    """-z rename 成对消费：根缓存内部 rename 不误报脏（第二段曾被切头三字符误判）。"""
+    from osca_cli.ledger import ledger_dirty
+
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "测试")
+    pkg = tmp_path / "pkg"
+    (pkg / "indexes").mkdir(parents=True)
+    (pkg / "indexes" / "a.json").write_text("{}", encoding="utf-8")
+    (pkg / "x.txt").write_text("1", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "1")
+    _git(tmp_path, "mv", "pkg/indexes/a.json", "pkg/indexes/b.json")
+    assert ledger_dirty(pkg) == []  # 缓存内部 rename——两段都在豁免区
+
+    _git(tmp_path, "mv", "pkg/indexes/b.json", "pkg/escaped.json")
+    assert ledger_dirty(pkg)  # rename 出缓存区——任一段出界即脏

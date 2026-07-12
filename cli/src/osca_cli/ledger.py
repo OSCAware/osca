@@ -20,6 +20,7 @@ import hashlib
 import os
 import re
 import subprocess
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -89,16 +90,29 @@ def ledger_dirty(root: Path | str) -> list[str] | None:
     porcelain = _git_out(root, "status", "--porcelain", "--ignored=matching", "-z", "--", ".")
     if porcelain is None:
         return None
-    entries = []
-    for record in porcelain.split("\0"):
-        if not record.strip():
-            continue
-        path = record[3:] if len(record) > 3 else record  # rename 的 from 段无状态前缀——照算脏（保守）
+
+    def exempt(path: str) -> bool:
         rel = path[len(prefix) :] if prefix and path.startswith(prefix) else path
         if rel == "indexes" or rel.startswith("indexes/"):
-            continue  # 仅包根缓存目录豁免（嵌套包的 pkg/indexes/ 归一化后同样豁免）
-        if rel.rsplit("/", 1)[-1] in JUNK_NAMES:
+            return True  # 仅包根缓存目录豁免（嵌套包的 pkg/indexes/ 归一化后同样豁免）
+        return rel.rsplit("/", 1)[-1] in JUNK_NAMES
+
+    entries = []
+    records = porcelain.split("\0")
+    i = 0
+    while i < len(records):
+        record = records[i]
+        i += 1
+        if not record.strip():
             continue
+        paths = [record[3:] if len(record) > 3 else record]
+        # porcelain -z 协议：rename/copy 的**原路径**跟在下一个 NUL 段、无状态前缀——必须成对消费，
+        # 否则第二段被切头三个字符、当成新记录误判（根缓存内部 rename 曾被误报脏）
+        if len(record) > 3 and (record[0] in "RC" or record[1] in "RC") and i < len(records) and records[i]:
+            paths.append(records[i])
+            i += 1
+        if all(exempt(p) for p in paths):
+            continue  # 两段都在豁免区（如缓存内部 rename）才豁免；任一段出界即脏
         entries.append(record)
     return entries
 
@@ -143,6 +157,53 @@ def _lock_path(root: Path) -> Path:
         raise OSError(f"{lock_dir} 是符号链接——拒绝在链接目录建账本锁")
     lock_dir.mkdir(exist_ok=True)
     return lock_dir / ".ledger.lock"
+
+
+@contextmanager
+def open_ledger_dir(root: Path, name: str):
+    """安全打开包内发布目录（cases/、indexes/）——发布路径不许逃出包根（Review 十三轮）。
+
+    lstat 明确拒绝符号链接（ledger_dirty 豁免包根缓存目录，链接可借此通过全部版本检查）；
+    O_DIRECTORY|O_NOFOLLOW 打开拿 dir_fd——之后的创建/link/rename/fsync 全部基于该 fd，
+    检查后目录项被替换也只作用于已持有的真实目录 inode。
+    """
+    path = root / name
+    if path.is_symlink():
+        raise OSError(f"{path} 是符号链接——发布目录必须是包内真实目录，拒绝写入")
+    path.mkdir(exist_ok=True)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def publish_file_in_dir(dir_fd: int, filename: str, data: bytes, *, overwrite: bool) -> bool:
+    """在已安全打开的目录 fd 内原子发布文件：唯一临时名（O_EXCL、不跟随链接）→ 写满 +
+    fsync → link（无覆盖，占用返回 False 由调用方顺移）或 replace（覆盖）→ 目录 fsync。
+    临时文件无论成败都清理。"""
+    tmp_name = f".{filename}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+    fd = os.open(tmp_name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o644, dir_fd=dir_fd)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if overwrite:
+            os.replace(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        else:
+            try:
+                os.link(tmp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except FileExistsError:
+                return False
+        os.fsync(dir_fd)  # link/rename 的目录项耐久
+        return True
+    finally:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass  # replace 已把临时名挪走
 
 
 @contextmanager

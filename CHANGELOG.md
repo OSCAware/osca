@@ -202,6 +202,18 @@
   ——零字节 C-xxxx.yaml 不再可见，绝不截断他人内容
 - oscapipe __version__ 从包 metadata 派生（0.2.0），加一致性测试
 
+## [Review 复核 · 十三轮] - 2026-07-12
+- 安全目录发布助手（osca_cli.ledger）：`open_ledger_dir`（lstat 拒符号链接 +
+  O_DIRECTORY|O_NOFOLLOW 持目录 fd）+ `publish_file_in_dir`（唯一临时名 O_EXCL →
+  写满 fsync → link 无覆盖 / replace 覆盖 → 目录 fsync，全程 dir_fd）——
+  `indexes/`/`cases/` 被换成外部目录链接（dirty 豁免包根缓存曾使其通过全部版本
+  检查）也写不出包根；检查后目录项被替换只作用于已持有的真实 inode
+- settle 与 checkup 发布路径接入同一助手；settle 编号扫描改 dir_fd listdir
+- Host replay_health：stamp → dirty → stamp 三明治——dirty 检查期间 HEAD 原子
+  前进到干净 tree 的竞态窗口封堵（两次戳必须一致）
+- ledger_dirty：porcelain -z 的 rename/copy 双路径成对消费——根缓存内部 rename
+  不再误报脏（fail-closed 可用性问题），任一段出豁免区仍算脏
+
 ## [Unreleased]
 - 发布 OSCA 开放规范白皮书 v1.0：以 OSCA 为核心、Oscaware 为参考实现，覆盖 O/S/C/A/J、
   双平面 Runtime、判断飞轮、采用路径、兼容与证据边界；历史 v0.1 扩展稿留档

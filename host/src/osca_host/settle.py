@@ -16,12 +16,10 @@ from __future__ import annotations
 
 import os
 import re
-import tempfile
 from datetime import datetime
-from pathlib import Path
 
 import yaml
-from osca_cli.ledger import CASE_NUM, ledger_lock
+from osca_cli.ledger import CASE_NUM, ledger_lock, open_ledger_dir, publish_file_in_dir
 
 from osca_host.connector import ConnectorProxy
 from osca_host.episode import Episode
@@ -60,16 +58,14 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
             results.append({"object": object_id, "settled": False, "note": f"对账取数失败：{receipt.error}"})
             continue
 
-        # 入账本锁协议（Review 十一轮）：对账落账与 capture/confirm/checkup 终检互斥——
-        # 不在 checkup 锁内终检通过之后偷写工作区。发布协议（十二轮）：内容先写满
-        # 临时 inode 并 fsync，再以 os.link 无覆盖落名——最终文件名一旦出现即是完整
-        # 内容，外部读者看不到零字节 C-xxxx.yaml
-        with ledger_lock(loaded.root):
-            cases_dir = loaded.root / "cases"
-            cases_dir.mkdir(exist_ok=True)
-            taken = [int(m.group(1)) for p in cases_dir.glob("*.yaml") if (m := CASE_NUM.match(p.stem)) is not None]
+        # 入账本锁协议（Review 十一轮）+ 安全目录发布（十三轮）：目录经 lstat/O_NOFOLLOW
+        # 校验后以 dir_fd 全程操作——cases/ 被换成符号链接也写不出包根；内容写满临时
+        # inode + fsync 再 link 无覆盖落名，外部读者看不到零字节 C-xxxx.yaml
+        with ledger_lock(loaded.root), open_ledger_dir(loaded.root, "cases") as cases_fd:
+            names = os.listdir(cases_fd)
+            taken = [int(m.group(1)) for nm in names if nm.endswith(".yaml") and (m := CASE_NUM.match(nm[:-5]))]
             n = max(taken, default=0) + 1
-            case_id, path = f"C-{n:04d}", cases_dir / f"C-{n:04d}.yaml"
+            case_id = f"C-{n:04d}"
             case = {
                 "case_id": case_id,
                 "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -92,29 +88,19 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
             }
             while True:
                 case["case_id"] = case_id
-                fd, tmp_name = tempfile.mkstemp(dir=str(cases_dir), prefix=f".{case_id}.", suffix=".tmp")
-                tmp = Path(tmp_name)
-                try:
-                    os.fchmod(fd, 0o644)
-                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                        fh.write(yaml.safe_dump(case, allow_unicode=True, sort_keys=False))
-                        fh.flush()
-                        os.fsync(fh.fileno())
-                    try:
-                        os.link(tmp, path)  # 无覆盖发布：撞号即重试下一号，绝不截断他人内容
-                    except FileExistsError:
-                        n += 1
-                        case_id, path = f"C-{n:04d}", cases_dir / f"C-{n:04d}.yaml"
-                        continue
+                payload = yaml.safe_dump(case, allow_unicode=True, sort_keys=False).encode("utf-8")
+                if publish_file_in_dir(cases_fd, f"{case_id}.yaml", payload, overwrite=False):
                     break
-                finally:
-                    tmp.unlink(missing_ok=True)
-            dfd = os.open(str(cases_dir), os.O_RDONLY)
-            try:
-                os.fsync(dfd)  # link 的目录项耐久——崩溃后账本条目不失踪
-            finally:
-                os.close(dfd)
-        results.append({"object": object_id, "settled": True, "case": case_id, "path": str(path)})
+                n += 1  # 无覆盖发布：撞号顺移重试（编号随内容重写保持一致），绝不截断他人内容
+                case_id = f"C-{n:04d}"
+        results.append(
+            {
+                "object": object_id,
+                "settled": True,
+                "case": case_id,
+                "path": str(loaded.root / "cases" / f"{case_id}.yaml"),
+            }
+        )
 
     episode.settlements.extend(results)
     return results
