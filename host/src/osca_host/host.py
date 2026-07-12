@@ -28,7 +28,7 @@ from osca_cli.rules import run_all
 from osca_host import __version__
 from osca_host.authz import Authorizer, Principal, ensure_admin_token, load_principals
 from osca_host.connector import ConnectorProxy
-from osca_host.control import ControlServer, admin_token_path, principals_path
+from osca_host.control import ControlServer, admin_token_path, principals_path, secure_run_dir
 from osca_host.episode import Episode, assemble
 from osca_host.expr import parse_precondition
 from osca_host.gate import Gate
@@ -69,13 +69,20 @@ class Host:
         cmd = request["cmd"]
         if cmd not in ("status", "episodes", "episode"):  # 只读命令不刷屏；变更命令留操作者身份痕
             log.info(f"[control] {principal.name}（{principal.role}）→ {cmd}")
-        async with self._cmd_lock:
-            try:
-                return await self._dispatch(cmd, request)
-            except RegistryError as e:
-                return {"ok": False, "detail": str(e)}
+        try:
+            if cmd == "load":
+                # 重活（读盘/解压/lint）在锁外线程执行——慢 load 不许压住 status/stop（W0.1 P2）
+                spec = self.deployments.get(request["deployment_id"])
+                if spec is None:
+                    detail = f"未配置的部署 ID：{request['deployment_id']}（部署清单归 Host 侧管理）"
+                    return {"ok": False, "detail": detail}
+                return await self._load(spec)
+            async with self._cmd_lock:
+                return self._dispatch(cmd, request)
+        except RegistryError as e:
+            return {"ok": False, "detail": str(e)}
 
-    async def _dispatch(self, cmd: str, request: dict) -> dict:
+    def _dispatch(self, cmd: str, request: dict) -> dict:
         if cmd == "status":
             snapshot = self.registry.status()
             for pkg in snapshot["packages"]:
@@ -92,11 +99,6 @@ class Host:
             ok, detail = policy.grant_approval(request["action"])
             log.info(detail)
             return {"ok": ok, "detail": detail}
-        if cmd == "load":
-            spec = self.deployments.get(request["deployment_id"])
-            if spec is None:
-                return {"ok": False, "detail": f"未配置的部署 ID：{request['deployment_id']}（部署清单归 Host 侧管理）"}
-            return await self._load(spec)
         if cmd == "unload":
             return self._unload(request["package_id"])
         if cmd in ("enable", "disable"):
@@ -119,21 +121,31 @@ class Host:
     async def _load(self, spec: dict) -> dict:
         """装载一个部署条目：{path[, bindings, dest]}——路径只来自服务端部署清单。
 
-        装载核心（读盘/解压/lint/索引重建）是同步重活，进线程跑；注册段回到
-        事件循环单线程执行（与 deliver 回调天然互斥），全程持 _cmd_lock 串行。
+        重活（读盘/解压/lint/索引重建、binding 读取、git 戳探测）整段进线程，
+        **锁外**执行——慢 load 不许压住 status/stop；_cmd_lock 只罩短暂的发布段
+        （注册表 + 笼子 + 闸门 + 布防，纯状态变更，事件循环上原子）。
         """
-        result, loaded = await asyncio.to_thread(
-            load_for_host,
-            str(spec.get("path")),
-            dest=spec.get("dest"),
-            bindings=spec.get("bindings"),
-        )
+
+        def _build():
+            result, loaded = load_for_host(str(spec.get("path")), dest=spec.get("dest"), bindings=spec.get("bindings"))
+            pkg_bindings: dict = {}
+            replay_kill_unprovable = False
+            if loaded is not None:
+                # binding 按包隔离：本次注入只归本包——同名 binding 不跨包串线、卸载即清理
+                if spec.get("bindings"):
+                    pkg_bindings = yaml.safe_load(Path(str(spec["bindings"])).read_text(encoding="utf-8")) or {}
+                policy_file = loaded.pack.yaml_files.get("policy.yaml")
+                kill_entries = (policy_file.mapping.get("kill_switch") if policy_file else None) or []
+                has_replay_condition = any(
+                    isinstance(e, dict) and isinstance(e.get("when"), str) and REPLAY_RED.fullmatch(e["when"])
+                    for e in kill_entries
+                )
+                replay_kill_unprovable = has_replay_condition and ledger_stamp(loaded.root) is None
+            return result, loaded, pkg_bindings, replay_kill_unprovable
+
+        result, loaded, pkg_bindings, replay_kill_unprovable = await asyncio.to_thread(_build)
         if loaded is None:
             return {"ok": False, "detail": result.lines}
-        # binding 按包隔离：本次注入只归本包——同名 binding 不跨包串线、卸载即清理
-        pkg_bindings: dict = {}
-        if spec.get("bindings"):
-            pkg_bindings = yaml.safe_load(Path(str(spec["bindings"])).read_text(encoding="utf-8")) or {}
 
         # 先在局部构建全部运行时对象——任何一步失败都不触碰注册表（原子发布，杜绝半注册包）
         pid = loaded.package_id
@@ -150,46 +162,44 @@ class Host:
             log.error(detail)
             return {"ok": False, "detail": [*result.lines, detail]}
 
-        # 发布点：注册表 + 笼子 + 闸门一起可见
-        lines = result.lines + self.registry.register(loaded)
-        self.bindings[pid] = pkg_bindings
-        self.policies[pid] = policy
-        self.proxies[pid] = proxy
-        for aware_id, gate in gates.items():
-            self.gates[(pid, aware_id)] = gate
-        if policy.kill_tripped:
-            lines.append(f"⚠ {policy.kill_reason}——包已装载但唤醒与调用全部拒绝（三级停语义，公理 A10）")
-        # 部署契约提示（M4 前拍板）：zip 解压目录无 git 账本 → 回放红灯率条件永远 unavailable（默认不触发）
-        kill_entries = (policy_file.mapping.get("kill_switch") if policy_file else None) or []
-        has_replay_condition = any(
-            isinstance(e, dict) and isinstance(e.get("when"), str) and REPLAY_RED.fullmatch(e["when"])
-            for e in kill_entries
-        )
-        if has_replay_condition and ledger_stamp(loaded.root) is None:
-            lines.append(
-                "⚠ policy 声明了「回放红灯率」kill 条件，但包根不是 git 账本（zip 部署形态）——"
-                "该条件永远不可求值（unavailable 默认不触发）。生产账本建议以 git 目录部署并定期 checkup"
-            )
+        # 发布段进命令锁（短暂、纯状态变更）：注册表 + 笼子 + 闸门一起可见
+        async with self._cmd_lock:
+            lines = result.lines + self.registry.register(loaded)
+            self.bindings[pid] = pkg_bindings
+            self.policies[pid] = policy
+            self.proxies[pid] = proxy
+            for aware_id, gate in gates.items():
+                self.gates[(pid, aware_id)] = gate
+            if policy.kill_tripped:
+                lines.append(f"⚠ {policy.kill_reason}——包已装载但唤醒与调用全部拒绝（三级停语义，公理 A10）")
+            # 部署契约提示（M4 前拍板）：zip 解压目录无 git 账本 → 回放红灯率条件永远 unavailable（默认不触发）
+            if replay_kill_unprovable:
+                lines.append(
+                    "⚠ policy 声明了「回放红灯率」kill 条件，但包根不是 git 账本（zip 部署形态）——"
+                    "该条件永远不可求值（unavailable 默认不触发）。生产账本建议以 git 目录部署并定期 checkup"
+                )
 
-        # 布防：enabled 的 Aware 逐条触发原语进触发表；任一条失败即补偿回滚——不留半装载包
-        armed = 0
-        try:
-            for aware in loaded.awares:
-                if aware.enabled:
-                    for t in aware.triggers:
-                        self.table.subscribe(
-                            t.kind,
-                            t.spec,
-                            Subscription(pid, aware.aware_id, t.trigger_id, self._make_deliver(pid, aware.aware_id)),
-                        )
-                        armed += 1
-        except Exception as e:
-            self._unload(pid)  # 补偿回滚：撤已布防 watcher + 清笼子/闸门/binding + 注销
-            detail = f"✗ 布防失败：{e}——已补偿回滚（发布与布防同生共死），包未装载"
-            log.error(detail)
-            return {"ok": False, "detail": [*result.lines, detail]}
-        self._sync_slots(pid)
-        lines.append(f"触发表布防 {armed} 条（schedule/watch 挂 watcher，event 待人工发射）")
+            # 布防：enabled 的 Aware 逐条触发原语进触发表；任一条失败即补偿回滚——不留半装载包
+            armed = 0
+            try:
+                for aware in loaded.awares:
+                    if aware.enabled:
+                        for t in aware.triggers:
+                            self.table.subscribe(
+                                t.kind,
+                                t.spec,
+                                Subscription(
+                                    pid, aware.aware_id, t.trigger_id, self._make_deliver(pid, aware.aware_id)
+                                ),
+                            )
+                            armed += 1
+            except Exception as e:
+                self._unload(pid)  # 补偿回滚：撤已布防 watcher + 清笼子/闸门/binding + 注销
+                detail = f"✗ 布防失败：{e}——已补偿回滚（发布与布防同生共死），包未装载"
+                log.error(detail)
+                return {"ok": False, "detail": [*result.lines, detail]}
+            self._sync_slots(pid)
+            lines.append(f"触发表布防 {armed} 条（schedule/watch 挂 watcher，event 待人工发射）")
         for line in lines:
             log.info(line)
         return {"ok": True, "package_id": loaded.package_id, "detail": lines}
@@ -388,14 +398,14 @@ class Host:
     # ── 生命周期 ──────────────────────────────────────────────────────
 
     async def run(self, initial_packs: list[dict] | None = None) -> int:
-        # 安全内核先立：私有运行目录 → principal 签发面 → 传输（实例锁 + socket 0600）。
-        # 任一步配置非法都拒绝启动——权限面出不来，Host 就不该开门。
+        # 安全内核先立：私有运行目录（不跟随符号链接）→ principal 签发面 → 传输
+        # （实例锁 + socket 0600）。任一步配置非法都拒绝启动——权限面出不来，Host 不开门。
         try:
-            run_dir = self.control.socket_path.parent
-            run_dir.mkdir(parents=True, exist_ok=True)
-            os.chmod(run_dir, 0o700)
+            secure_run_dir(self.control.socket_path.parent)
             token_file = admin_token_path(self.control.socket_path)
-            self.authorizer.register(ensure_admin_token(token_file), Principal("local-admin", "host_admin"))
+            # admin token 绑定 Host 自己的 uid：生产模式下别的 uid 偷到也当不了 admin
+            admin = Principal("local-admin", "host_admin", os.getuid())
+            self.authorizer.register(ensure_admin_token(token_file), admin)
             issued = load_principals(principals_path(self.control.socket_path), self.authorizer)
             await self.control.start()
         except (OSError, ValueError) as e:
@@ -413,8 +423,10 @@ class Host:
 
         failed = 0
         for pack in initial_packs or []:
-            async with self._cmd_lock:  # 与控制命令同一串行纪律——socket 已开门
-                response = await self._load(pack)
+            try:
+                response = await self._load(pack)  # 锁纪律在 _load 内部（发布段短锁）
+            except RegistryError as e:
+                response = {"ok": False, "detail": [str(e)]}
             if not response["ok"]:
                 failed += 1
                 for line in response["detail"]:

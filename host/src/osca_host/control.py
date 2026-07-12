@@ -34,8 +34,29 @@ log = logging.getLogger("osca-host")
 
 DEFAULT_SOCKET = Path.home() / ".osca" / "host.sock"
 MAX_LINE = 64 * 1024
+MAX_RESPONSE = 8 * 1024 * 1024
 READ_TIMEOUT = 10.0
+WRITE_TIMEOUT = 10.0
 MAX_CONNECTIONS = 16
+
+
+def secure_run_dir(run_dir: Path) -> None:
+    """私有运行目录：不跟随符号链接地创建并收紧 0700（M4-W0.1 P1-2）。
+
+    mkdir/chmod 按路径操作都会跟随链接——运行目录被预置成指向外部目录的符号链接
+    时，socket/token/lock 会建到外面、外部目录权限还被改掉。这里 os.mkdir 不跟随、
+    O_NOFOLLOW 打开后对 fd fchmod/fstat：目录是链接即拒绝启动。
+    """
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(run_dir)
+    fd = os.open(run_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        if os.fstat(fd).st_uid != os.getuid():
+            raise OSError(f"运行目录属主不是当前用户——拒绝使用：{run_dir}")
+        os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
 
 
 def admin_token_path(socket_path: Path) -> Path:
@@ -75,6 +96,7 @@ class ControlServer:
         self.handler = handler
         self.authorizer = authorizer
         self.read_timeout = READ_TIMEOUT
+        self.write_timeout = WRITE_TIMEOUT
         self.max_connections = MAX_CONNECTIONS
         self._connections = 0
         self._server: asyncio.AbstractServer | None = None
@@ -82,9 +104,7 @@ class ControlServer:
         self._bound: tuple[int, int] | None = None  # 本实例创建的 socket inode（st_dev, st_ino）
 
     async def start(self) -> None:
-        run_dir = self.socket_path.parent
-        run_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(run_dir, 0o700)  # 私有运行目录：bind 与 chmod 之间的权限窗口也被目录挡住
+        secure_run_dir(self.socket_path.parent)  # 私有目录：bind 与 chmod 之间的权限窗口也被目录挡住
         lock_path = self.socket_path.with_name(self.socket_path.name + ".lock")
         self._lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
@@ -102,6 +122,15 @@ class ControlServer:
             st = os.lstat(self.socket_path)
             self._bound = (st.st_dev, st.st_ino)
         except BaseException:
+            # fail-closed：权限面没立起来就不许开门——bind 之后任一步失败都要关监听器、
+            # 删自己的 socket，再放实例锁；不留「无锁监听器」给后来的实例并存（W0.1 P1-3）
+            if self._server is not None:
+                self._server.close()
+                await self._server.wait_closed()
+                self._server = None
+                with contextlib.suppress(OSError):
+                    if stat.S_ISSOCK(os.lstat(self.socket_path).st_mode):
+                        self.socket_path.unlink()  # 持锁期间路径上的 socket 只能是自己刚 bind 的
             os.close(self._lock_fd)  # 锁文件保留：unlink 锁文件才是竞态（同 ledger 锁纪律）
             self._lock_fd = None
             raise
@@ -123,56 +152,73 @@ class ControlServer:
             self._lock_fd = None
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            response = await self._respond(reader, writer)
-            if response is not None:
-                writer.write(json.dumps(response, ensure_ascii=False).encode() + b"\n")
-                await writer.drain()
-        except Exception:
-            # 统一异常边界：命令实现/序列化的意外一律回一行 internal，不许空响应
-            log.exception("控制连接处理异常")
-            with contextlib.suppress(Exception):
-                fallback = _error("internal", "内部错误（见 Host 日志）")
-                writer.write(json.dumps(fallback, ensure_ascii=False).encode() + b"\n")
-                await writer.drain()
-        finally:
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
-
-    async def _respond(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> dict | None:
-        if self._connections >= self.max_connections:
-            return _error("busy", f"控制通道并发连接已达上限（{self.max_connections}）")
+        # 计数覆盖整个连接生命周期（含响应序列化与 drain）——不读响应的慢客户端
+        # 也占并发额度，不许积累成不受上限约束的阻塞任务（W0.1 P2）
+        over = self._connections >= self.max_connections
         self._connections += 1
         try:
-            uid = _peer_uid(writer.get_extra_info("socket"))
-            if uid is None or uid != os.getuid():
-                log.warning(f"控制连接对端 uid 校验失败（peer uid={uid}）——拒绝")
-                return _error("unauthorized", "对端凭据校验失败：控制通道只接受同用户的本机进程")
             try:
-                line = await asyncio.wait_for(reader.readline(), timeout=self.read_timeout)
-            except asyncio.TimeoutError:
-                return _error("bad_request", f"读取请求超时（{self.read_timeout}s 内未收到完整一行）")
-            except (ValueError, asyncio.LimitOverrunError):
-                return _error("bad_request", f"请求超长（单行上限 {MAX_LINE} 字节）")
-            if not line:
-                return None  # 对端未发一字节即断开
-            try:
-                request = json.loads(line)
-            except json.JSONDecodeError:
-                return _error("bad_request", "请求不是合法 JSON")
-            problem = validate_request(request)
-            if problem is not None:
-                return _error("bad_request", problem)
-            principal = self.authorizer.identify(request.get("token"))
-            if principal is None:
-                return _error("unauthorized", "token 缺失或不可识别——控制命令必须携带有效 principal token")
-            if not self.authorizer.authorize(principal, request["cmd"]):
-                log.warning(f"授权拒绝：{principal.name}（{principal.role}）→ {request['cmd']}")
-                return _error("forbidden", f"角色 {principal.role} 无权执行 {request['cmd']}")
-            return await self.handler(request, principal)
+                if over:
+                    response = _error("busy", f"控制通道并发连接已达上限（{self.max_connections}）")
+                else:
+                    response = await self._respond(reader, writer)
+                if response is not None:
+                    await self._write_response(writer, response)
+            except Exception:
+                # 统一异常边界：命令实现/序列化的意外一律回一行 internal，不许空响应
+                log.exception("控制连接处理异常")
+                with contextlib.suppress(Exception):
+                    await self._write_response(writer, _error("internal", "内部错误（见 Host 日志）"))
+            finally:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
         finally:
             self._connections -= 1
+
+    async def _write_response(self, writer: asyncio.StreamWriter, response: dict) -> None:
+        data = json.dumps(response, ensure_ascii=False).encode() + b"\n"
+        if len(data) > MAX_RESPONSE:
+            log.error(f"控制响应超出大小上限（{len(data)} > {MAX_RESPONSE} 字节）——已替换为错误响应")
+            oversize = _error("internal", "响应超出大小上限（见 Host 日志）")
+            data = json.dumps(oversize, ensure_ascii=False).encode() + b"\n"
+        writer.write(data)
+        await asyncio.wait_for(writer.drain(), timeout=self.write_timeout)  # 写超时：不给不收响应的对端挂住
+
+    async def _respond(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> dict | None:
+        uid = _peer_uid(writer.get_extra_info("socket"))
+        # 传输层允许名单：Host 同 uid + 生产模式 principals 声明的 uid；凭据取不到 fail-closed
+        if uid is None or (uid != os.getuid() and uid not in self.authorizer.peer_uids):
+            log.warning(f"控制连接对端 uid 校验失败（peer uid={uid}）——拒绝")
+            return _error("unauthorized", "对端凭据校验失败：对端 uid 不在控制通道允许名单")
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=self.read_timeout)
+        except asyncio.TimeoutError:
+            return _error("bad_request", f"读取请求超时（{self.read_timeout}s 内未收到完整一行）")
+        except (ValueError, asyncio.LimitOverrunError):
+            return _error("bad_request", f"请求超长（单行上限 {MAX_LINE} 字节）")
+        if not line:
+            return None  # 对端未发一字节即断开
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            return _error("bad_request", "请求不是合法 JSON")
+        problem = validate_request(request)
+        if problem is not None:
+            return _error("bad_request", problem)
+        principal = self.authorizer.identify(request.get("token"))
+        if principal is None:
+            return _error("unauthorized", "token 缺失或不可识别——控制命令必须携带有效 principal token")
+        # token 与对端 uid 双绑定：绑定了 uid 的 principal 只在自己的 uid 上有效；
+        # 开发模式条目（无 uid）只在 Host 同 uid 上有效——偷来的 token 换了进程身份即失效
+        required_uid = principal.uid if principal.uid is not None else os.getuid()
+        if uid != required_uid:
+            log.warning(f"token 与对端 uid 不符：principal {principal.name} 绑定 {required_uid}，对端 {uid}——拒绝")
+            return _error("unauthorized", "token 与对端进程身份不符——该 token 不属于这个 uid（疑似被窃）")
+        if not self.authorizer.authorize(principal, request["cmd"]):
+            log.warning(f"授权拒绝：{principal.name}（{principal.role}）→ {request['cmd']}")
+            return _error("forbidden", f"角色 {principal.role} 无权执行 {request['cmd']}")
+        return await self.handler(request, principal)
 
 
 def send_command(

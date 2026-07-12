@@ -46,31 +46,45 @@ uv run osca-host fire demo-group-oper-diagnosis AW-001/T3
 uv run osca-host episodes
 uv run osca-host episode EP-0001
 
-# 审批门：授予一次性放行——须 approver 角色 token（admin 不可伪造业务审批，见下）
-uv run osca-host --token-file /path/to/approver.token \
-  approve demo-group-oper-diagnosis 终稿发送管理层
+# 审批门：W3 审批 challenge 落地前经控制通道禁用（对全角色 forbidden）——
+# 旧 set[action] 授予没有 approver/episode/digest/expiry/nonce 绑定，不再暴露
+uv run osca-host approve demo-group-oper-diagnosis 终稿发送管理层  # → forbidden
 ```
 
-## 控制通道的权限面（M4-W0 安全内核）
+## 控制通道的权限面（M4-W0/W0.1 安全内核）
 
 控制通道是本机 unix socket（默认 `~/.osca/host.sock`，`--socket` 可改）：
-运行目录 0700、socket 0600、对端 uid 校验（只接受同用户本机进程）、实例
-flock（同一路径只有一个 Host，关闭只删自己创建的 inode）；协议 v1 带读超时、
-64 KiB 行上限、并发上限与统一错误响应。
+运行目录 0700 且不跟随符号链接（O_NOFOLLOW + fchmod，目录被换成外链即拒绝
+启动）、socket 0600、对端 uid 校验、实例 flock（同一路径只有一个 Host；启动
+中途失败即关监听器删 socket 再放锁，关闭只删自己创建的 inode）；协议 v1 带
+读/写超时、64 KiB 行上限、响应大小上限、并发上限与统一错误响应。
 
-进程级身份靠 token：Host 启动生成 admin token（`<socket>.token`，0600，
-CLI 默认自动读取）；其他 principal 由部署者在 `<socket>.principals.yaml`
-（0600，`[{name, role, token}]`）签发。角色能力矩阵（`osca_host.authz`）：
+**信任模型两档（诚实标注）：**
+- **开发模式**（principal 不带 uid）：全部进程同 OS uid——token 防误用与角色
+  越权，**不抵抗同 uid 进程失陷**（同 uid 天然读得到 token 文件与彼此内存）；
+- **生产模式**（principals 条目写 `uid`）：Host、运营台、专家端、审批适配器各用
+  独立 OS uid/容器；principal 绑定 `expected_uid + role + token 摘要`，传输层
+  允许名单 = Host uid + 各 principal 声明的 uid——偷来的 token 换了进程身份
+  一律失效，被攻陷的界面进程偷到 admin token 也当不了 admin。
+
+进程级身份靠 token：Host 启动生成 admin token（`<socket>.token`，0600，绑定
+Host 自身 uid，CLI 默认自动读取）；其他 principal 由部署者在
+`<socket>.principals.yaml`（0600，`[{name, role, token[, uid]}]`）签发。凭据
+文件以单 fd 读取（O_NOFOLLOW + fstat 验属主/权限/大小，无检查-读取窗口），
+权限过宽即拒绝启动；轮换 = 替换文件后重启（token 只在进程内存生效），在线
+撤销随 W3。角色能力矩阵（`osca_host.authz`，测试钉住）：
 
 | 角色 | 允许 | 明确禁止 |
 |---|---|---|
 | `host_admin` | status / load / unload / enable / disable / fire / episodes / episode / stop | 授予业务审批 |
-| `operator` | status / enable / disable / fire / episodes（摘要） | load、approve、完整 episode、stop |
-| `approver` | approve | 其余全部 |
+| `operator` | status / enable / disable / fire / episodes（摘要；脱敏 DTO 属 W2，当前与 admin 同构——勿授予不可信进程） | load、approve、完整 episode、stop |
+| `approver` | （空集：W3 审批 challenge——pending→approved\|denied→consumed、绑定 approver/episode/digest/expiry/nonce——落地前，旧 approve RPC 对全角色关闭） | 其余全部 |
 | `expert` | （M4-W1 专家端命令落地时归入） | 其余全部 |
 
 `load` 只收 `deployment_id`：包路径、bindings、解压目录一律由 Host 侧
-`--deployments` 清单解析，绝不从连接者透传（confused-deputy 面收口）。
+`--deployments` 清单解析（相对路径按清单文件所在目录解析），绝不从连接者
+透传（confused-deputy 面收口）；重活在事件循环外执行，慢 load 不阻塞
+status/stop。
 
 ## LLM 通道（剧集的 agent 步）
 

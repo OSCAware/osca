@@ -39,7 +39,9 @@ def test_role_caps_matrix_pinned():
     assert "approve" not in ROLE_CAPS["host_admin"]  # admin 不可伪造业务审批
     assert ROLE_CAPS["operator"] == {"status", "enable", "disable", "fire", "episodes"}
     assert "episode" not in ROLE_CAPS["operator"]  # 剧集摘要可看，全量导出不给
-    assert ROLE_CAPS["approver"] == {"approve"}
+    # W3 审批 challenge（pending→approved|denied→consumed，绑定 approver/episode/
+    # digest/expiry/nonce）落地前，旧 set[action] 授予不从控制通道暴露——approver 空集
+    assert ROLE_CAPS["approver"] == frozenset()
     assert ROLE_CAPS["expert"] == frozenset()  # M4-W1 专家端命令落地时显式归入
 
 
@@ -59,6 +61,21 @@ def test_authorizer_register_identify_authorize():
         az.register("c" * 16, Principal("坏", "root"))  # 未知角色
     with pytest.raises(ValueError):
         az.register("a" * 16, Principal("重", "operator"))  # token 重复（一 token 一 principal）
+    with pytest.raises(ValueError):
+        az.register(12345678901234567890, Principal("非字符串", "operator"))  # 不做 str() 静默转换
+    with pytest.raises(ValueError):
+        az.register("d" * 16, Principal("控制\x00字符", "operator"))  # name 拒控制字符
+
+
+def test_authorizer_uid_binding_registers_peer_allowlist():
+    """生产模式：principal 绑 uid → 进传输层允许名单；uid 验型拒 bool/负数/非整数。"""
+    az = Authorizer()
+    az.register("e" * 16, Principal("飞书Bot", "operator", 30001))
+    assert az.peer_uids == {30001}
+    assert az.identify("e" * 16).uid == 30001
+    for bad_uid in (True, -1, "30001"):
+        with pytest.raises(ValueError):
+            az.register("f" * 16, Principal("坏uid", "operator", bad_uid))
 
 
 def test_ensure_admin_token_creates_0600_and_reuses(tmp_path):
@@ -76,6 +93,17 @@ def test_ensure_admin_token_refuses_symlink(tmp_path):
     link.symlink_to(victim)
     with pytest.raises(OSError):
         ensure_admin_token(link)
+
+
+def test_ensure_admin_token_refuses_lax_permissions(tmp_path):
+    """已存在的 token 文件权限过宽（如 0644）→ 拒绝复用（凭据读取协议对 fd fstat 验证）。"""
+    path = tmp_path / "h.sock.token"
+    path.write_text("a" * 64 + "\n", encoding="utf-8")
+    os.chmod(path, 0o644)
+    with pytest.raises(OSError):
+        ensure_admin_token(path)
+    os.chmod(path, 0o600)
+    assert ensure_admin_token(path) == "a" * 64  # 收紧后照常复用
 
 
 def test_load_principals_validates(tmp_path):
@@ -104,3 +132,30 @@ def test_load_principals_validates(tmp_path):
     os.chmod(path, 0o600)
     with pytest.raises(ValueError):
         load_principals(path, Authorizer())
+
+
+def test_load_principals_uid_binding_and_strict_types(tmp_path):
+    """uid 条目进允许名单；token 非字符串不做 str() 静默转换，一律拒绝。"""
+    path = tmp_path / "p.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            [{"name": "飞书Bot", "role": "operator", "token": "bot-operator-token", "uid": 30001}],
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+    az = Authorizer()
+    assert load_principals(path, az) == 1
+    assert az.identify("bot-operator-token").uid == 30001
+    assert az.peer_uids == {30001}
+
+    for bad in (
+        [{"name": "整数token", "role": "operator", "token": 12345678901234567890}],
+        [{"name": "坏uid", "role": "operator", "token": "x" * 16, "uid": "30001"}],
+        [{"name": "多余键", "role": "operator", "token": "x" * 16, "extra": 1}],
+    ):
+        path.write_text(yaml.safe_dump(bad, allow_unicode=True), encoding="utf-8")
+        os.chmod(path, 0o600)
+        with pytest.raises(ValueError):
+            load_principals(path, Authorizer())

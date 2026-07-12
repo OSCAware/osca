@@ -3,7 +3,8 @@
 run 之外的子命令都是控制通道客户端：对运行中的 Host 发注册表操作。
 身份即 token（M4-W0）：默认读 Host 生成的 admin token（socket 旁 0600 文件）；
 非 admin 界面进程用 --token-file 带自己的 principal token——角色能力见
-osca_host.authz 的权限矩阵（admin 不可授予业务审批，approve 归 approver）。
+osca_host.authz 的权限矩阵（admin 不可授予业务审批；approve 在 W3 审批
+challenge 落地前对全角色关闭）。
 """
 
 from __future__ import annotations
@@ -65,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fire.add_argument("trigger_id", help="全局触发 ID，如 AW-001/T3")
 
     p_approve = sub.add_parser(
-        "approve", help="审批门：授予一次性放行——须 approver 角色 token（admin 不可伪造业务审批）"
+        "approve", help="审批门（W3 审批 challenge 落地前经控制通道禁用——旧 set[action] 授予不再暴露）"
     )
     p_approve.add_argument("package_id")
     p_approve.add_argument("action", help="policy.yaml approvals 里声明的动作名")
@@ -81,13 +82,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _load_deployments(path: str) -> dict[str, dict]:
+    """部署清单严格验型：ID 与路径都须非空字符串（限长、拒控制字符），不收其他键；
+    相对路径按**清单文件所在目录**解析（不随 Host 进程 cwd 漂移）。"""
+    from osca_host.authz import clean_text
+
+    base = Path(path).resolve().parent
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         raise ValueError("部署清单必须是 mapping：deployment_id → {path[, bindings, dest]}")
+    deployments: dict[str, dict] = {}
     for did, spec in data.items():
+        did = clean_text(did, f"部署 ID {did!r}", max_len=200)
         if not isinstance(spec, dict) or "path" not in spec or set(spec) - {"path", "bindings", "dest"}:
             raise ValueError(f"部署 {did} 须是 {{path[, bindings, dest]}}（path 必填，不收其他键）")
-    return data
+        clean: dict = {}
+        for key in ("path", "bindings", "dest"):
+            if spec.get(key) is None:
+                continue
+            value = Path(clean_text(spec[key], f"部署 {did} 的 {key}"))
+            clean[key] = str(value if value.is_absolute() else base / value)
+        deployments[did] = clean
+    return deployments
 
 
 def _client(request: dict, socket_path: Path, token_file: Path | None) -> int:

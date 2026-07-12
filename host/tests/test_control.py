@@ -200,21 +200,26 @@ async def test_w4_precondition_evaluated_through_proxy(running_host, sample_pack
     assert len(response["episodes"]) == 1
 
 
-async def test_w4_approval_gate_via_control(running_host, sample_pack, deploy):
+async def test_w4_approval_gate_closed_until_challenge(running_host, sample_pack, deploy):
+    """审批 RPC 在 W3 challenge 落地前对全角色关闭——旧 set[action] 授予不从控制通道可达。
+
+    M2 的审批门语义仍在（policy 内部授予接口，runner 消费）；W3 用持久化 challenge
+    （pending→approved|denied→consumed，绑定 approver/episode/digest/expiry/nonce）替换它。
+    """
     host = running_host
     await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
 
-    # 审批是业务裁决，归 approver 角色（admin 授予被矩阵禁止——见 test_control_security）
     approver = "approver-token-0001"
     host.authorizer.register(approver, Principal("审批卡", "approver"))
-    response = await _send({"cmd": "approve", "package_id": pid, "action": "终稿发送管理层"}, host, token=approver)
-    assert response["ok"]
+    for token in (None, approver):  # admin 与 approver 一视同仁：无绑定授予面不暴露
+        response = await _send({"cmd": "approve", "package_id": pid, "action": "终稿发送管理层"}, host, token=token)
+        assert not response["ok"] and response["error"] == "forbidden"
+
+    ok, _ = host.policies[pid].grant_approval("终稿发送管理层")  # M2 语义（内部接口）未动
+    assert ok
     response = await _send({"cmd": "status"}, host)
     assert response["packages"][0]["policy"]["approvals"]["终稿发送管理层"] == "granted"
-
-    response = await _send({"cmd": "approve", "package_id": pid, "action": "不存在的动作"}, host, token=approver)
-    assert not response["ok"]
 
 
 async def test_w4_precondition_blocks_without_bindings(running_host, sample_pack):

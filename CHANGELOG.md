@@ -249,6 +249,31 @@ Review M4 首轮（权限面）No-Go 四项 P1 + 协议加固收口；专家端/
   approver/episode/payload digest/expiry/nonce/幂等键）→ append-only 审计与
   shutdown draining
 
+## [M4-W0.1 · 安全内核复核收口] - 2026-07-12
+Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
+- 信任模型两档诚实标注：开发模式（principal 无 uid，同 uid 可信，token 只防
+  误用）/ 生产模式（principals 条目写 uid，principal 绑定 expected_uid + role +
+  token 摘要；传输允许名单 = Host uid + 各 principal uid）——偷来的 token 换了
+  进程身份即失效，被攻陷界面进程偷到 admin token 也当不了 admin
+- 运行目录锚定：mkdir/chmod 跟随链接的面收口——os.mkdir 不跟随 + O_NOFOLLOW
+  打开后对 fd fstat（属主校验）/fchmod；目录被换成外链即拒绝启动，外部目录
+  权限零改动、零写入
+- 启动 fail-closed 回滚：bind 后任一步失败 → 关监听器、删自己的 socket、再放
+  实例锁——不留「无锁监听器」与后来实例并存
+- 审批 RPC 暂闭：W3 challenge（pending→approved|denied→consumed，绑定
+  approver/episode/payload digest/expiry/nonce）落地前 ROLE_CAPS["approver"]
+  空集——旧 set[action] 无绑定授予面不从控制通道暴露；M2 语义留在 policy 内部
+  接口，W3 以 challenge 状态机替换后再接审批卡
+- 凭据读取协议：O_NOFOLLOW 打开 → 同一 fd fstat 验属主/普通文件/0600 以内/
+  限长 → 从该 fd 读——无检查-读取替换窗口；已存在 admin token 权限过宽拒绝
+  启动；轮换 = 换文件重启（诚实标注），在线撤销随 W3
+- 锁粒度：load 全部重活（读盘/解压/lint/binding 读取/git 戳探测）锁外线程执行，
+  _cmd_lock 只罩发布段——慢 load 不再压住 status/stop（回归钉住）
+- 连接计数覆盖完整连接生命周期（含响应序列化与 drain）+ 响应大小上限 + 写超时
+- 部署/principals 严格验型：字段须非空字符串（拒静默 str() 转换）、限长、拒
+  控制字符；部署清单相对路径按清单文件所在目录解析；operator 快照未脱敏的
+  现状在 README 诚实标注（脱敏 DTO 属 W2）
+
 ## [Unreleased]
 - 发布 OSCA 开放规范白皮书 v1.0：以 OSCA 为核心、Oscaware 为参考实现，覆盖 O/S/C/A/J、
   双平面 Runtime、判断飞轮、采用路径、兼容与证据边界；历史 v0.1 扩展稿留档
