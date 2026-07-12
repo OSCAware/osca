@@ -274,6 +274,24 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   控制字符；部署清单相对路径按清单文件所在目录解析；operator 快照未脱敏的
   现状在 README 诚实标注（脱敏 DTO 属 W2）
 
+## [M4-W0.2 · 防御性安全修复] - 2026-07-12
+- 显式双模式：开发 `0700/0600`；生产以 `--control-group` 验证专用 group 和既有
+  `0710` 运行目录、发布 `0660` socket。group 只提供内核可达性，peer UID、token、
+  expected_uid、role 继续逐层裁决；配置/权限错误 fail-closed，不自动降级
+- 运行目录从根逐级 `openat`/`dir_fd + O_DIRECTORY + O_NOFOLLOW` 打开，最终 fd
+  持有到完全关闭；token/principals/lock/清理均相对 fd。socket bind 前后复核父
+  inode；生产路径祖先必须由 root/Host UID 持有、不可被 group/other 改名且允许目标
+  group 遍历。启动失败和 shutdown 只删本实例保存的 socket inode
+- 生产 principals 只收 `token_sha256 + uid`，客户端明文由对应 UID 的 0600 文件
+  持有；凭据读取最多 `MAX+1`，principals YAML 错误归一化且不回显可能含 token 的行
+- Host 生命周期显式化为 `STARTING/RUNNING/DRAINING/STOPPED`；load 按 deployment
+  单飞并以 generation + package tombstone 线性化，stop/unload 胜过迟到发布，不同
+  deployment 仍并行，status 不被慢准备阻塞；shutdown 跟踪并清退控制连接，启动
+  阶段取消同样释放 runtime fd；取消判定保持 Python 3.10 兼容
+- 部署清单拒绝必填 path 缺失/null/空串/控制字符，显式 null 的可选路径字段同样拒绝；
+  deployments/principals 的 falsy 非容器顶层不再伪装成空配置，生产 principal 的 uid
+  必须是非负整数且不可为 null
+
 ## [Unreleased]
 - 发布 OSCA 开放规范白皮书 v1.0：以 OSCA 为核心、Oscaware 为参考实现，覆盖 O/S/C/A/J、
   双平面 Runtime、判断飞轮、采用路径、兼容与证据边界；历史 v0.1 扩展稿留档

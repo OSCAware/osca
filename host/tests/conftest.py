@@ -21,6 +21,7 @@ def sample_pack(tmp_path) -> Path:
 @pytest.fixture
 def sock_path():
     """unix socket 路径有 ~104 字符上限（macOS），tmp_path 太深，用 /tmp 短路径。"""
-    d = Path(tempfile.mkdtemp(prefix="oscah-", dir="/tmp"))
+    # macOS 的 /tmp 是系统符号链接；安全运行目录协议逐级 O_NOFOLLOW，测试使用真实锚点。
+    d = Path(tempfile.mkdtemp(prefix="oscah-", dir="/tmp")).resolve()
     yield d / "h.sock"
     shutil.rmtree(d, ignore_errors=True)

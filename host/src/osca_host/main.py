@@ -2,7 +2,7 @@
 
 run 之外的子命令都是控制通道客户端：对运行中的 Host 发注册表操作。
 身份即 token（M4-W0）：默认读 Host 生成的 admin token（socket 旁 0600 文件）；
-非 admin 界面进程用 --token-file 带自己的 principal token——角色能力见
+    非 admin 界面进程用 --token-file 带自己 UID 所有的 0600 principal token——角色能力见
 osca_host.authz 的权限矩阵（admin 不可授予业务审批；approve 在 W3 审批
 challenge 落地前对全角色关闭）。
 """
@@ -38,6 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="前台启动 Host（常驻进程；Ctrl-C / SIGTERM 干净关停）")
     p_run.add_argument(
         "--load", action="append", default=[], metavar="PACK", help="启动时装载的包（目录或 zip），可多次"
+    )
+    p_run.add_argument(
+        "--control-group",
+        help="生产模式专用 Unix group：运行目录 0710、socket 0660；省略即开发模式 0700/0600",
     )
     p_run.add_argument("--bindings", help="部署环境 bindings.yaml，装载时比对")
     p_run.add_argument(
@@ -87,7 +91,7 @@ def _load_deployments(path: str) -> dict[str, dict]:
     from osca_host.authz import clean_text
 
     base = Path(path).resolve().parent
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("部署清单必须是 mapping：deployment_id → {path[, bindings, dest]}")
     deployments: dict[str, dict] = {}
@@ -97,8 +101,10 @@ def _load_deployments(path: str) -> dict[str, dict]:
             raise ValueError(f"部署 {did} 须是 {{path[, bindings, dest]}}（path 必填，不收其他键）")
         clean: dict = {}
         for key in ("path", "bindings", "dest"):
-            if spec.get(key) is None:
+            if key not in spec:
                 continue
+            if spec[key] is None:
+                raise ValueError(f"部署 {did} 的 {key} 不接受 null；不使用可选字段时请省略")
             value = Path(clean_text(spec[key], f"部署 {did} 的 {key}"))
             clean[key] = str(value if value.is_absolute() else base / value)
         deployments[did] = clean
@@ -108,8 +114,10 @@ def _load_deployments(path: str) -> dict[str, dict]:
 def _client(request: dict, socket_path: Path, token_file: Path | None) -> int:
     token = None
     if token_file is not None:
+        from osca_host.authz import read_private_file
+
         try:
-            token = token_file.read_text(encoding="utf-8").strip()
+            token = read_private_file(token_file).strip()
         except OSError as e:
             print(f"读不到 token 文件：{e}")
             return EXIT_FAILURE
@@ -142,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"部署清单不可用：{e}")
                 return EXIT_FAILURE
         packs = [{"path": p, "bindings": args.bindings} for p in args.load]
-        return run_host(args.socket, packs, deployments)
+        return run_host(args.socket, packs, deployments, args.control_group)
 
     client = {
         "status": lambda: {"cmd": "status"},

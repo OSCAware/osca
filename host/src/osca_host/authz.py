@@ -117,6 +117,20 @@ class Authorizer:
         ):
             raise ValueError(f"principal {principal.name} 的 uid 须是非负整数")
         digest = hashlib.sha256(token.encode()).hexdigest()
+        self.register_digest(digest, principal)
+
+    def register_digest(self, digest: str, principal: Principal) -> None:
+        """注册部署者保存的 SHA-256 摘要，不要求 Host 接触客户端明文 token。"""
+        if principal.role not in ROLE_CAPS:
+            raise ValueError(f"未知角色：{principal.role}（可选：{'/'.join(sorted(ROLE_CAPS))}）")
+        clean_text(principal.name, f"principal 名（{principal.role}）", max_len=200)
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdefABCDEF" for c in digest):
+            raise ValueError(f"principal {principal.name} 的 token_sha256 须是 64 位十六进制摘要")
+        if principal.uid is not None and (
+            not isinstance(principal.uid, int) or isinstance(principal.uid, bool) or principal.uid < 0
+        ):
+            raise ValueError(f"principal {principal.name} 的 uid 须是非负整数")
+        digest = digest.lower()
         if digest in self._by_digest:
             raise ValueError(f"token 重复（一 token 一 principal）：principal {principal.name}")
         self._by_digest[digest] = principal
@@ -132,10 +146,10 @@ class Authorizer:
         return cmd in ROLE_CAPS.get(principal.role, frozenset())
 
 
-def read_private_file(path: Path) -> str:
+def read_private_file(path: Path | str, *, dir_fd: int | None = None) -> str:
     """凭据文件读取协议：O_NOFOLLOW 打开 → 对**同一个 fd** fstat 验证（普通文件、
-    属主是自己、权限 0600 以内、限长）→ 从该 fd 读——检查与读取之间无替换窗口。"""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    属主是自己、权限 0600 以内）→ 最多读 MAX+1——无替换窗口或 st_size 增长绕过。"""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -146,15 +160,27 @@ def read_private_file(path: Path) -> str:
             raise OSError(f"凭据文件权限过宽（须 0600 以内，内含 token）：{path}")
         if st.st_size > MAX_CRED_FILE:
             raise OSError(f"凭据文件超长（上限 {MAX_CRED_FILE} 字节）：{path}")
-        with os.fdopen(fd, "r", encoding="utf-8") as fh:
-            fd = -1  # fdopen 接管关闭
-            return fh.read()
+        chunks: list[bytes] = []
+        remaining = MAX_CRED_FILE + 1
+        while remaining:
+            chunk = os.read(fd, min(8192, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > MAX_CRED_FILE:
+            raise OSError(f"凭据文件超长（上限 {MAX_CRED_FILE} 字节）：{path}")
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise OSError(f"凭据文件不是合法 UTF-8：{path}") from e
     finally:
         if fd >= 0:
             os.close(fd)
 
 
-def ensure_admin_token(path: Path) -> str:
+def ensure_admin_token(path: Path | str, *, dir_fd: int | None = None) -> str:
     """host_admin token：已存在即经凭据协议校验后复用，否则原子生成 0600 新文件。
 
     轮换 = 替换/删除文件后重启 Host（token 只在进程内存里生效，重启即旧 token 全体失效）；
@@ -162,9 +188,9 @@ def ensure_admin_token(path: Path) -> str:
     """
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags, 0o600)
+        fd = os.open(path, flags, 0o600, dir_fd=dir_fd)
     except FileExistsError:
-        token = read_private_file(path).strip()
+        token = read_private_file(path, dir_fd=dir_fd).strip()
         if len(token) < MIN_TOKEN_LEN:
             raise OSError(f"token 文件内容过短——删除后重启 Host 重新生成：{path}") from None
         return token
@@ -174,32 +200,42 @@ def ensure_admin_token(path: Path) -> str:
     return token
 
 
-def load_principals(path: Path, authorizer: Authorizer) -> int:
-    """部署者签发的 principals 文件：yaml 列表 [{name, role, token[, uid]}]，权限须 0600。
+def load_principals(
+    path: Path | str, authorizer: Authorizer, *, dir_fd: int | None = None, production: bool = False
+) -> int:
+    """部署者签发的 principals 文件，权限须 0600。
 
-    uid 即生产模式绑定（token 只在该对端 uid 上有效）；不写 uid 为开发模式条目
-    （同 uid 可信）。缺文件 = 只有 admin（合法的单用户形态）；文件存在但形态/
-    权限/条目非法一律抛错拒绝启动——签发面配置错误必须响，不许静默降级。
+    开发模式兼容 [{name, role, token[, uid]}]；生产模式只收
+    [{name, role, uid, token_sha256}]，Host 配置不保存客户端明文。缺文件 = 只有
+    admin；存在但形态/权限/条目非法一律拒绝启动，不静默降级。
     """
     try:
-        text = read_private_file(path)
+        text = read_private_file(path, dir_fd=dir_fd)
     except FileNotFoundError:
         return 0
-    entries = yaml.safe_load(text) or []
+    try:
+        entries = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ValueError(f"principals YAML 无法解析：{path}（为避免泄露凭据，未显示原文）") from e
     if not isinstance(entries, list):
-        raise ValueError(f"principals 文件须是列表 [{{name, role, token[, uid]}}]：{path}")
+        raise ValueError(f"principals 文件须是列表：{path}")
     for i, entry in enumerate(entries):
-        if (
-            not isinstance(entry, dict)
-            or not {"name", "role", "token"} <= set(entry)
-            or set(entry) - {"name", "role", "token", "uid"}
-        ):
-            raise ValueError(f"principals 第 {i + 1} 条须含 name/role/token（可选 uid），不收其他键：{path}")
+        required = {"name", "role", "uid", "token_sha256"} if production else {"name", "role", "token"}
+        allowed = required if production else {"name", "role", "token", "uid"}
+        if not isinstance(entry, dict) or not required <= set(entry) or set(entry) - allowed:
+            shape = "name/role/uid/token_sha256" if production else "name/role/token（可选 uid）"
+            raise ValueError(f"principals 第 {i + 1} 条须含 {shape}，不收其他键：{path}")
         name = clean_text(entry["name"], f"principals 第 {i + 1} 条 name", max_len=200)
         role = clean_text(entry["role"], f"principals 第 {i + 1} 条 role", max_len=50)
-        token = clean_text(entry["token"], f"principals 第 {i + 1} 条 token")
         uid = entry.get("uid")
-        if uid is not None and (not isinstance(uid, int) or isinstance(uid, bool) or uid < 0):
+        if production and (type(uid) is not int or uid < 0):
+            raise ValueError(f"principals 第 {i + 1} 条 uid 须是非负整数且不可为 null：{path}")
+        if not production and uid is not None and (type(uid) is not int or uid < 0):
             raise ValueError(f"principals 第 {i + 1} 条 uid 须是非负整数：{path}")
-        authorizer.register(token, Principal(name, role, uid))
+        principal = Principal(name, role, uid)
+        if production:
+            authorizer.register_digest(entry["token_sha256"], principal)
+        else:
+            token = clean_text(entry["token"], f"principals 第 {i + 1} 条 token")
+            authorizer.register(token, principal)
     return len(entries)

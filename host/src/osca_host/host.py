@@ -16,6 +16,7 @@ import os
 import signal
 from collections import OrderedDict
 from datetime import datetime
+from enum import Enum, auto
 from pathlib import Path
 
 import yaml
@@ -28,7 +29,7 @@ from osca_cli.rules import run_all
 from osca_host import __version__
 from osca_host.authz import Authorizer, Principal, ensure_admin_token, load_principals
 from osca_host.connector import ConnectorProxy
-from osca_host.control import ControlServer, admin_token_path, principals_path, secure_run_dir
+from osca_host.control import ControlServer, admin_token_path, principals_path
 from osca_host.episode import Episode, assemble
 from osca_host.expr import parse_precondition
 from osca_host.gate import Gate
@@ -44,8 +45,20 @@ log = logging.getLogger("osca-host")
 EPISODE_LEDGER_CAP = 100  # 剧集台账只留近期；持久归档随 M3 采集器/账本落地
 
 
+class HostState(Enum):
+    STARTING = auto()
+    RUNNING = auto()
+    DRAINING = auto()
+    STOPPED = auto()
+
+
 class Host:
-    def __init__(self, socket_path: Path, deployments: dict[str, dict] | None = None):
+    def __init__(
+        self,
+        socket_path: Path,
+        deployments: dict[str, dict] | None = None,
+        control_group: str | None = None,
+    ):
         self.registry = Registry()
         self.table = TriggerTable(poller=self._poll)
         self.gates: dict[tuple[str, str], Gate] = {}  # (package_id, aware_id) → Gate
@@ -59,13 +72,25 @@ class Host:
         self._episode_seq = 0
         self._episode_tasks: set[asyncio.Task] = set()  # 在跑剧集（认知平面，独立线程）
         self.authorizer = Authorizer()
-        self.control = ControlServer(socket_path, self.handle, self.authorizer)
+        self.control = ControlServer(socket_path, self.handle, self.authorizer, control_group)
         self._cmd_lock = asyncio.Lock()  # 命令串行；load 的重活在线程里跑，事件循环保持响应
         self._stop = asyncio.Event()
+        self.state = HostState.STARTING
+        self._deployment_generations: dict[str, int] = {}
+        self._deployment_locks: dict[str, asyncio.Lock] = {}
+        self._load_slots: dict[str, tuple[int, int, asyncio.Task]] = {}
+        self._package_deployments: dict[str, str] = {}
+        self._package_tombstones: dict[str, int] = {}
+        self._operation_seq = 0
+        self._last_unload_operation = 0
+        self._control_tasks: set[asyncio.Task] = set()
 
     # ── 控制命令（schema 与授权已在 ControlServer 裁决后才进到这里） ──────
 
     async def handle(self, request: dict, principal: Principal) -> dict:
+        current = asyncio.current_task()
+        if current is not None:
+            self._control_tasks.add(current)
         cmd = request["cmd"]
         if cmd not in ("status", "episodes", "episode"):  # 只读命令不刷屏；变更命令留操作者身份痕
             log.info(f"[control] {principal.name}（{principal.role}）→ {cmd}")
@@ -76,11 +101,16 @@ class Host:
                 if spec is None:
                     detail = f"未配置的部署 ID：{request['deployment_id']}（部署清单归 Host 侧管理）"
                     return {"ok": False, "detail": detail}
-                return await self._load(spec)
+                return await self._request_load(request["deployment_id"], spec)
             async with self._cmd_lock:
+                if self.state is not HostState.RUNNING and cmd not in ("status", "episodes", "episode", "stop"):
+                    return {"ok": False, "detail": f"Host 当前为 {self.state.name}，拒绝新的变更命令"}
                 return self._dispatch(cmd, request)
         except RegistryError as e:
             return {"ok": False, "detail": str(e)}
+        finally:
+            if current is not None:
+                self._control_tasks.discard(current)
 
     def _dispatch(self, cmd: str, request: dict) -> dict:
         if cmd == "status":
@@ -114,11 +144,72 @@ class Host:
             return {"ok": True, "episode": episode.dump()}
         if cmd == "stop":
             log.info("收到 stop 命令，开始关停")
-            self._stop.set()
+            self._begin_draining()
             return {"ok": True, "detail": "Host 关停中"}
         return {"ok": False, "detail": f"未知命令：{cmd}"}  # schema 先裁过，此行是防御兜底
 
-    async def _load(self, spec: dict) -> dict:
+    def _begin_draining(self) -> None:
+        """单个事件循环原子写入生命周期 tombstone；任何迟到发布都会看到它。"""
+        if self.state in (HostState.DRAINING, HostState.STOPPED):
+            self._stop.set()
+            return
+        self.state = HostState.DRAINING
+        for deployment_id in set(self._deployment_generations) | set(self._load_slots):
+            self._deployment_generations[deployment_id] = self._deployment_generations.get(deployment_id, 0) + 1
+        # 初始 --load 发生在 run() 进入 _stop.wait() 之前；若只置事件，stop 会等慢
+        # worker 返回后才有机会进入 _shutdown，形成循环等待。这里立即取消协程任务；
+        # asyncio.to_thread 的系统线程可自行收尾，但 generation 已失效，绝不能迟到发布。
+        for _, _, task in self._load_slots.values():
+            if not task.done():
+                task.cancel()
+        self._stop.set()
+
+    async def _request_load(self, deployment_id: str, spec: dict) -> dict:
+        """同 deployment 共享同一 generation 的在途任务；tombstone 后创建新 generation。"""
+        async with self._cmd_lock:
+            if self.state is not HostState.RUNNING:
+                return {"ok": False, "detail": f"Host 当前为 {self.state.name}，拒绝开始 load"}
+            current_generation = self._deployment_generations.get(deployment_id, 0)
+            slot = self._load_slots.get(deployment_id)
+            if (
+                slot is not None
+                and slot[0] == current_generation
+                and slot[1] > self._last_unload_operation
+                and not slot[2].done()
+            ):
+                task = slot[2]
+            else:
+                generation = current_generation + 1
+                self._operation_seq += 1
+                operation = self._operation_seq
+                self._deployment_generations[deployment_id] = generation
+                task = asyncio.create_task(self._load_generation(deployment_id, generation, operation, spec))
+                self._load_slots[deployment_id] = (generation, operation, task)
+
+                def clear_slot(done: asyncio.Task, did=deployment_id, gen=generation, op=operation) -> None:
+                    if self._load_slots.get(did) == (gen, op, done):
+                        self._load_slots.pop(did, None)
+
+                task.add_done_callback(clear_slot)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # shield 区分两种取消：共享 load 自身被 shutdown 取消时 task.cancelled() 为真，
+            # 应给请求方稳定业务响应；若只是当前请求被取消，底层共享 load 仍活着，继续
+            # 向外传播。不要用 Task.cancelling()——它是 3.11+，项目支持下限为 3.10。
+            if task.cancelled():
+                return {"ok": False, "detail": "Host 正在关停，load 已取消且不会发布"}
+            raise
+
+    async def _load_generation(self, deployment_id: str, generation: int, operation: int, spec: dict) -> dict:
+        lock = self._deployment_locks.setdefault(deployment_id, asyncio.Lock())
+        async with lock:
+            async with self._cmd_lock:
+                if self.state is not HostState.RUNNING or self._deployment_generations.get(deployment_id) != generation:
+                    return {"ok": False, "detail": "load generation 已失效，未开始准备"}
+            return await self._load(spec, deployment_id, generation, operation)
+
+    async def _load(self, spec: dict, deployment_id: str, generation: int, operation: int) -> dict:
         """装载一个部署条目：{path[, bindings, dest]}——路径只来自服务端部署清单。
 
         重活（读盘/解压/lint/索引重建、binding 读取、git 戳探测）整段进线程，
@@ -164,7 +255,14 @@ class Host:
 
         # 发布段进命令锁（短暂、纯状态变更）：注册表 + 笼子 + 闸门一起可见
         async with self._cmd_lock:
+            if self.state is not HostState.RUNNING or self._deployment_generations.get(deployment_id) != generation:
+                return {"ok": False, "detail": "load 准备完成时 generation 已失效，拒绝迟到发布"}
+            if operation < self._package_tombstones.get(pid, 0):
+                return {"ok": False, "detail": f"{pid} 已被更新的 unload tombstone 停止，拒绝旧 load 发布"}
             lines = result.lines + self.registry.register(loaded)
+            if operation >= self._package_tombstones.get(pid, 0):
+                self._package_tombstones.pop(pid, None)
+            self._package_deployments[pid] = deployment_id
             self.bindings[pid] = pkg_bindings
             self.policies[pid] = policy
             self.proxies[pid] = proxy
@@ -205,6 +303,12 @@ class Host:
         return {"ok": True, "package_id": loaded.package_id, "detail": lines}
 
     def _unload(self, package_id: str) -> dict:
+        self._operation_seq += 1
+        self._last_unload_operation = self._operation_seq
+        self._package_tombstones[package_id] = self._operation_seq
+        deployment_id = self._package_deployments.pop(package_id, None)
+        if deployment_id is not None:
+            self._deployment_generations[deployment_id] = self._deployment_generations.get(deployment_id, 0) + 1
         removed = self.table.unsubscribe(package_id)
         for key in [k for k in self.gates if k[0] == package_id]:
             del self.gates[key]
@@ -397,43 +501,17 @@ class Host:
 
     # ── 生命周期 ──────────────────────────────────────────────────────
 
-    async def run(self, initial_packs: list[dict] | None = None) -> int:
-        # 安全内核先立：私有运行目录（不跟随符号链接）→ principal 签发面 → 传输
-        # （实例锁 + socket 0600）。任一步配置非法都拒绝启动——权限面出不来，Host 不开门。
-        try:
-            secure_run_dir(self.control.socket_path.parent)
-            token_file = admin_token_path(self.control.socket_path)
-            # admin token 绑定 Host 自己的 uid：生产模式下别的 uid 偷到也当不了 admin
-            admin = Principal("local-admin", "host_admin", os.getuid())
-            self.authorizer.register(ensure_admin_token(token_file), admin)
-            issued = load_principals(principals_path(self.control.socket_path), self.authorizer)
-            await self.control.start()
-        except (OSError, ValueError) as e:
-            log.error(f"控制通道启动失败：{e}")
-            return 1
-        log.info(
-            f"osca-host {__version__} 就绪，控制通道：{self.control.socket_path}"
-            f"（admin token：{token_file}；部署签发 principal {issued} 个；部署清单 {len(self.deployments)} 条）"
-        )
-
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            with contextlib.suppress(NotImplementedError):
-                loop.add_signal_handler(sig, self._stop.set)
-
-        failed = 0
-        for pack in initial_packs or []:
-            try:
-                response = await self._load(pack)  # 锁纪律在 _load 内部（发布段短锁）
-            except RegistryError as e:
-                response = {"ok": False, "detail": [str(e)]}
-            if not response["ok"]:
-                failed += 1
-                for line in response["detail"]:
-                    log.error(line)
-                log.error(f"启动装载失败：{pack['path']}")
-
-        await self._stop.wait()
+    async def _shutdown(self) -> None:
+        """幂等关停：先封发布，再清退 load/剧集/控制请求，最后释放 socket/lock/runtime fd。"""
+        if self.state is HostState.STOPPED:
+            return
+        async with self._cmd_lock:
+            self._begin_draining()
+        load_tasks = {slot[2] for slot in self._load_slots.values() if not slot[2].done()}
+        for task in load_tasks:
+            task.cancel()
+        if load_tasks:
+            await asyncio.gather(*load_tasks, return_exceptions=True)
 
         # 先等在跑剧集收尾（剧集短命，正常秒级；网关卡死时 60s 兜底放弃等待，线程随进程消亡）
         if self._episode_tasks:
@@ -448,12 +526,84 @@ class Host:
                 log.info(line)
         self.table.shutdown()
         await self.control.close()
+        self._load_slots.clear()
+        self._deployment_locks.clear()
+        self._deployment_generations.clear()
+        self._package_deployments.clear()
+        self._package_tombstones.clear()
+        self._control_tasks.clear()
+        self.state = HostState.STOPPED
         log.info("osca-host 已退出")
-        return 1 if failed else 0
+
+    async def run(self, initial_packs: list[dict] | None = None) -> int:
+        # 安全内核先立：私有运行目录（不跟随符号链接）→ principal 签发面 → 传输
+        # （实例锁 + dev 0600 / prod 0660 socket）。任一步非法都拒绝启动，不降级。
+        try:
+            runtime = self.control.prepare_runtime()
+            token_file = admin_token_path(self.control.socket_path)
+            # admin token 绑定 Host 自己的 uid：生产模式下别的 uid 偷到也当不了 admin
+            admin = Principal("local-admin", "host_admin", os.getuid())
+            self.authorizer.register(
+                ensure_admin_token(token_file.name, dir_fd=runtime.fd),
+                admin,
+            )
+            issued = load_principals(
+                principals_path(self.control.socket_path).name,
+                self.authorizer,
+                dir_fd=runtime.fd,
+                production=runtime.production,
+            )
+            await self.control.start()
+        except asyncio.CancelledError:
+            # run() 可能在控制通道完全发布前被嵌入方取消；此时还没进入下面的
+            # 主循环 finally，必须在这里释放已锚定的 runtime fd / listener / flock。
+            await asyncio.shield(self.control.close())
+            self.state = HostState.STOPPED
+            raise
+        except Exception as e:
+            log.error(f"控制通道启动失败：{e}")
+            await self.control.close()
+            self.state = HostState.STOPPED
+            return 1
+        self.state = HostState.RUNNING
+        log.info(
+            f"osca-host {__version__} 就绪，控制通道：{self.control.socket_path}"
+            f"（admin token：{token_file}；部署签发 principal {issued} 个；部署清单 {len(self.deployments)} 条）"
+        )
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError):
+                loop.add_signal_handler(sig, self._begin_draining)
+
+        try:
+            failed = 0
+            for index, pack in enumerate(initial_packs or []):
+                try:
+                    response = await self._request_load(f"__initial__:{index}", pack)
+                except RegistryError as e:
+                    response = {"ok": False, "detail": [str(e)]}
+                if not response["ok"]:
+                    failed += 1
+                    detail = response["detail"]
+                    for line in detail if isinstance(detail, list) else [str(detail)]:
+                        log.error(line)
+                    log.error(f"启动装载失败：{pack['path']}")
+
+            await self._stop.wait()
+            return 1 if failed else 0
+        finally:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                with contextlib.suppress(NotImplementedError):
+                    loop.remove_signal_handler(sig)
+            await asyncio.shield(self._shutdown())
 
 
 def run_host(
-    socket_path: Path, initial_packs: list[dict] | None = None, deployments: dict[str, dict] | None = None
+    socket_path: Path,
+    initial_packs: list[dict] | None = None,
+    deployments: dict[str, dict] | None = None,
+    control_group: str | None = None,
 ) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    return asyncio.run(Host(socket_path, deployments).run(initial_packs))
+    return asyncio.run(Host(socket_path, deployments, control_group).run(initial_packs))

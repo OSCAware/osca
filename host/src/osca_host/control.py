@@ -4,10 +4,11 @@
 {"v": 1, "cmd": ..., "token": ...}，回一行 JSON 响应 {"ok": ...}。
 协议保持傻：本地管控，不是对外 API。
 
-M4-W0 安全内核（Review M4 首轮）：
-- 私有运行目录 0700 + socket 0600 + 对端 uid 校验（fail-closed）——传输层先证明
-  「本机同用户进程」；进程级身份再由 token → Principal 证明（osca_host.authz），
-  schema 与逐命令授权都在进入命令实现前裁决；
+M4-W0.2 安全内核：
+- 开发模式 0700/0600；生产模式以部署者指定 group 提供 0710/0660 可达性，对端
+  kernel uid + token/expected_uid/role 仍逐层 fail-closed；
+- 运行目录从根逐级 O_NOFOLLOW 打开并持 fd；凭据/lock/清理均走 dir_fd，socket
+  bind 前后复核父 inode；
 - 实例 flock：同一 socket 路径同时只有一个 Host——活 socket 不可被第二实例接管；
   残留 socket 只在持锁后清理且必须真是 socket；关闭只删本实例创建的 inode
   （lstat 比对），绝不误删后来者的入口；
@@ -20,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import grp
 import json
 import logging
 import os
@@ -38,25 +40,133 @@ MAX_RESPONSE = 8 * 1024 * 1024
 READ_TIMEOUT = 10.0
 WRITE_TIMEOUT = 10.0
 MAX_CONNECTIONS = 16
+CONNECTION_DRAIN_TIMEOUT = 0.5
+DEV_DIR_MODE = 0o700
+DEV_SOCKET_MODE = 0o600
+PROD_DIR_MODE = 0o710
+PROD_SOCKET_MODE = 0o660
+
+
+class RuntimeDirectory:
+    """从 `/` 逐级 O_NOFOLLOW 打开的运行目录，并持有最终 inode 的 fd。"""
+
+    def __init__(self, path: Path, control_group: str | None = None):
+        if not path.is_absolute():
+            raise ValueError(f"运行目录必须是绝对路径：{path}")
+        self.path = path
+        self.production = control_group is not None
+        self.gid = self._resolve_group(control_group) if control_group is not None else os.getgid()
+        self.dir_mode = PROD_DIR_MODE if self.production else DEV_DIR_MODE
+        self.socket_mode = PROD_SOCKET_MODE if self.production else DEV_SOCKET_MODE
+        self.fd, created = self._open(create_final=True)
+        try:
+            st = os.fstat(self.fd)
+            if st.st_uid != os.getuid():
+                raise OSError(f"运行目录属主不是当前用户——拒绝使用：{path}")
+            if created:
+                if self.production:
+                    os.fchown(self.fd, -1, self.gid)
+                os.fchmod(self.fd, self.dir_mode)
+                st = os.fstat(self.fd)
+            mode = stat.S_IMODE(st.st_mode)
+            if mode != self.dir_mode:
+                raise OSError(
+                    f"运行目录权限不符合{'生产' if self.production else '开发'}模式"
+                    f"（需要 {self.dir_mode:04o}，实际 {mode:04o}）：{path}"
+                )
+            if self.production and st.st_gid != self.gid:
+                raise OSError(f"运行目录 group 不符合生产配置（需要 gid {self.gid}，实际 {st.st_gid}）：{path}")
+            self.inode = (st.st_dev, st.st_ino)
+        except BaseException:
+            os.close(self.fd)
+            raise
+
+    @staticmethod
+    def _resolve_group(name: str) -> int:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("生产模式 control group 须是非空 Unix group 名")
+        try:
+            return grp.getgrnam(name).gr_gid
+        except KeyError as e:
+            raise ValueError(f"生产模式 control group 不存在：{name}") from e
+
+    def _validate_trusted_ancestor(self, fd: int, path: Path) -> None:
+        """生产路径祖先须不可由 control group/其他 UID 改名。
+
+        root 或 Host UID 所有的普通不可写目录可信；sticky 目录（如 /tmp）也可信，
+        因为非目录/条目 owner 不能改名 Host 所有的下一层。其他 UID 所有的祖先，
+        或无 sticky 的 group/world 可写祖先，会重新打开 precheck→bind 逃逸窗口。
+        """
+        st = os.fstat(fd)
+        if st.st_uid not in (0, os.getuid()):
+            raise OSError(f"生产运行目录祖先须由 root 或 Host UID 持有：{path}")
+        mode = stat.S_IMODE(st.st_mode)
+        if mode & 0o022 and not st.st_mode & stat.S_ISVTX:
+            raise OSError(f"生产运行目录祖先可被 group/other 改名且无 sticky 保护：{path}")
+        if st.st_gid == self.gid:
+            traversable = bool(mode & stat.S_IXGRP)
+        else:
+            traversable = bool(mode & stat.S_IXOTH)
+        if not traversable:
+            raise OSError(f"生产 control group 无法遍历运行目录祖先：{path}")
+
+    def _open(self, *, create_final: bool) -> tuple[int, bool]:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        parts = self.path.parts
+        fd = os.open(parts[0], flags)
+        created = False
+        try:
+            current_path = Path(parts[0])
+            if self.production:
+                self._validate_trusted_ancestor(fd, current_path)
+            for index, part in enumerate(parts[1:], start=1):
+                final = index == len(parts) - 1
+                try:
+                    next_fd = os.open(part, flags, dir_fd=fd)
+                except FileNotFoundError:
+                    if not final or not create_final:
+                        raise
+                    os.mkdir(part, self.dir_mode, dir_fd=fd)
+                    created = True
+                    next_fd = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+                current_path /= part
+                if self.production and not final:
+                    self._validate_trusted_ancestor(fd, current_path)
+            return fd, created
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def path_matches(self) -> bool:
+        """普通 bind 路径仍必须解析到被持有 inode，且沿途不得出现链接。"""
+        try:
+            fd, _ = self._open(create_final=False)
+        except OSError:
+            return False
+        try:
+            st = os.fstat(fd)
+            return (st.st_dev, st.st_ino) == self.inode
+        finally:
+            os.close(fd)
+
+    def stat(self, name: str):
+        return os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+
+    def unlink(self, name: str) -> None:
+        os.unlink(name, dir_fd=self.fd)
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
 
 
 def secure_run_dir(run_dir: Path) -> None:
-    """私有运行目录：不跟随符号链接地创建并收紧 0700（M4-W0.1 P1-2）。
-
-    mkdir/chmod 按路径操作都会跟随链接——运行目录被预置成指向外部目录的符号链接
-    时，socket/token/lock 会建到外面、外部目录权限还被改掉。这里 os.mkdir 不跟随、
-    O_NOFOLLOW 打开后对 fd fchmod/fstat：目录是链接即拒绝启动。
-    """
-    run_dir.parent.mkdir(parents=True, exist_ok=True)
-    with contextlib.suppress(FileExistsError):
-        os.mkdir(run_dir)
-    fd = os.open(run_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        if os.fstat(fd).st_uid != os.getuid():
-            raise OSError(f"运行目录属主不是当前用户——拒绝使用：{run_dir}")
-        os.fchmod(fd, 0o700)
-    finally:
-        os.close(fd)
+    """兼容入口：按开发模式安全打开运行目录，验证后立即关闭 fd。"""
+    runtime = RuntimeDirectory(run_dir)
+    runtime.close()
 
 
 def admin_token_path(socket_path: Path) -> Path:
@@ -91,10 +201,11 @@ def _peer_uid(sock: socket.socket) -> int | None:
 class ControlServer:
     """挂在 Host 事件循环上的控制端。handler 由 Host 注入：async (request, principal) → dict。"""
 
-    def __init__(self, socket_path: Path, handler, authorizer):
+    def __init__(self, socket_path: Path, handler, authorizer, control_group: str | None = None):
         self.socket_path = socket_path
         self.handler = handler
         self.authorizer = authorizer
+        self.control_group = control_group
         self.read_timeout = READ_TIMEOUT
         self.write_timeout = WRITE_TIMEOUT
         self.max_connections = MAX_CONNECTIONS
@@ -102,25 +213,86 @@ class ControlServer:
         self._server: asyncio.AbstractServer | None = None
         self._lock_fd: int | None = None
         self._bound: tuple[int, int] | None = None  # 本实例创建的 socket inode（st_dev, st_ino）
+        self._runtime: RuntimeDirectory | None = None
+        self._client_tasks: set[asyncio.Task] = set()
+
+    @property
+    def runtime(self) -> RuntimeDirectory:
+        if self._runtime is None:
+            raise RuntimeError("运行目录尚未准备")
+        return self._runtime
+
+    def prepare_runtime(self) -> RuntimeDirectory:
+        if self._runtime is None:
+            self._runtime = RuntimeDirectory(self.socket_path.parent, self.control_group)
+        return self._runtime
+
+    def _entry_inode(self, name: str) -> tuple[int, int] | None:
+        try:
+            st = self.runtime.stat(name)
+        except FileNotFoundError:
+            return None
+        return st.st_dev, st.st_ino
+
+    def _unlink_bound(self) -> None:
+        if self._bound is not None and self._entry_inode(self.socket_path.name) == self._bound:
+            self.runtime.unlink(self.socket_path.name)
 
     async def start(self) -> None:
-        secure_run_dir(self.socket_path.parent)  # 私有目录：bind 与 chmod 之间的权限窗口也被目录挡住
-        lock_path = self.socket_path.with_name(self.socket_path.name + ".lock")
-        self._lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        runtime = self.prepare_runtime()
+        lock_name = self.socket_path.name + ".lock"
+        self._lock_fd = os.open(
+            lock_name,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=runtime.fd,
+        )
         try:
+            lock_st = os.fstat(self._lock_fd)
+            if not stat.S_ISREG(lock_st.st_mode):
+                raise OSError(f"控制通道 lock 不是普通文件：{lock_name}")
+            if lock_st.st_uid != os.getuid():
+                raise OSError(f"控制通道 lock 属主不是当前用户：{lock_name}")
+            if stat.S_IMODE(lock_st.st_mode) & 0o077:
+                raise OSError(f"控制通道 lock 权限过宽（须 0600 以内）：{lock_name}")
             try:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as e:
                 raise OSError(f"另一个 Host 实例正在此控制通道上运行：{self.socket_path}") from e
             # 持有实例锁 ⇒ 此路径不可能有活 Host——存在的只能是残留 socket；其他类型拒绝清理
             with contextlib.suppress(FileNotFoundError):
-                if not stat.S_ISSOCK(os.lstat(self.socket_path).st_mode):
+                if not stat.S_ISSOCK(runtime.stat(self.socket_path.name).st_mode):
                     raise OSError(f"控制通道路径被非 socket 占用（拒绝清理，请人工排查）：{self.socket_path}")
-                self.socket_path.unlink()
-            self._server = await asyncio.start_unix_server(self._serve, path=str(self.socket_path), limit=MAX_LINE)
-            os.chmod(self.socket_path, 0o600)
-            st = os.lstat(self.socket_path)
-            self._bound = (st.st_dev, st.st_ino)
+                runtime.unlink(self.socket_path.name)
+            if not runtime.path_matches():
+                raise OSError(f"运行目录路径在 bind 前已被替换——拒绝启动：{runtime.path}")
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.setblocking(False)
+                listener.bind(str(self.socket_path))
+                st = runtime.stat(self.socket_path.name)
+                self._bound = (st.st_dev, st.st_ino)  # chmod/asyncio 接管前立即记录路径 inode
+                if not runtime.path_matches():
+                    raise OSError(f"运行目录路径在 bind 后已被替换——拒绝启动：{runtime.path}")
+                os.chmod(
+                    self.socket_path.name,
+                    runtime.socket_mode,
+                    dir_fd=runtime.fd,
+                    follow_symlinks=False,
+                )
+                if runtime.production:
+                    os.chown(
+                        self.socket_path.name,
+                        -1,
+                        runtime.gid,
+                        dir_fd=runtime.fd,
+                        follow_symlinks=False,
+                    )
+                self._server = await asyncio.start_unix_server(self._serve, sock=listener, limit=MAX_LINE)
+                listener = None
+            finally:
+                if listener is not None:
+                    listener.close()
         except BaseException:
             # fail-closed：权限面没立起来就不许开门——bind 之后任一步失败都要关监听器、
             # 删自己的 socket，再放实例锁；不留「无锁监听器」给后来的实例并存（W0.1 P1-3）
@@ -128,30 +300,43 @@ class ControlServer:
                 self._server.close()
                 await self._server.wait_closed()
                 self._server = None
-                with contextlib.suppress(OSError):
-                    if stat.S_ISSOCK(os.lstat(self.socket_path).st_mode):
-                        self.socket_path.unlink()  # 持锁期间路径上的 socket 只能是自己刚 bind 的
+            with contextlib.suppress(OSError):
+                self._unlink_bound()
+            self._bound = None
             os.close(self._lock_fd)  # 锁文件保留：unlink 锁文件才是竞态（同 ledger 锁纪律）
             self._lock_fd = None
             raise
 
     async def close(self) -> None:
         if self._server:
-            self._server.close()
-            await self._server.wait_closed()
+            server = self._server
+            server.close()
+            current = asyncio.current_task()
+            tasks = {task for task in self._client_tasks if task is not current and not task.done()}
+            if tasks:
+                _, pending = await asyncio.wait(tasks, timeout=CONNECTION_DRAIN_TIMEOUT)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+            await server.wait_closed()
             self._server = None
         # 只删本实例创建的 inode——路径上是别人的东西就不动（不误删后来者的入口）
         if self._bound is not None:
             with contextlib.suppress(FileNotFoundError):
-                st = os.lstat(self.socket_path)
-                if (st.st_dev, st.st_ino) == self._bound:
-                    self.socket_path.unlink()
+                self._unlink_bound()
             self._bound = None
         if self._lock_fd is not None:
             os.close(self._lock_fd)  # 关闭即释放实例锁
             self._lock_fd = None
+        if self._runtime is not None:
+            self._runtime.close()
+            self._runtime = None
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        current = asyncio.current_task()
+        if current is not None:
+            self._client_tasks.add(current)
         # 计数覆盖整个连接生命周期（含响应序列化与 drain）——不读响应的慢客户端
         # 也占并发额度，不许积累成不受上限约束的阻塞任务（W0.1 P2）
         over = self._connections >= self.max_connections
@@ -175,6 +360,8 @@ class ControlServer:
                     await writer.wait_closed()
         finally:
             self._connections -= 1
+            if current is not None:
+                self._client_tasks.discard(current)
 
     async def _write_response(self, writer: asyncio.StreamWriter, response: dict) -> None:
         data = json.dumps(response, ensure_ascii=False).encode() + b"\n"

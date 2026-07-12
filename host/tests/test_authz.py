@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 
@@ -14,6 +15,7 @@ from osca_host.authz import (
     Principal,
     ensure_admin_token,
     load_principals,
+    read_private_file,
     validate_request,
 )
 
@@ -159,3 +161,85 @@ def test_load_principals_uid_binding_and_strict_types(tmp_path):
         os.chmod(path, 0o600)
         with pytest.raises(ValueError):
             load_principals(path, Authorizer())
+
+
+def test_private_file_read_is_bounded_even_if_fstat_size_is_stale(tmp_path, monkeypatch):
+    """文件可在 fstat 后增长；读取协议本身必须以 MAX+1 为硬边界。"""
+    import osca_host.authz as authz_mod
+
+    path = tmp_path / "growing.token"
+    path.write_bytes(b"x" * (authz_mod.MAX_CRED_FILE + 1))
+    os.chmod(path, 0o600)
+    real_fstat = os.fstat
+
+    def stale_size(fd):
+        st = real_fstat(fd)
+        values = list(st)
+        values[6] = 0  # st_size：模拟检查后增长
+        return os.stat_result(values)
+
+    monkeypatch.setattr(os, "fstat", stale_size)
+    with pytest.raises(OSError, match="超长"):
+        read_private_file(path)
+
+
+def test_principals_yaml_error_is_normalized_without_source_excerpt(tmp_path):
+    """解析器错误不能把可能含 token 的 YAML 行原文带进启动日志。"""
+    secret = "super-secret-token-value"
+    path = tmp_path / "p.yaml"
+    path.write_text(f"- name: x\n  role: operator\n  token: {secret}\n  broken: [\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    with pytest.raises(ValueError) as exc:
+        load_principals(path, Authorizer())
+    assert secret not in str(exc.value)
+    assert "YAML" in str(exc.value)
+
+
+def test_production_principal_accepts_digest_without_plaintext_token(tmp_path):
+    """生产签发文件只保存 token 摘要；客户端明文不落 Host 配置。"""
+    token = "client-owned-operator-token"
+    path = tmp_path / "p.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            [
+                {
+                    "name": "运营台",
+                    "role": "operator",
+                    "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+                    "uid": os.getuid(),
+                }
+            ],
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+    az = Authorizer()
+    assert load_principals(path, az, production=True) == 1
+    assert az.identify(token) == Principal("运营台", "operator", os.getuid())
+    assert token not in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("text", ["{}\n", "false\n", "0\n", "null\n", '""\n'])
+def test_existing_principals_file_rejects_falsy_non_list_shapes(tmp_path, text):
+    """存在的签发文件必须真是列表；falsy 值不能伪装成“没有 principal”。"""
+    path = tmp_path / "p.yaml"
+    path.write_text(text, encoding="utf-8")
+    os.chmod(path, 0o600)
+    with pytest.raises(ValueError, match="列表"):
+        load_principals(path, Authorizer())
+
+
+def test_production_principal_requires_non_null_uid(tmp_path):
+    """生产 principal 的 UID 是认证绑定，不允许用 null 悄悄退化成 Host UID。"""
+    path = tmp_path / "p.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            [{"name": "运营台", "role": "operator", "uid": None, "token_sha256": "a" * 64}],
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o600)
+    with pytest.raises(ValueError, match="uid"):
+        load_principals(path, Authorizer(), production=True)

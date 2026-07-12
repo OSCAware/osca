@@ -51,28 +51,58 @@ uv run osca-host episode EP-0001
 uv run osca-host approve demo-group-oper-diagnosis 终稿发送管理层  # → forbidden
 ```
 
-## 控制通道的权限面（M4-W0/W0.1 安全内核）
+## 控制通道的权限面（M4-W0.2 安全内核）
 
-控制通道是本机 unix socket（默认 `~/.osca/host.sock`，`--socket` 可改）：
-运行目录 0700 且不跟随符号链接（O_NOFOLLOW + fchmod，目录被换成外链即拒绝
-启动）、socket 0600、对端 uid 校验、实例 flock（同一路径只有一个 Host；启动
-中途失败即关监听器删 socket 再放锁，关闭只删自己创建的 inode）；协议 v1 带
-读/写超时、64 KiB 行上限、响应大小上限、并发上限与统一错误响应。
+控制通道是本机 unix socket（默认 `~/.osca/host.sock`，`--socket` 可改）。运行目录
+从 `/` 起逐级以 `openat`/`dir_fd + O_DIRECTORY + O_NOFOLLOW` 打开，只允许最后一级
+由 Host 创建；最终目录 fd 持有到 ControlServer 完全关闭。token、principals、lock
+全部相对该 fd 操作。Python 的 Unix socket bind 没有 `dir_fd`，因此 bind 前后都复核
+父目录 inode；生产模式另要求每级祖先由 root/Host UID 持有、不可由 group/other
+改名且允许目标 group 遍历（root/Host 所有的 sticky 临时目录可用）。路径被换时拒绝
+启动，异常与 shutdown 只按保存的 socket inode 清理。
+协议 v1 另有读/写超时、64 KiB 行上限、响应上限、连接上限和统一错误响应。
 
 **信任模型两档（诚实标注）：**
-- **开发模式**（principal 不带 uid）：全部进程同 OS uid——token 防误用与角色
-  越权，**不抵抗同 uid 进程失陷**（同 uid 天然读得到 token 文件与彼此内存）；
-- **生产模式**（principals 条目写 `uid`）：Host、运营台、专家端、审批适配器各用
-  独立 OS uid/容器；principal 绑定 `expected_uid + role + token 摘要`，传输层
-  允许名单 = Host uid + 各 principal 声明的 uid——偷来的 token 换了进程身份
-  一律失效，被攻陷的界面进程偷到 admin token 也当不了 admin。
+- **开发模式**（不传 `--control-group`）：运行目录/socket 为 `0700/0600`，全部
+  进程同 OS uid。token 只防误操作和角色越权，**不抵抗同 uid 失陷进程**；同 uid
+  本来就能读取彼此文件和内存。
+- **生产模式**（显式传 `run --control-group GROUP`）：运行目录必须由部署者预置为
+  Host owner、目标 group、`0710`，socket 为该 group 的 `0660`。group 只提供目录
+  遍历与连接可达性，不绕过 kernel peer UID、principal token、UID 绑定或角色检查。
+  group 不存在、祖先不可安全遍历、目录 owner/group/mode 不符、chown/chmod 失败均
+  拒绝启动，不降级。
 
-进程级身份靠 token：Host 启动生成 admin token（`<socket>.token`，0600，绑定
-Host 自身 uid，CLI 默认自动读取）；其他 principal 由部署者在
-`<socket>.principals.yaml`（0600，`[{name, role, token[, uid]}]`）签发。凭据
-文件以单 fd 读取（O_NOFOLLOW + fstat 验属主/权限/大小，无检查-读取窗口），
-权限过宽即拒绝启动；轮换 = 替换文件后重启（token 只在进程内存生效），在线
-撤销随 W3。角色能力矩阵（`osca_host.authz`，测试钉住）：
+生产示例（账号/group 名按部署环境替换；自定义路径必须写真实无符号链接的绝对路径，
+macOS 的 `/tmp` 是系统链接，需写 `/private/tmp`）：
+
+```bash
+sudo install -d -o osca-host -g osca-control -m 0710 /run/oscaware
+sudo -u osca-host uv run osca-host --socket /run/oscaware/host.sock \
+  run --control-group osca-control --deployments /etc/osca/deployments.yaml
+```
+
+进程级身份靠 token。Host 生成的 admin token 仍在 `<socket>.token`（0600，绑定
+Host uid，开发 CLI 默认读取）。生产 principals 文件只保存客户端 token 的 SHA-256
+摘要，不保存明文；明文由对应客户端 UID 自己持有在 0600 文件中，并以全局参数
+`--token-file` 传给 CLI：
+
+```bash
+openssl rand -hex 32 | tr -d '\n' > operator.token  # 至少 32 字节随机数；不要手工编 token
+chmod 0600 operator.token
+shasum -a 256 operator.token           # 将摘要写入 Host 侧 principals 文件
+```
+
+```yaml
+# <socket>.principals.yaml（0600，Host 所有）
+- name: operator-console
+  role: operator
+  uid: 30001
+  token_sha256: 6f...共 64 位十六进制...
+```
+
+凭据读取从同一 fd 最多取 `MAX+1` 字节，再验 UTF-8；不依赖可竞态的预读
+`st_size`。轮换 = 客户端换明文、部署者换摘要后重启 Host；在线撤销随 W3。
+角色能力矩阵（`osca_host.authz`，测试钉住）：
 
 | 角色 | 允许 | 明确禁止 |
 |---|---|---|
@@ -83,8 +113,10 @@ Host 自身 uid，CLI 默认自动读取）；其他 principal 由部署者在
 
 `load` 只收 `deployment_id`：包路径、bindings、解压目录一律由 Host 侧
 `--deployments` 清单解析（相对路径按清单文件所在目录解析），绝不从连接者
-透传（confused-deputy 面收口）；重活在事件循环外执行，慢 load 不阻塞
-status/stop。
+透传（confused-deputy 面收口）。load 准备在线程中按 deployment 单飞，不同
+deployment 可并行；发布段才进入短锁并复核 lifecycle/generation/tombstone。
+`STARTING → RUNNING → DRAINING → STOPPED` 保证 stop/unload 胜过迟到 load，同时
+慢 load 期间 status 仍可快速返回。
 
 ## LLM 通道（剧集的 agent 步）
 
