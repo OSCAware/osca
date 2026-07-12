@@ -173,5 +173,7 @@
 ## [Unreleased]
 - 发布 OSCA 开放规范白皮书 v1.0：以 OSCA 为核心、Oscaware 为参考实现，覆盖 O/S/C/A/J、
   双平面 Runtime、判断飞轮、采用路径、兼容与证据边界；历史 v0.1 扩展稿留档
+- 白皮书 v1.0 新增 English / 日本語 完整译本；GitHub README 新增日本語版本，中英日三语
+  README 与白皮书互相链接
 - Phase 0 内容线：P0-A 在高频真实场景形成 ≥20 条经专家 Confirm 入账的 Judgment，并观察
   后续独立使用；P0-B 慢场景单独报告，反哺 SPEC

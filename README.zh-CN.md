@@ -2,15 +2,17 @@
   <img src="https://avatars.githubusercontent.com/OSCAware" width="88" alt="OSCA" />
   <h1>OSCA</h1>
   <p><b>用文本定义、随人的反馈进化的 AI 认知工作流程规范。</b></p>
-  <p><sub><a href="README.md">English</a> · <b>简体中文</b></sub></p>
+  <p><sub><a href="README.md">English</a> · <b>简体中文</b> · <a href="README.ja.md">日本語</a></sub></p>
 </div>
 
 ---
 
 OSCA 是一套用纯文本定义 AI 认知工作流程的开放规范——控制平面确定性运行，在关键决策点保留人类判断，并随人的反馈不断进化；反馈被记入一本可署名的**贡献账本**。
 
-📘 [《OSCA 开放规范白皮书 v1.0》](docs/OSCA-WHITEPAPER-v1.0.zh-CN.md)——从设计动机、O/S/C/A/J、
-运行时到反馈飞轮，说明如何定义并开始实现自己的 OSCA Agent。白皮书版本不等于软件已经发布 1.0。
+📘 **白皮书：** [English](docs/OSCA-WHITEPAPER-v1.0.en.md) ·
+[简体中文](docs/OSCA-WHITEPAPER-v1.0.zh-CN.md) · [日本語](docs/OSCA-WHITEPAPER-v1.0.ja.md)——覆盖
+设计动机、O/S/C/A/J、Runtime、反馈飞轮，以及如何开始实现自己的 OSCA Agent。白皮书 v1.0
+不等于软件 1.0 已发布。
 
 ## OSCA 与 Oscaware
 
@@ -73,7 +75,9 @@ O/S/C/A 定义稳定骨架，J 保存随现场变化的裁决。一个 Agent 是
 
 ```
 osca/
-├── docs/OSCA-WHITEPAPER-v1.0.zh-CN.md # 开放规范白皮书（设计思路与采用路径）
+├── docs/OSCA-WHITEPAPER-v1.0.en.md    # 开放规范白皮书：English
+├── docs/OSCA-WHITEPAPER-v1.0.zh-CN.md # 开放规范白皮书：简体中文
+├── docs/OSCA-WHITEPAPER-v1.0.ja.md    # 开放规范白皮书：日本語
 ├── docs/OSCA-SPEC-v0.3.md        # 规范正文（CC BY 4.0）；v0.4 草案与历史版本 v0.2 同目录
 ├── docs/OSCA-LINT-RULES.md       # lint 规则清单（账本纪律的机器化）
 ├── examples/oper-diagnosis.osca/  # 完整合成演示包（含 supersedes 链与口述 case）

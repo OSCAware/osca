@@ -7,6 +7,8 @@
 - **规范基线：** OSCA SPEC v0.3 + v0.4 draft（2026-07-12 Profile）
 - **参考实现状态：** 公开 Host 0.2.0、第一方反馈飞轮（M3）工程收官；真实业务验证尚未完成
 
+**语言：** [English](OSCA-WHITEPAPER-v1.0.en.md) · **简体中文** · [日本語](OSCA-WHITEPAPER-v1.0.ja.md)
+
 ## 摘要
 
 今天的 Agent 已经能理解语言、检索知识、调用工具和执行多步任务。OSCA 追问的是另一个

@@ -2,7 +2,7 @@
   <img src="https://avatars.githubusercontent.com/OSCAware" width="88" alt="OSCA" />
   <h1>OSCA</h1>
   <p><b>An open specification for AI cognitive workflows — defined in plain text, evolving through human feedback.</b></p>
-  <p><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a></sub></p>
+  <p><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a></sub></p>
 </div>
 
 ---
@@ -11,9 +11,10 @@ OSCA is an open specification for defining AI cognitive workflows in plain text 
 plane runs deterministically, that keep humans at the decision points, and that evolve through human feedback
 recorded in an attributable **contribution ledger**.
 
-📘 [OSCA Open Specification Whitepaper v1.0 (Chinese)](docs/OSCA-WHITEPAPER-v1.0.zh-CN.md) explains the
-design rationale, O/S/C/A/J model, runtime, feedback flywheel, and how to define and begin implementing your
-own OSCA Agent. The whitepaper version is not a software 1.0 release.
+📘 **Whitepaper:** [English](docs/OSCA-WHITEPAPER-v1.0.en.md) ·
+[简体中文](docs/OSCA-WHITEPAPER-v1.0.zh-CN.md) · [日本語](docs/OSCA-WHITEPAPER-v1.0.ja.md) — the design
+rationale, O/S/C/A/J model, Runtime, feedback flywheel, and how to begin implementing your own OSCA Agent.
+Whitepaper v1.0 is not a software 1.0 release.
 
 ## OSCA and Oscaware
 
@@ -79,7 +80,9 @@ mostly Markdown + YAML `.osca` folder that Git can manage, machines can validate
 
 ```
 osca/
-├── docs/OSCA-WHITEPAPER-v1.0.zh-CN.md # open-spec whitepaper (design rationale and adoption path)
+├── docs/OSCA-WHITEPAPER-v1.0.en.md    # open-spec whitepaper: English
+├── docs/OSCA-WHITEPAPER-v1.0.zh-CN.md # open-spec whitepaper: Simplified Chinese
+├── docs/OSCA-WHITEPAPER-v1.0.ja.md    # open-spec whitepaper: Japanese
 ├── docs/OSCA-SPEC-v0.3.md         # the specification (CC BY 4.0); v0.4 draft alongside, v0.2 kept for history
 ├── docs/OSCA-LINT-RULES.md        # lint rule catalogue (ledger discipline, machine-enforced)
 ├── examples/oper-diagnosis.osca/  # a full synthetic demo pack (with supersedes chains and spoken-language cases)
