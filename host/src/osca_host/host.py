@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 from collections import OrderedDict
 from datetime import datetime
@@ -25,8 +26,9 @@ from osca_cli.packer import rebuild_index
 from osca_cli.rules import run_all
 
 from osca_host import __version__
+from osca_host.authz import Authorizer, Principal, ensure_admin_token, load_principals
 from osca_host.connector import ConnectorProxy
-from osca_host.control import ControlServer
+from osca_host.control import ControlServer, admin_token_path, principals_path
 from osca_host.episode import Episode, assemble
 from osca_host.expr import parse_precondition
 from osca_host.gate import Gate
@@ -43,75 +45,95 @@ EPISODE_LEDGER_CAP = 100  # 剧集台账只留近期；持久归档随 M3 采集
 
 
 class Host:
-    def __init__(self, socket_path: Path):
+    def __init__(self, socket_path: Path, deployments: dict[str, dict] | None = None):
         self.registry = Registry()
         self.table = TriggerTable(poller=self._poll)
         self.gates: dict[tuple[str, str], Gate] = {}  # (package_id, aware_id) → Gate
         self.policies: dict[str, PolicyInterceptor] = {}
         self.proxies: dict[str, ConnectorProxy] = {}
         self.bindings: dict[str, dict] = {}  # package_id → 部署注入的 binding 表（按包隔离，永不进包）
+        # 部署清单（服务端解析）：deployment_id → {path[, bindings, dest]}——控制通道只收 ID，
+        # 路径类参数绝不从连接者透传（confused-deputy 文件读写面，M4 首轮 P1）
+        self.deployments: dict[str, dict] = dict(deployments or {})
         self.episodes: OrderedDict[str, Episode] = OrderedDict()  # 剧集台账（近期）
         self._episode_seq = 0
         self._episode_tasks: set[asyncio.Task] = set()  # 在跑剧集（认知平面，独立线程）
-        self.control = ControlServer(socket_path, self.handle)
+        self.authorizer = Authorizer()
+        self.control = ControlServer(socket_path, self.handle, self.authorizer)
+        self._cmd_lock = asyncio.Lock()  # 命令串行；load 的重活在线程里跑，事件循环保持响应
         self._stop = asyncio.Event()
 
-    # ── 控制命令（注册表操作，全部同步且快） ──────────────────────────
+    # ── 控制命令（schema 与授权已在 ControlServer 裁决后才进到这里） ──────
 
-    def handle(self, request: dict) -> dict:
-        cmd = request.get("cmd")
-        try:
-            if cmd == "status":
-                snapshot = self.registry.status()
-                for pkg in snapshot["packages"]:
-                    pkg["gates"] = [
-                        gate.snapshot() for (pid, _), gate in sorted(self.gates.items()) if pid == pkg["package_id"]
-                    ]
-                    policy = self.policies.get(pkg["package_id"])
-                    pkg["policy"] = policy.snapshot() if policy else None
-                return {"ok": True, "version": __version__, **snapshot, "triggers": self.table.status()}
-            if cmd == "approve":
-                policy = self.policies.get(str(request.get("package_id")))
-                if policy is None:
-                    return {"ok": False, "detail": f"包未注册：{request.get('package_id')}"}
-                ok, detail = policy.grant_approval(str(request.get("action")))
-                log.info(detail)
-                return {"ok": ok, "detail": detail}
-            if cmd == "load":
-                return self._load(request)
-            if cmd == "unload":
-                return self._unload(str(request.get("package_id")))
-            if cmd in ("enable", "disable"):
-                return self._set_aware(str(request.get("package_id")), str(request.get("aware_id")), cmd == "enable")
-            if cmd == "fire":
-                return self._fire(str(request.get("package_id")), str(request.get("trigger_id")))
-            if cmd == "episodes":
-                return {"ok": True, "episodes": [ep.summary() for ep in self.episodes.values()]}
-            if cmd == "episode":
-                episode = self.episodes.get(str(request.get("episode_id")))
-                if episode is None:
-                    return {"ok": False, "detail": f"剧集不存在（台账只留近期 {EPISODE_LEDGER_CAP} 条）"}
-                return {"ok": True, "episode": episode.dump()}
-            if cmd == "stop":
-                log.info("收到 stop 命令，开始关停")
-                self._stop.set()
-                return {"ok": True, "detail": "Host 关停中"}
-            return {"ok": False, "detail": f"未知命令：{cmd}"}
-        except RegistryError as e:
-            return {"ok": False, "detail": str(e)}
+    async def handle(self, request: dict, principal: Principal) -> dict:
+        cmd = request["cmd"]
+        if cmd not in ("status", "episodes", "episode"):  # 只读命令不刷屏；变更命令留操作者身份痕
+            log.info(f"[control] {principal.name}（{principal.role}）→ {cmd}")
+        async with self._cmd_lock:
+            try:
+                return await self._dispatch(cmd, request)
+            except RegistryError as e:
+                return {"ok": False, "detail": str(e)}
 
-    def _load(self, request: dict) -> dict:
-        result, loaded = load_for_host(
-            str(request.get("path")),
-            dest=request.get("dest"),
-            bindings=request.get("bindings"),
+    async def _dispatch(self, cmd: str, request: dict) -> dict:
+        if cmd == "status":
+            snapshot = self.registry.status()
+            for pkg in snapshot["packages"]:
+                pkg["gates"] = [
+                    gate.snapshot() for (pid, _), gate in sorted(self.gates.items()) if pid == pkg["package_id"]
+                ]
+                policy = self.policies.get(pkg["package_id"])
+                pkg["policy"] = policy.snapshot() if policy else None
+            return {"ok": True, "version": __version__, **snapshot, "triggers": self.table.status()}
+        if cmd == "approve":
+            policy = self.policies.get(request["package_id"])
+            if policy is None:
+                return {"ok": False, "detail": f"包未注册：{request['package_id']}"}
+            ok, detail = policy.grant_approval(request["action"])
+            log.info(detail)
+            return {"ok": ok, "detail": detail}
+        if cmd == "load":
+            spec = self.deployments.get(request["deployment_id"])
+            if spec is None:
+                return {"ok": False, "detail": f"未配置的部署 ID：{request['deployment_id']}（部署清单归 Host 侧管理）"}
+            return await self._load(spec)
+        if cmd == "unload":
+            return self._unload(request["package_id"])
+        if cmd in ("enable", "disable"):
+            return self._set_aware(request["package_id"], request["aware_id"], cmd == "enable")
+        if cmd == "fire":
+            return self._fire(request["package_id"], request["trigger_id"])
+        if cmd == "episodes":
+            return {"ok": True, "episodes": [ep.summary() for ep in self.episodes.values()]}
+        if cmd == "episode":
+            episode = self.episodes.get(request["episode_id"])
+            if episode is None:
+                return {"ok": False, "detail": f"剧集不存在（台账只留近期 {EPISODE_LEDGER_CAP} 条）"}
+            return {"ok": True, "episode": episode.dump()}
+        if cmd == "stop":
+            log.info("收到 stop 命令，开始关停")
+            self._stop.set()
+            return {"ok": True, "detail": "Host 关停中"}
+        return {"ok": False, "detail": f"未知命令：{cmd}"}  # schema 先裁过，此行是防御兜底
+
+    async def _load(self, spec: dict) -> dict:
+        """装载一个部署条目：{path[, bindings, dest]}——路径只来自服务端部署清单。
+
+        装载核心（读盘/解压/lint/索引重建）是同步重活，进线程跑；注册段回到
+        事件循环单线程执行（与 deliver 回调天然互斥），全程持 _cmd_lock 串行。
+        """
+        result, loaded = await asyncio.to_thread(
+            load_for_host,
+            str(spec.get("path")),
+            dest=spec.get("dest"),
+            bindings=spec.get("bindings"),
         )
         if loaded is None:
             return {"ok": False, "detail": result.lines}
-        # binding 按包隔离：本次 --bindings 只归本包——同名 binding 不跨包串线、卸载即清理
+        # binding 按包隔离：本次注入只归本包——同名 binding 不跨包串线、卸载即清理
         pkg_bindings: dict = {}
-        if request.get("bindings"):
-            pkg_bindings = yaml.safe_load(Path(str(request["bindings"])).read_text(encoding="utf-8")) or {}
+        if spec.get("bindings"):
+            pkg_bindings = yaml.safe_load(Path(str(spec["bindings"])).read_text(encoding="utf-8")) or {}
 
         # 先在局部构建全部运行时对象——任何一步失败都不触碰注册表（原子发布，杜绝半注册包）
         pid = loaded.package_id
@@ -366,8 +388,23 @@ class Host:
     # ── 生命周期 ──────────────────────────────────────────────────────
 
     async def run(self, initial_packs: list[dict] | None = None) -> int:
-        await self.control.start()
-        log.info(f"osca-host {__version__} 就绪，控制通道：{self.control.socket_path}")
+        # 安全内核先立：私有运行目录 → principal 签发面 → 传输（实例锁 + socket 0600）。
+        # 任一步配置非法都拒绝启动——权限面出不来，Host 就不该开门。
+        try:
+            run_dir = self.control.socket_path.parent
+            run_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(run_dir, 0o700)
+            token_file = admin_token_path(self.control.socket_path)
+            self.authorizer.register(ensure_admin_token(token_file), Principal("local-admin", "host_admin"))
+            issued = load_principals(principals_path(self.control.socket_path), self.authorizer)
+            await self.control.start()
+        except (OSError, ValueError) as e:
+            log.error(f"控制通道启动失败：{e}")
+            return 1
+        log.info(
+            f"osca-host {__version__} 就绪，控制通道：{self.control.socket_path}"
+            f"（admin token：{token_file}；部署签发 principal {issued} 个；部署清单 {len(self.deployments)} 条）"
+        )
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -376,7 +413,8 @@ class Host:
 
         failed = 0
         for pack in initial_packs or []:
-            response = self._load({"cmd": "load", **pack})
+            async with self._cmd_lock:  # 与控制命令同一串行纪律——socket 已开门
+                response = await self._load(pack)
             if not response["ok"]:
                 failed += 1
                 for line in response["detail"]:
@@ -402,6 +440,8 @@ class Host:
         return 1 if failed else 0
 
 
-def run_host(socket_path: Path, initial_packs: list[dict] | None = None) -> int:
+def run_host(
+    socket_path: Path, initial_packs: list[dict] | None = None, deployments: dict[str, dict] | None = None
+) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    return asyncio.run(Host(socket_path).run(initial_packs))
+    return asyncio.run(Host(socket_path, deployments).run(initial_packs))

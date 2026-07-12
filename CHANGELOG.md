@@ -226,6 +226,29 @@
 - settle 撞号重试真分支回归：对手在编号扫描后、首次 link 前落号——首次发布
   返回占用、对手文件原样、顺移 C-0104 且 YAML 内 case_id 一致
 
+## [M4-W0 · 控制通道安全内核] - 2026-07-12
+Review M4 首轮（权限面）No-Go 四项 P1 + 协议加固收口；专家端/运营台/审批卡
+（W1–W3）在安全内核复核通过后再开：
+- 传输层：私有运行目录 0700 + socket 0600（umask 无关）、对端 uid 校验
+  （SO_PEERCRED / LOCAL_PEERCRED，取不到凭据 fail-closed 拒绝）
+- 实例 flock：同一 socket 路径只有一个 Host——活 socket 不可被第二实例接管；
+  残留 socket 只在持锁后清理且必须真是 socket；关闭只删本实例创建的 inode
+  （lstat 比对），不误删后来者入口
+- Principal + Authorizer + CommandSchema（osca_host.authz）：token → Principal
+  认证（sha256 存表；admin token 启动生成 0600，其余 principal 走部署者签发的
+  principals 文件，权限过宽拒绝启动），角色能力矩阵在进入命令实现前裁决——
+  host_admin 管生命周期但不可授予业务审批（approve 归 approver）；operator 只有
+  脱敏快照/启停/发射/剧集摘要；expert 命令随 M4-W1 落地。矩阵以测试钉住
+- load 的 confused-deputy 面收口：控制通道只收 deployment_id，包路径/bindings/
+  解压目录一律由 Host 侧 --deployments 清单解析，请求内 path 类字段死于 schema
+- 协议 v1 加固：顶层必须 mapping、字段白名单（多余/缺失即拒）、读超时、单行
+  64 KiB 上限、并发连接上限、统一异常边界（error 码 + 人话 detail，不再有
+  AttributeError/ValueError 空响应）；load 重活进线程、命令经锁串行，事件循环
+  保持确定性响应
+- 后续按序：W1 专家端 → W2 运营台 → W3 审批卡（持久化审批 challenge：绑定
+  approver/episode/payload digest/expiry/nonce/幂等键）→ append-only 审计与
+  shutdown draining
+
 ## [Unreleased]
 - 发布 OSCA 开放规范白皮书 v1.0：以 OSCA 为核心、Oscaware 为参考实现，覆盖 O/S/C/A/J、
   双平面 Runtime、判断飞轮、采用路径、兼容与证据边界；历史 v0.1 扩展稿留档

@@ -1,0 +1,7 @@
+# 部署清单（Host 侧 --deployments）：控制通道 load 只收 deployment_id，
+# 包路径 / bindings / 解压目录一律由服务端解析——路径类参数绝不从连接者透传。
+# 相对路径按 Host 进程 cwd 解析；生产环境建议写绝对路径。
+demo:
+  path: ../examples/oper-diagnosis.osca
+  # bindings: /etc/osca/bindings.yaml       # 部署环境注入的 binding 表（永不进包）
+  # dest: /var/lib/osca/packs/demo          # zip 交付态的解压目录

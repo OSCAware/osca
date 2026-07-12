@@ -9,6 +9,7 @@ import asyncio
 
 import pytest
 
+from osca_host.authz import Principal
 from osca_host.control import send_command
 from osca_host.host import Host
 
@@ -26,8 +27,14 @@ async def running_host(sock_path):
     await asyncio.wait_for(task, timeout=5)
 
 
-async def _send(request, host):
-    return await asyncio.to_thread(send_command, request, host.control.socket_path)
+async def _send(request, host, token=None):
+    return await asyncio.to_thread(send_command, request, host.control.socket_path, 30.0, token)
+
+
+async def _load_pack(host, path, bindings=None, did="t-pack"):
+    """装载走部署 ID（M4-W0）：路径类参数只住服务端部署清单，控制通道只收 ID。"""
+    host.deployments[did] = {"path": str(path), "bindings": str(bindings) if bindings else None}
+    return await _send({"cmd": "load", "deployment_id": did}, host)
 
 
 async def test_full_lifecycle(running_host, sample_pack):
@@ -38,7 +45,7 @@ async def test_full_lifecycle(running_host, sample_pack):
     assert response["ok"] and response["packages"] == []
 
     # 装载样例包
-    response = await _send({"cmd": "load", "path": str(sample_pack)}, host)
+    response = await _load_pack(host, sample_pack)
     assert response["ok"]
     assert response["package_id"] == "demo-group-oper-diagnosis"
 
@@ -58,7 +65,7 @@ async def test_load_invalid_pack_rejected(running_host, tmp_path):
     bad = tmp_path / "bad.osca"
     bad.mkdir()
     (bad / "osca.yaml").write_text("format: osca\n", encoding="utf-8")
-    response = await _send({"cmd": "load", "path": str(bad)}, running_host)
+    response = await _load_pack(running_host, bad)
     assert not response["ok"]
 
 
@@ -90,7 +97,7 @@ def test_client_without_host(tmp_path):
 async def test_w2_trigger_stop_and_manual_fire(running_host, sample_pack, deploy):
     """W2 验收路径:布防 → 触发器停/启 → 人工发射穿透闸门唤醒。"""
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
 
     # 布防:3 条订阅,槽位 armed;schedule watcher 已排好下次触发
@@ -128,7 +135,7 @@ async def test_w2_trigger_stop_and_manual_fire(running_host, sample_pack, deploy
 async def test_w3_wake_assembles_episode(running_host, sample_pack, deploy):
     """W3 验收路径:发射 → 唤醒 → 剧集装配进台账 → 完整上下文可导出。"""
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
 
     response = await _send({"cmd": "episodes"}, host)
@@ -172,7 +179,7 @@ def deploy(tmp_path):
 async def test_w4_precondition_evaluated_through_proxy(running_host, sample_pack, deploy):
     """W4 验收路径:装载带 binding → 发射 → precondition 经代理真求值 → 唤醒装配。"""
     host = running_host
-    response = await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    response = await _load_pack(host, sample_pack, deploy)
     assert response["ok"]
     pid = "demo-group-oper-diagnosis"
 
@@ -195,22 +202,25 @@ async def test_w4_precondition_evaluated_through_proxy(running_host, sample_pack
 
 async def test_w4_approval_gate_via_control(running_host, sample_pack, deploy):
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
 
-    response = await _send({"cmd": "approve", "package_id": pid, "action": "终稿发送管理层"}, host)
+    # 审批是业务裁决，归 approver 角色（admin 授予被矩阵禁止——见 test_control_security）
+    approver = "approver-token-0001"
+    host.authorizer.register(approver, Principal("审批卡", "approver"))
+    response = await _send({"cmd": "approve", "package_id": pid, "action": "终稿发送管理层"}, host, token=approver)
     assert response["ok"]
     response = await _send({"cmd": "status"}, host)
     assert response["packages"][0]["policy"]["approvals"]["终稿发送管理层"] == "granted"
 
-    response = await _send({"cmd": "approve", "package_id": pid, "action": "不存在的动作"}, host)
+    response = await _send({"cmd": "approve", "package_id": pid, "action": "不存在的动作"}, host, token=approver)
     assert not response["ok"]
 
 
 async def test_w4_precondition_blocks_without_bindings(running_host, sample_pack):
     """未注入部署 binding → precondition 取数失败 → 保守拦截唤醒(不装配)。"""
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack)}, host)
+    await _load_pack(host, sample_pack)
     pid = "demo-group-oper-diagnosis"
     await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
     response = await _send({"cmd": "status"}, host)
@@ -223,7 +233,7 @@ async def test_w4_precondition_blocks_without_bindings(running_host, sample_pack
 async def test_kill_switch_recomputed_at_wakeup(running_host, sample_pack, deploy):
     """账本健康度即安全信号：M3 采集器落账后计数恶化，Host 不重启、下次唤醒前重算即拒。"""
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
 
     await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
@@ -250,7 +260,7 @@ async def test_kill_switch_recomputed_at_wakeup(running_host, sample_pack, deplo
 async def test_wakeup_sees_newly_distilled_judgment(running_host, sample_pack, deploy):
     """长跑 Host 的账本以磁盘为准：M3 拍板落账后，不 unload/load，下次唤醒即用新判断。"""
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
 
     # 模拟 M3 拍板落账：磁盘新增一条 active 判断（Host 进程不重启）
@@ -276,7 +286,7 @@ async def test_wakeup_refused_while_ledger_locked(running_host, sample_pack, dep
     from osca_cli.ledger import ledger_lock
 
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
 
     with ledger_lock(sample_pack):  # 模拟 oscapipe capture/confirm 正持锁写账
@@ -290,7 +300,7 @@ async def test_wakeup_refused_while_ledger_locked(running_host, sample_pack, dep
 async def test_wakeup_refused_on_broken_ledger(running_host, sample_pack, deploy):
     """磁盘账本不合规（如写入中断留下不可解析判断）→ 唤醒拒绝、保留旧快照。"""
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
 
     (sample_pack / "judgments" / "J-0999.yaml").write_text("judgment_id: [未闭合", encoding="utf-8")
@@ -303,7 +313,7 @@ async def test_refresh_exception_refuses_wakeup_and_callback_survives(running_ho
     import osca_host.host as host_mod
 
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
 
     def disk_full(root, pkg=None):
@@ -324,7 +334,7 @@ async def test_policy_publish_inside_refresh_transaction(running_host, sample_pa
     from osca_host.policy import PolicyInterceptor
 
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
     old_pack = host.registry.packages[pid].pack
 
@@ -344,7 +354,7 @@ async def test_policy_publish_inside_refresh_transaction(running_host, sample_pa
 async def test_enable_failure_rolls_back_and_stays_retryable(running_host, sample_pack, deploy, monkeypatch):
     """enable 全部订阅成功才置位：半路失败即补偿回滚，不留「显示启用、实际半布防」，且可重试修复。"""
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
     await _send({"cmd": "disable", "package_id": pid, "aware_id": "AW-001"}, host)
 
@@ -382,7 +392,7 @@ async def test_arming_failure_rolls_back_registration(running_host, sample_pack,
         return original(kind, spec, sub)
 
     monkeypatch.setattr(host.table, "subscribe", flaky)
-    response = await _send({"cmd": "load", "path": str(sample_pack)}, host)
+    response = await _load_pack(host, sample_pack)
     assert not response["ok"]
     assert any("补偿回滚" in line for line in response["detail"])
 
@@ -399,7 +409,7 @@ async def test_load_failure_leaves_no_half_registered_package(running_host, samp
         raise RuntimeError("构造失败（测试注入）")
 
     monkeypatch.setattr(host_mod, "PolicyInterceptor", boom)
-    response = await _send({"cmd": "load", "path": str(sample_pack)}, running_host)
+    response = await _load_pack(running_host, sample_pack)
     assert not response["ok"]
     assert any("包未注册" in line for line in response["detail"])
 
@@ -411,7 +421,7 @@ async def test_load_failure_leaves_no_half_registered_package(running_host, samp
 async def test_enable_is_idempotent(running_host, sample_pack, deploy):
     """对已启用 Aware 重复 enable 不得重复订阅（否则一次触发双份唤醒）。"""
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
 
     response = await _send({"cmd": "enable", "package_id": pid, "aware_id": "AW-001"}, host)
@@ -429,7 +439,7 @@ async def test_bindings_isolated_per_package(running_host, sample_pack, deploy, 
     import yaml as _yaml
 
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy)}, host)
+    await _load_pack(host, sample_pack, deploy)
 
     pack_b = tmp_path / "pack-b.osca"
     shutil.copytree(sample_pack, pack_b, ignore=shutil.ignore_patterns("indexes"))
@@ -446,7 +456,7 @@ async def test_bindings_isolated_per_package(running_host, sample_pack, deploy, 
     bindings_b.write_text(
         _yaml.safe_dump({"FINANCE_DB": {"endpoint": f"mock://{fixtures_b}", "secret_ref": "K"}}), encoding="utf-8"
     )
-    response = await _send({"cmd": "load", "path": str(pack_b), "bindings": str(bindings_b)}, host)
+    response = await _load_pack(host, pack_b, bindings_b, did="t-pack-b")
     assert response["ok"]
 
     a = host.proxies["demo-group-oper-diagnosis"].bindings["FINANCE_DB"]["endpoint"]
@@ -491,7 +501,7 @@ def deploy_w5(tmp_path, monkeypatch):
 async def test_w5_fire_runs_pipeline_to_draft(running_host, sample_pack, deploy_w5):
     """W5 验收路径(发布凭据第三样的运行侧):装载 → 发射 → 跑完 pipeline 出草稿 → 台账可导出。"""
     host = running_host
-    await _send({"cmd": "load", "path": str(sample_pack), "bindings": str(deploy_w5)}, host)
+    await _load_pack(host, sample_pack, deploy_w5)
     pid = "demo-group-oper-diagnosis"
     await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
 

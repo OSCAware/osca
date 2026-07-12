@@ -1,6 +1,9 @@
 """osca-host 命令入口。
 
 run 之外的子命令都是控制通道客户端：对运行中的 Host 发注册表操作。
+身份即 token（M4-W0）：默认读 Host 生成的 admin token（socket 旁 0600 文件）；
+非 admin 界面进程用 --token-file 带自己的 principal token——角色能力见
+osca_host.authz 的权限矩阵（admin 不可授予业务审批，approve 归 approver）。
 """
 
 from __future__ import annotations
@@ -9,6 +12,8 @@ import argparse
 import json
 import sys
 from pathlib import Path
+
+import yaml
 
 from osca_host import __version__
 from osca_host.control import DEFAULT_SOCKET, send_command
@@ -21,6 +26,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="osca-host", description="OSCA 运行框架 Host（参考实现）")
     parser.add_argument("--version", action="version", version=f"osca-host {__version__}")
     parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET, help=f"控制通道路径（默认 {DEFAULT_SOCKET}）")
+    parser.add_argument(
+        "--token-file",
+        type=Path,
+        help="principal token 文件（默认读 Host 生成的 admin token：<socket>.token）",
+    )
 
     sub = parser.add_subparsers(dest="command")
 
@@ -29,13 +39,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--load", action="append", default=[], metavar="PACK", help="启动时装载的包（目录或 zip），可多次"
     )
     p_run.add_argument("--bindings", help="部署环境 bindings.yaml，装载时比对")
+    p_run.add_argument(
+        "--deployments",
+        help="部署清单 deployments.yaml：deployment_id → {path[, bindings, dest]}——控制通道 load 只收 ID",
+    )
 
     sub.add_parser("status", help="注册表快照：已装载的包 / Aware / watcher 槽位")
 
-    p_load = sub.add_parser("load", help="向运行中的 Host 装载一个包")
-    p_load.add_argument("package", help=".osca 包目录或交付态 zip")
-    p_load.add_argument("--bindings", help="部署环境 bindings.yaml")
-    p_load.add_argument("--dest", help="zip 解压目标目录")
+    p_load = sub.add_parser("load", help="向运行中的 Host 装载一个部署条目（路径由 Host 侧 --deployments 解析）")
+    p_load.add_argument("deployment_id", help="Host 启动时 --deployments 清单里的部署 ID")
 
     p_unload = sub.add_parser("unload", help="包停：注销全部 watcher 并移除包")
     p_unload.add_argument("package_id")
@@ -52,7 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_fire.add_argument("package_id")
     p_fire.add_argument("trigger_id", help="全局触发 ID，如 AW-001/T3")
 
-    p_approve = sub.add_parser("approve", help="审批门：对审批清单内的动作授予一次性放行（M4 换审批卡界面）")
+    p_approve = sub.add_parser(
+        "approve", help="审批门：授予一次性放行——须 approver 角色 token（admin 不可伪造业务审批）"
+    )
     p_approve.add_argument("package_id")
     p_approve.add_argument("action", help="policy.yaml approvals 里声明的动作名")
 
@@ -66,8 +80,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _client(request: dict, socket_path: Path) -> int:
-    response = send_command(request, socket_path)
+def _load_deployments(path: str) -> dict[str, dict]:
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError("部署清单必须是 mapping：deployment_id → {path[, bindings, dest]}")
+    for did, spec in data.items():
+        if not isinstance(spec, dict) or "path" not in spec or set(spec) - {"path", "bindings", "dest"}:
+            raise ValueError(f"部署 {did} 须是 {{path[, bindings, dest]}}（path 必填，不收其他键）")
+    return data
+
+
+def _client(request: dict, socket_path: Path, token_file: Path | None) -> int:
+    token = None
+    if token_file is not None:
+        try:
+            token = token_file.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            print(f"读不到 token 文件：{e}")
+            return EXIT_FAILURE
+    response = send_command(request, socket_path, token=token)
     if request["cmd"] in ("status", "episodes", "episode") and response.get("ok"):
         print(json.dumps(response, ensure_ascii=False, indent=2))
     else:
@@ -88,27 +119,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         from osca_host.host import run_host
 
+        deployments = None
+        if args.deployments:
+            try:
+                deployments = _load_deployments(args.deployments)
+            except (OSError, ValueError, yaml.YAMLError) as e:
+                print(f"部署清单不可用：{e}")
+                return EXIT_FAILURE
         packs = [{"path": p, "bindings": args.bindings} for p in args.load]
-        return run_host(args.socket, packs)
+        return run_host(args.socket, packs, deployments)
 
-    if args.command == "status":
-        return _client({"cmd": "status"}, args.socket)
-    if args.command == "load":
-        return _client({"cmd": "load", "path": args.package, "bindings": args.bindings, "dest": args.dest}, args.socket)
-    if args.command == "unload":
-        return _client({"cmd": "unload", "package_id": args.package_id}, args.socket)
-    if args.command in ("enable", "disable"):
-        return _client({"cmd": args.command, "package_id": args.package_id, "aware_id": args.aware_id}, args.socket)
-    if args.command == "fire":
-        return _client({"cmd": "fire", "package_id": args.package_id, "trigger_id": args.trigger_id}, args.socket)
-    if args.command == "approve":
-        return _client({"cmd": "approve", "package_id": args.package_id, "action": args.action}, args.socket)
-    if args.command == "episodes":
-        return _client({"cmd": "episodes"}, args.socket)
-    if args.command == "episode":
-        return _client({"cmd": "episode", "episode_id": args.episode_id}, args.socket)
-    if args.command == "stop":
-        return _client({"cmd": "stop"}, args.socket)
+    client = {
+        "status": lambda: {"cmd": "status"},
+        "load": lambda: {"cmd": "load", "deployment_id": args.deployment_id},
+        "unload": lambda: {"cmd": "unload", "package_id": args.package_id},
+        "enable": lambda: {"cmd": "enable", "package_id": args.package_id, "aware_id": args.aware_id},
+        "disable": lambda: {"cmd": "disable", "package_id": args.package_id, "aware_id": args.aware_id},
+        "fire": lambda: {"cmd": "fire", "package_id": args.package_id, "trigger_id": args.trigger_id},
+        "approve": lambda: {"cmd": "approve", "package_id": args.package_id, "action": args.action},
+        "episodes": lambda: {"cmd": "episodes"},
+        "episode": lambda: {"cmd": "episode", "episode_id": args.episode_id},
+        "stop": lambda: {"cmd": "stop"},
+    }
+    if args.command in client:
+        return _client(client[args.command](), args.socket, args.token_file)
 
     parser.error(f"未知命令：{args.command}")
     return EXIT_FAILURE
