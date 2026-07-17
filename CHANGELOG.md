@@ -311,6 +311,9 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   真写」端到端闭环待 M5/M6——真写执行未接入（payload 摘要恒空串摘要）、runner 无
   剧集内挂起等批（挑战绑 episode_id，重跑即新剧集，已批挑战等不到 consume）；
   接通时须一并落地剧集内等批重试、审批卡带人类可读脱敏 payload、TTL 按人审时延重估
+- 外部审查补漏（GPT review）：approver 名绑定是全局的、无包域——同名审批人可批任何
+  指定其名的包、challenges 不按审批人过滤；README 矩阵补多租户告示（与 expert 同款，
+  包域收窄归 T1/T2）；挑战存储进程内随 Policy 同寿（包重载即清空 pending）同段明示
 
 ## [Unreleased]
 - 发布 OSCA 开放规范白皮书 v1.0：以 OSCA 为核心、Oscaware 为参考实现，覆盖 O/S/C/A/J、

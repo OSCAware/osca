@@ -113,7 +113,7 @@ shasum -a 256 operator.token           # 将摘要写入 Host 侧 principals 文
 |---|---|---|
 | `host_admin` | status / load / unload / enable / disable / fire / episodes / episode / stop | 审批面（approve/deny/challenges——admin 管生命周期但不可伪造业务审批） |
 | `operator` | status / enable / disable / fire / episodes（摘要；脱敏 DTO 属 W2，当前与 admin 同构——勿授予不可信进程） | load、审批面、完整 episode、stop |
-| `approver` | challenges / approve / deny（M4-W3：绑 challenge_id 批/驳一张具体挑战；principal 名须与挑战指定审批人相符——冒名/越权/一次性/过期由挑战状态机 fail-closed） | 其余全部（无生命周期/快照/启停/剧集面） |
+| `approver` | challenges / approve / deny（M4-W3：绑 challenge_id 批/驳一张具体挑战；principal 名须与挑战指定审批人相符——冒名/越权/一次性/过期由挑战状态机 fail-closed。**名绑定是全局的、无包域**：同名审批人可批任何指定其名的包，challenges 覆盖任意包全部待批项、不按审批人过滤；per-principal 包域收窄归 T1/T2，之前勿在多租户 Host 上授予——与 expert 同款告示） | 其余全部（无生命周期/快照/启停/剧集面） |
 | `expert` | episodes / episode（M4-W1 专家端只读交付面——draft 即交付物；episodes 摘要当前覆盖 Host 上全部包，per-principal 包域收窄未做，勿在多租户 Host 上授予） | 其余全部 |
 
 ### M4-W3 审批挑战（诚实标注：机制完成，闭环待 M5/M6）
@@ -129,6 +129,10 @@ W3 落地的是**机制**：绑定挑战状态机（approver / episode / payload
 consume，到 TTL 过期作废。M5/M6 接入真写时须一并落地：①剧集内挂起等批后重试消费；
 ②审批卡带脱敏后的人类可读 payload（只给摘要 = 让审批人对哈希拍板）；③TTL 按 IM
 人审时延重估（现值 5 分钟是机制口径）。
+
+另两条现状边界：挑战存储是进程内、随 Policy 同寿——包重载 / Host 重启即清空 pending
+（闭环未通故今天无实际影响；是否持久化属 M5/M6 闭环设计）；approver 的名绑定无包域
+（见上表告示），包域收窄归 T1/T2 多租户。
 
 `load` 只收 `deployment_id`：包路径、bindings、解压目录一律由 Host 侧
 `--deployments` 清单解析（相对路径按清单文件所在目录解析），绝不从连接者
