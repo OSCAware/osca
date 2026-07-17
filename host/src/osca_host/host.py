@@ -105,14 +105,14 @@ class Host:
             async with self._cmd_lock:
                 if self.state is not HostState.RUNNING and cmd not in ("status", "episodes", "episode", "stop"):
                     return {"ok": False, "detail": f"Host 当前为 {self.state.name}，拒绝新的变更命令"}
-                return self._dispatch(cmd, request)
+                return self._dispatch(cmd, request, principal)
         except RegistryError as e:
             return {"ok": False, "detail": str(e)}
         finally:
             if current is not None:
                 self._control_tasks.discard(current)
 
-    def _dispatch(self, cmd: str, request: dict) -> dict:
+    def _dispatch(self, cmd: str, request: dict, principal: Principal) -> dict:
         if cmd == "status":
             snapshot = self.registry.status()
             for pkg in snapshot["packages"]:
@@ -122,13 +122,22 @@ class Host:
                 policy = self.policies.get(pkg["package_id"])
                 pkg["policy"] = policy.snapshot() if policy else None
             return {"ok": True, "version": __version__, **snapshot, "triggers": self.table.status()}
-        if cmd == "approve":
+        if cmd in ("approve", "deny"):
+            # 审批人经控制通道批/驳一张具体挑战（绑 challenge_id）。principal.name 必与挑战指定审批人相符
+            # （ChallengeStore.decide 强制），冒名/越权/一次性全在状态机 fail-closed。
             policy = self.policies.get(request["package_id"])
             if policy is None:
                 return {"ok": False, "detail": f"包未注册：{request['package_id']}"}
-            ok, detail = policy.grant_approval(request["action"])
+            ok, detail = policy.decide_challenge(
+                request["challenge_id"], by_name=principal.name, by_role=principal.role, approve=(cmd == "approve")
+            )
             log.info(detail)
             return {"ok": ok, "detail": detail}
+        if cmd == "challenges":
+            policy = self.policies.get(request["package_id"])
+            if policy is None:
+                return {"ok": False, "detail": f"包未注册：{request['package_id']}"}
+            return {"ok": True, "challenges": policy.pending_challenges()}
         if cmd == "unload":
             return self._unload(request["package_id"])
         if cmd in ("enable", "disable"):

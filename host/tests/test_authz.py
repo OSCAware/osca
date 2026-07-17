@@ -41,21 +41,37 @@ def test_role_caps_matrix_pinned():
     assert "approve" not in ROLE_CAPS["host_admin"]  # admin 不可伪造业务审批
     assert ROLE_CAPS["operator"] == {"status", "enable", "disable", "fire", "episodes"}
     assert "episode" not in ROLE_CAPS["operator"]  # 剧集摘要可看，全量导出不给
-    # W3 审批 challenge（pending→approved|denied→consumed，绑定 approver/episode/
-    # digest/expiry/nonce）落地前，旧 set[action] 授予不从控制通道暴露——approver 空集
-    assert ROLE_CAPS["approver"] == frozenset()
+    # W3 审批 challenge（pending→approved|denied→consumed，绑定 approver/episode/digest/
+    # expiry/nonce）：approver 批/驳（绑 challenge_id）+ 看待批清单——绑定挑战替换旧无绑定 set[action]
+    assert ROLE_CAPS["approver"] == {"approve", "deny", "challenges"}
+    assert "approve" not in ROLE_CAPS["host_admin"]  # admin 管生命周期但不可伪造业务审批（deny/challenges 同理）
+    for cap in ("deny", "challenges"):
+        assert cap not in ROLE_CAPS["host_admin"] and cap not in ROLE_CAPS["operator"]
+    # approver 只有审批面，无生命周期/快照/启停
+    for denied in ("status", "load", "unload", "enable", "disable", "fire", "episodes", "episode", "stop"):
+        assert denied not in ROLE_CAPS["approver"]
     # M4-W1 专家端：只读交付面——episodes 摘要 + episode 全量（draft 即交付物）；写命令一律不给
     assert ROLE_CAPS["expert"] == {"episodes", "episode"}
 
 
 def test_expert_role_readonly_delivery_surface():
-    """expert 只读：能取剧集（交付面），任何状态变更命令一律被拒。"""
+    """expert 只读：能取剧集（交付面），任何状态变更/审批命令一律被拒。"""
     az = Authorizer()
     expert = Principal("专家桥", "expert")
     assert az.authorize(expert, "episodes")
     assert az.authorize(expert, "episode")
-    for denied in ("status", "load", "unload", "enable", "disable", "fire", "approve", "stop"):
+    for denied in ("status", "load", "unload", "enable", "disable", "fire", "approve", "deny", "challenges", "stop"):
         assert not az.authorize(expert, denied)
+
+
+def test_approver_role_challenge_surface_only():
+    """approver：只有审批 challenge 面（approve/deny/challenges），生命周期/快照/启停一律被拒。"""
+    az = Authorizer()
+    approver = Principal("审批人", "approver")
+    for allowed in ("approve", "deny", "challenges"):
+        assert az.authorize(approver, allowed)
+    for denied in ("status", "load", "unload", "enable", "disable", "fire", "episodes", "episode", "stop"):
+        assert not az.authorize(approver, denied)
 
 
 def test_authorizer_register_identify_authorize():

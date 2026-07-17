@@ -212,6 +212,10 @@ def run_episode(
             payloads: dict[str, object] = {}
             receipts: list[dict] = []
             for ref in refs:
+                # 当前 connector-performer 是取数（读）步，不传 params。审批门（require_write_approval）
+                # 已按 episode_id + payload(params) 摘要挂绑定挑战，但真写执行未接入（_execute_real 返回未接入）：
+                # 待 M5/M6 真写落地时须在此传入模型给出的写 params（否则 payload_digest 恒为空串摘要、绑不住被写内容），
+                # 且审批门拦下的写应在**本剧集内**挂起等批后重试消费（而非当场 failed）——否则 episode_id 绑定不可兑现。
                 receipt = proxy.call(ref, step=step_name, episode_id=episode.episode_id)
                 receipts.append(asdict(receipt))
                 if not receipt.ok:

@@ -40,6 +40,8 @@ from osca_cli.triggers import (  # 数量记法与预算键的单一真理源（
     parse_quantity,
 )
 
+from osca_host.challenge import ChallengeStore, payload_digest  # W3 审批：绑定挑战替换旧无绑定 set[action]
+
 __all__ = ["PolicyInterceptor", "REDACTORS", "ledger_stats", "parse_quantity", "replay_health"]
 
 # 边界用数字负向断言而非 \b：中文与数字同属正则「单词字符」，
@@ -57,9 +59,13 @@ AUDIT_TAIL = 20  # status 里只带最近这些条
 
 
 class PolicyInterceptor:
-    def __init__(self, package_id: str, policy: dict, ledger_stats: dict[str, int]):
+    def __init__(
+        self, package_id: str, policy: dict, ledger_stats: dict[str, int], *, challenges: ChallengeStore | None = None
+    ):
         self.package_id = package_id
         self.audit: list[dict] = []
+        # 审批门的绑定挑战存储（每包一台，随包卸载而消亡）。可注入（测试控时/共享）。
+        self._challenges = challenges if challenges is not None else ChallengeStore()
 
         # ── 笼子自防：形状错误绝不静默改语义（如关闭脱敏）——留审计警告，lint 之外的第二道闸 ──
         def shape_warn(section: str, value, expected: str) -> None:
@@ -175,7 +181,6 @@ class PolicyInterceptor:
                 str(approvals_raw),
                 "审批配置非法——审批门一律拒绝（fail-closed），修好 policy 再放行",
             )
-        self._granted: set[str] = set()
         self.revoked = ""  # 非空即包停/撤销原因——在途剧集在步间与每次调用点看它（三级停之「包停」触达认知平面）
         self._policy = policy  # kill switch 重算用（账本计数变了，条件不变）
         self._warned_conditions: set[str] = set()  # 不可求值条件只警告一次，重算不刷屏
@@ -379,24 +384,36 @@ class PolicyInterceptor:
             return self._allow(None, host, "egress 白名单放行")
         return self._deny(None, host, f"egress 默认全禁：{host} 不在 allow_domains")
 
-    # ── 审批门（授予一次用一次；授予入口是控制通道，M4 换审批卡界面） ──
+    # ── 审批门（绑定挑战：批一张、用一次；批/驳入口是控制通道 approve/deny，M4-W3.2 换 IM 审批卡） ──
 
-    def require_approval(self, action: str) -> tuple[bool, str]:
-        with self._gate:  # 一次性 token 的消费与授予跨线程（控制通道 vs 剧集线程）——同一边界
-            return self._require_approval_locked(action)
+    def require_approval(self, action: str, *, episode_id: str | None, payload: object) -> tuple[bool, str]:
+        """审批门放行路径：绑定挑战（approver/episode/payload digest/expiry/nonce）替换旧无绑定 token。
 
-    def _require_approval_locked(self, action: str) -> tuple[bool, str]:
+        动作不在审批清单 → 放行；在清单：按同绑定（package/action/episode/payload digest）找已批准挑战
+        一次性 consume 放行；无则挂起/复用一张 pending 挑战供审批人裁决，本次拒绝（fail-closed）。
+        撤销/kill 在 authorize_tool/authorize_llm 已先行拦截，审批门不重复检查。
+        """
         if self._approvals_broken:
             return self._deny(None, action, "approvals 配置非法——审批门一律拒绝（fail-closed），修好 policy 再放行")
         approver = self.approvals.get(action)
         if approver is None:
             return True, "动作不在审批清单，放行"
-        if action in self._granted:
-            self._granted.discard(action)
-            return self._allow(None, action, f"审批已获（{approver}），一次性放行")
-        return self._deny(None, action, f"审批门拦截：动作「{action}」需 {approver} 审批")
+        digest = payload_digest(payload)
+        ep = episode_id or ""
+        ok, detail = self._challenges.consume(
+            package_id=self.package_id, action=action, episode_id=ep, payload_digest=digest
+        )
+        if ok:
+            return self._allow(None, action, detail)
+        # 无匹配的已批准挑战：挂起/复用一张 pending 供审批人裁决（幂等，不刷屏），本次拒绝。
+        ch = self._challenges.raise_or_get(
+            package_id=self.package_id, action=action, approver=approver, episode_id=ep, payload_digest=digest
+        )
+        return self._deny(None, action, f"审批门拦截：「{action}」需 {approver} 审批（挑战 {ch.challenge_id} 待批）")
 
-    def require_write_approval(self, interface_ref: str) -> tuple[bool, str]:
+    def require_write_approval(
+        self, interface_ref: str, *, episode_id: str | None, payload: object
+    ) -> tuple[bool, str]:
         """写接口的审批门（Connector 代理写路径必经，内部调用不豁免）。
 
         与 require_approval 的缺省放行相反：写动作**默认拒绝**——不在审批清单的
@@ -406,21 +423,17 @@ class PolicyInterceptor:
             return self._deny(
                 None, interface_ref, f"写接口「{interface_ref}」不在 policy approvals 清单——写动作默认拒绝"
             )
-        return self.require_approval(interface_ref)
+        return self.require_approval(interface_ref, episode_id=episode_id, payload=payload)
 
-    def grant_approval(self, action: str) -> tuple[bool, str]:
-        with self._gate:
-            return self._grant_approval_locked(action)
+    def decide_challenge(self, challenge_id: str, *, by_name: str, by_role: str, approve: bool) -> tuple[bool, str]:
+        """控制通道审批人批/驳一张挑战（绑 challenge_id）。角色/冒名/一次性防护在 ChallengeStore.decide。"""
+        ok, detail = self._challenges.decide(challenge_id, by_name=by_name, by_role=by_role, approve=approve)
+        self._record("allow" if ok else "deny", "approval", challenge_id, detail)
+        return ok, detail
 
-    def _grant_approval_locked(self, action: str) -> tuple[bool, str]:
-        if self._approvals_broken:
-            # 配置损坏时授予必须失败——授出一个 require 永远拒绝的 token 是控制面撒谎
-            return False, "approvals 配置非法——授予拒绝（fail-closed），修好 policy 再来"
-        if action not in self.approvals:
-            return False, f"动作「{action}」不在审批清单中"
-        self._granted.add(action)
-        self._record("allow", "approval", action, "操作者授予一次性审批")
-        return True, f"已授予一次性审批：{action}（审批人应为 {self.approvals[action]}）"
+    def pending_challenges(self) -> list[dict]:
+        """待审批挑战的脱敏 DTO 清单（控制通道 challenges 命令 / IM 审批卡轮询输入；不含 nonce）。"""
+        return [ch.public() for ch in self._challenges.list_pending()]
 
     # ── 脱敏（注入剧集前执行） ─────────────────────────────────────────
 
@@ -471,10 +484,12 @@ class PolicyInterceptor:
             "max_tool_calls": self.max_tool_calls,
             "max_tokens": self.max_tokens,
             "approvals": (
-                "config_error/deny_all"  # 控制面不撒谎：配置损坏时明示一律拒绝，而非展示永不生效的 granted
+                "config_error/deny_all"  # 控制面不撒谎：配置损坏时明示一律拒绝
                 if self._approvals_broken
-                else {a: ("granted" if a in self._granted else "pending") for a in self.approvals}
+                else dict(self.approvals)  # action → 指定审批人（谁能批）；批准与否是挑战级、见 pending_challenges
             ),
+            # 待审批挑战数；完整清单经 challenges 命令（approver-only）
+            "pending_challenges": len(self._challenges.list_pending()),
             "redact": self.redact_categories,
             "audit_tail": self.audit[-AUDIT_TAIL:],
         }

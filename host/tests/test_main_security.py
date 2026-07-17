@@ -2,7 +2,32 @@ from __future__ import annotations
 
 import pytest
 
+from osca_host import main as m
+from osca_host.authz import PROTOCOL_VERSION, validate_request
 from osca_host.main import _client, _load_deployments
+
+
+@pytest.mark.parametrize(
+    ("argv", "expect"),
+    [
+        (["challenges", "pkg"], {"cmd": "challenges", "package_id": "pkg"}),
+        (["approve", "pkg", "CH-1"], {"cmd": "approve", "package_id": "pkg", "challenge_id": "CH-1"}),
+        (["deny", "pkg", "CH-1"], {"cmd": "deny", "package_id": "pkg", "challenge_id": "CH-1"}),
+    ],
+)
+def test_cli_builds_schema_valid_w3_approval_requests(argv, expect, monkeypatch):
+    """CLI 客户端为 W3 审批命令构造的请求必须与 COMMAND_FIELDS 契约对齐（防 approve/deny/challenges 契约漂移回归）。"""
+    captured: dict = {}
+
+    def fake_send(request, socket_path, token=None):
+        captured["req"] = request
+        return {"ok": True, "detail": "ok", "challenges": []}
+
+    monkeypatch.setattr(m, "send_command", fake_send)
+    assert m.main(argv) == 0
+    assert captured["req"] == expect
+    # 关键回归：请求过 schema（不再是旧的 {cmd:approve, action:...}，否则 validate_request 拒）
+    assert validate_request({"v": PROTOCOL_VERSION, **captured["req"]}) is None
 
 
 @pytest.mark.parametrize(

@@ -9,10 +9,10 @@
 
 授权在进入命令实现前裁决：角色 → 能力集，不在集合内一律拒绝（fail-closed）。
 M4 权限矩阵：host_admin 管生命周期但**不可授予业务审批**；operator 只有快照、
-启停触发与剧集摘要（脱敏 DTO 属 W2）；approver 在 W3 审批 challenge
+启停触发与剧集摘要（脱敏 DTO 属 W2）；approver 经 W3 审批 challenge
 （pending → approved|denied → consumed，绑定 approver/episode/payload digest/
-expiry/nonce）落地前为空集——旧 set[action] 授予不从控制通道暴露；
-expert 的命令随 M4-W1 专家端落地。
+expiry/nonce）批/驳（绑 challenge_id）与看待批清单——绑定挑战替换旧 set[action]
+无绑定授予；expert 的命令随 M4-W1 专家端落地。
 """
 
 from __future__ import annotations
@@ -35,7 +35,8 @@ MAX_CRED_FILE = 64 * 1024  # 凭据文件大小上限
 ROLE_CAPS: dict[str, frozenset[str]] = {
     "host_admin": frozenset({"status", "load", "unload", "enable", "disable", "fire", "episodes", "episode", "stop"}),
     "operator": frozenset({"status", "enable", "disable", "fire", "episodes"}),
-    "approver": frozenset(),  # W3 审批 challenge 前为空——旧 approve RPC 对全角色关闭，不留无绑定授予面
+    # W3 审批 challenge：approve/deny 绑 challenge_id、challenges 看待批清单——绑定挑战替换旧无绑定 set[action]
+    "approver": frozenset({"approve", "deny", "challenges"}),
     "expert": frozenset({"episodes", "episode"}),  # M4-W1 专家端：只读交付面（摘要 + 全量导出——draft 正是要交付之物）
 }
 
@@ -48,7 +49,9 @@ COMMAND_FIELDS: dict[str, tuple[str, ...]] = {
     "enable": ("package_id", "aware_id"),
     "disable": ("package_id", "aware_id"),
     "fire": ("package_id", "trigger_id"),
-    "approve": ("package_id", "action"),
+    "approve": ("package_id", "challenge_id"),  # W3：批一张具体挑战（绑 challenge_id），非旧的按 action 授予
+    "deny": ("package_id", "challenge_id"),
+    "challenges": ("package_id",),  # 待审批挑战清单（approver 拉取，IM 审批卡输入）
     "episodes": (),
     "episode": ("episode_id",),
     "stop": (),

@@ -62,14 +62,52 @@ def test_kill_switch_unparsable_condition_warns_not_trips():
 
 
 def test_approval_gate_one_shot():
+    """绑定挑战审批门：首次拦并挂 pending 挑战 → approver 批 → 同绑定放行一次 → 一次性再拦。"""
     p = make()
-    assert not p.require_approval("终稿发送管理层")[0]  # 未审批 → 拦
-    ok, detail = p.grant_approval("终稿发送管理层")
+    action = "终稿发送管理层"
+    ok, detail = p.require_approval(action, episode_id="EP-1", payload={"x": 1})
+    assert not ok and "审批门拦截" in detail  # 未批 → 拦，同时挂 pending 挑战
+    [ch] = p.pending_challenges()
+    assert ch["action"] == action and ch["approver"] == "专家" and "nonce" not in ch  # 脱敏 DTO 不外泄 nonce
+    ok, _ = p.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
     assert ok
-    assert p.require_approval("终稿发送管理层")[0]  # 授予后放行一次
-    assert not p.require_approval("终稿发送管理层")[0]  # 一次性：再次即拦
-    assert p.require_approval("普通动作")[0]  # 不在清单的动作不设门
-    assert not p.grant_approval("不存在的动作")[0]
+    assert p.require_approval(action, episode_id="EP-1", payload={"x": 1})[0]  # 同绑定放行一次
+    assert not p.require_approval(action, episode_id="EP-1", payload={"x": 1})[0]  # 一次性：consume 后再拦
+    assert p.require_approval("普通动作", episode_id="EP-1", payload={})[0]  # 不在清单的动作不设门
+
+
+def test_approval_binds_payload_no_swap():
+    """偷梁换柱防线（端到端接线）：批「4.5 折」的挑战不得放行「1 折」的写。"""
+    p = make()
+    action = "终稿发送管理层"
+    p.require_approval(action, episode_id="EP-1", payload={"折扣": "4.5"})  # 挂挑战 A（绑 4.5 折摘要）
+    [ch] = p.pending_challenges()
+    p.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+    assert not p.require_approval(action, episode_id="EP-1", payload={"折扣": "1"})[0]  # 换 payload → 摘要不符，拒
+    assert p.require_approval(action, episode_id="EP-1", payload={"折扣": "4.5"})[0]  # 原 payload 仍放行一次
+
+
+def test_approval_deny_blocks_consume():
+    """驳回：approver deny 后该挑战不可放行；同绑定重试会挂一张新 pending。"""
+    p = make()
+    action = "终稿发送管理层"
+    p.require_approval(action, episode_id="EP-1", payload={})
+    [ch] = p.pending_challenges()
+    ok, _ = p.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=False)
+    assert ok
+    assert not p.require_approval(action, episode_id="EP-1", payload={})[0]  # 已驳回：consume 不中，另挂新 pending
+    [ch2] = p.pending_challenges()
+    assert ch2["challenge_id"] != ch["challenge_id"]
+
+
+def test_approval_imposter_and_wrong_role_cannot_decide():
+    """冒名/越权批不动：decide 须 role=approver 且 by_name 与挑战指定审批人相符（fail-closed）。"""
+    p = make()
+    p.require_approval("终稿发送管理层", episode_id="EP-1", payload={})
+    [ch] = p.pending_challenges()
+    assert not p.decide_challenge(ch["challenge_id"], by_name="冒名", by_role="approver", approve=True)[0]  # 名不符
+    assert not p.decide_challenge(ch["challenge_id"], by_name="专家", by_role="operator", approve=True)[0]  # 角色不符
+    assert not p.require_approval("终稿发送管理层", episode_id="EP-1", payload={})[0]  # 仍未获批 → 拦
 
 
 def test_kill_switch_garbage_threshold_does_not_crash():
@@ -109,8 +147,8 @@ def test_interceptor_fails_closed_on_broken_safety_config():
     assert p2.permissions["取数"] == set()  # 混合列表不部分接受——整叶空白名单（默认拒绝）
     assert p2.kill_tripped and "配置错误" in p2.kill_reason  # kill switch 形状非法 → 停机
     assert p2.max_tool_calls == 0 and p2.max_tokens == 0  # 预算非法 → 额度撤销
-    assert not p2.require_approval("终稿发送管理层")[0]  # 审批配置非法 → 一律拒绝
-    assert not p2.require_approval("任意动作")[0]  # 「不在清单放行」的口子也关死
+    assert not p2.require_approval("终稿发送管理层", episode_id="EP-1", payload={})[0]  # 审批配置非法 → 一律拒绝
+    assert not p2.require_approval("任意动作", episode_id="EP-1", payload={})[0]  # 「不在清单放行」的口子也关死
 
     p3 = make(policy={**POLICY, "data": {"redact": ["身份证"]}})  # 合法形状、未知类别
     assert set(p3.redact_categories) == set(REDACTORS)  # 未知类别同样保守全开
@@ -154,15 +192,18 @@ def test_unparsable_budget_revokes_quota_not_unlimited():
 
 
 def test_write_approval_defaults_to_deny():
-    """写动作默认拒绝：不在 approvals 清单的写接口没有合法路径；token 一次性消费。"""
+    """写动作默认拒绝：不在 approvals 清单的写接口没有合法路径；批准后一次性消费。"""
     p = make()
-    ok, reason = p.require_write_approval("CON-009.回写工单")
+    ref = "CON-009.回写工单"
+    ok, reason = p.require_write_approval(ref, episode_id="EP-1", payload="")
     assert not ok and "默认拒绝" in reason
-    p.approvals["CON-009.回写工单"] = "专家"
-    assert not p.require_write_approval("CON-009.回写工单")[0]  # 在清单但未授予 → 拦
-    p.grant_approval("CON-009.回写工单")
-    assert p.require_write_approval("CON-009.回写工单")[0]  # 授予后放行一次
-    assert not p.require_write_approval("CON-009.回写工单")[0]  # token 已消费
+    p.approvals[ref] = "专家"
+    ok, detail = p.require_write_approval(ref, episode_id="EP-1", payload="")
+    assert not ok and "审批门拦截" in detail  # 在清单但未批 → 拦（挂 pending 挑战）
+    [ch] = p.pending_challenges()
+    p.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+    assert p.require_write_approval(ref, episode_id="EP-1", payload="")[0]  # 批后放行一次
+    assert not p.require_write_approval(ref, episode_id="EP-1", payload="")[0]  # 一次性：consume 后再拦
 
 
 def test_redaction():
@@ -194,11 +235,10 @@ def test_zero_token_budget_denies_before_any_call():
     assert not ok and "拒绝发起" in reason
 
 
-def test_grant_refused_and_status_honest_when_approvals_broken():
-    """P2：配置损坏时授予必须失败——授出永不生效的 token、status 显示 granted 都是控制面撒谎。"""
+def test_status_honest_when_approvals_broken():
+    """P2：配置损坏时审批门一律拒绝，status 明示 config_error/deny_all（控制面不撒谎）。"""
     p = make(policy={**POLICY, "approvals": ["oops"]})
-    ok, reason = p.grant_approval("终稿发送管理层")
-    assert not ok and "配置非法" in reason
+    assert not p.require_approval("终稿发送管理层", episode_id="EP-1", payload={})[0]  # 一律拒绝
     assert p.snapshot()["approvals"] == "config_error/deny_all"
 
 

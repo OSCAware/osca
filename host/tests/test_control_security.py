@@ -165,10 +165,12 @@ async def test_role_capability_matrix_enforced(running_host):
     # operator：快照（脱敏 DTO 属 W2）/ 启停 / 发射 / 剧集摘要
     assert (await _send({"cmd": "status"}, host, token=operator))["ok"]
     assert (await _send({"cmd": "episodes"}, host, token=operator))["ok"]
-    # operator 明确禁止：load 面 / 审批 / 完整剧集 / 生命周期
+    # operator 明确禁止：load 面 / 审批面（approve/deny/challenges）/ 完整剧集 / 生命周期
     for request in (
         {"cmd": "load", "deployment_id": "x"},
-        {"cmd": "approve", "package_id": "p", "action": "a"},
+        {"cmd": "approve", "package_id": "p", "challenge_id": "CH-x"},
+        {"cmd": "deny", "package_id": "p", "challenge_id": "CH-x"},
+        {"cmd": "challenges", "package_id": "p"},
         {"cmd": "episode", "episode_id": "EP-0001"},
         {"cmd": "unload", "package_id": "p"},
         {"cmd": "stop"},
@@ -176,10 +178,18 @@ async def test_role_capability_matrix_enforced(running_host):
         response = await _send(request, host, token=operator)
         assert response["error"] == "forbidden", request
 
-    # 审批 RPC 在 W3 challenge 前对全角色关闭：admin 不可伪造业务审批，approver 也是空集
-    assert (await _send({"cmd": "approve", "package_id": "p", "action": "a"}, host))["error"] == "forbidden"
-    approve_req = {"cmd": "approve", "package_id": "p", "action": "a"}
-    assert (await _send(approve_req, host, token=approver))["error"] == "forbidden"
+    # 审批面：admin 管生命周期但不可伪造业务审批——approve/deny/challenges 都不在 host_admin 能力集
+    for request in (
+        {"cmd": "approve", "package_id": "p", "challenge_id": "CH-x"},
+        {"cmd": "deny", "package_id": "p", "challenge_id": "CH-x"},
+        {"cmd": "challenges", "package_id": "p"},
+    ):
+        assert (await _send(request, host))["error"] == "forbidden", request  # 默认 token = admin
+
+    # approver：有审批面（schema+authz 过、到达 handler；包 p 未注册故 ok=False 而非 forbidden）
+    resp = await _send({"cmd": "approve", "package_id": "p", "challenge_id": "CH-x"}, host, token=approver)
+    assert "error" not in resp and resp["ok"] is False and "包未注册" in resp["detail"]
+    # approver 无快照/启停/生命周期面
     assert (await _send({"cmd": "status"}, host, token=approver))["error"] == "forbidden"
     assert (await _send({"cmd": "status"}, host, token=expert))["error"] == "forbidden"
 

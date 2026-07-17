@@ -3,8 +3,8 @@
 run 之外的子命令都是控制通道客户端：对运行中的 Host 发注册表操作。
 身份即 token（M4-W0）：默认读 Host 生成的 admin token（socket 旁 0600 文件）；
     非 admin 界面进程用 --token-file 带自己 UID 所有的 0600 principal token——角色能力见
-osca_host.authz 的权限矩阵（admin 不可授予业务审批；approve 在 W3 审批
-challenge 落地前对全角色关闭）。
+osca_host.authz 的权限矩阵（admin 不可授予业务审批；approve/deny/challenges 属 approver 角色，
+绑 challenge_id 批/驳一张具体审批挑战——绑定挑战替换旧无绑定 set[action]）。
 """
 
 from __future__ import annotations
@@ -69,11 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_fire.add_argument("package_id")
     p_fire.add_argument("trigger_id", help="全局触发 ID，如 AW-001/T3")
 
-    p_approve = sub.add_parser(
-        "approve", help="审批门（W3 审批 challenge 落地前经控制通道禁用——旧 set[action] 授予不再暴露）"
-    )
+    p_challenges = sub.add_parser("challenges", help="列出某包的待审批挑战（脱敏 DTO，无 nonce）——approver 角色")
+    p_challenges.add_argument("package_id")
+
+    p_approve = sub.add_parser("approve", help="批准一张审批挑战（绑 challenge_id）——approver 角色")
     p_approve.add_argument("package_id")
-    p_approve.add_argument("action", help="policy.yaml approvals 里声明的动作名")
+    p_approve.add_argument("challenge_id", help="challenges 命令列出的挑战 ID，如 CH-abc123")
+
+    p_deny = sub.add_parser("deny", help="驳回一张审批挑战（绑 challenge_id）——approver 角色")
+    p_deny.add_argument("package_id")
+    p_deny.add_argument("challenge_id", help="challenges 命令列出的挑战 ID")
 
     sub.add_parser("episodes", help="剧集台账：近期唤醒装配的剧集摘要")
 
@@ -122,7 +127,7 @@ def _client(request: dict, socket_path: Path, token_file: Path | None) -> int:
             print(f"读不到 token 文件：{e}")
             return EXIT_FAILURE
     response = send_command(request, socket_path, token=token)
-    if request["cmd"] in ("status", "episodes", "episode") and response.get("ok"):
+    if request["cmd"] in ("status", "episodes", "episode", "challenges") and response.get("ok"):
         print(json.dumps(response, ensure_ascii=False, indent=2))
     else:
         detail = response.get("detail", "")
@@ -159,7 +164,9 @@ def main(argv: list[str] | None = None) -> int:
         "enable": lambda: {"cmd": "enable", "package_id": args.package_id, "aware_id": args.aware_id},
         "disable": lambda: {"cmd": "disable", "package_id": args.package_id, "aware_id": args.aware_id},
         "fire": lambda: {"cmd": "fire", "package_id": args.package_id, "trigger_id": args.trigger_id},
-        "approve": lambda: {"cmd": "approve", "package_id": args.package_id, "action": args.action},
+        "challenges": lambda: {"cmd": "challenges", "package_id": args.package_id},
+        "approve": lambda: {"cmd": "approve", "package_id": args.package_id, "challenge_id": args.challenge_id},
+        "deny": lambda: {"cmd": "deny", "package_id": args.package_id, "challenge_id": args.challenge_id},
         "episodes": lambda: {"cmd": "episodes"},
         "episode": lambda: {"cmd": "episode", "episode_id": args.episode_id},
         "stop": lambda: {"cmd": "stop"},

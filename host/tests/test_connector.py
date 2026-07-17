@@ -71,20 +71,23 @@ def test_egress_default_deny_for_real_endpoint(sample_pack):
 
 
 def test_write_path_gated_by_approval_even_for_internal_calls(proxy):
-    """写接口审批门：step=None 的内部调用不豁免；不在清单默认拒绝；token 一次性消费。"""
+    """写接口审批门（绑定挑战）：step=None 内部调用不豁免；不在清单默认拒绝；批准后一次性消费。"""
+    ref = "CON-001.拉取费用明细"
     proxy.connectors["CON-001"]["permissions"]["write"] = "allowed_with_approval"
 
-    receipt = proxy.call("CON-001.拉取费用明细", step=None)
+    receipt = proxy.call(ref, step=None)
     assert not receipt.ok and "默认拒绝" in receipt.error  # 不在 approvals 清单——内部调用也没有旁路
 
-    proxy.policy.approvals["CON-001.拉取费用明细"] = "专家"
-    receipt = proxy.call("CON-001.拉取费用明细", step="取数")
-    assert not receipt.ok and "审批门拦截" in receipt.error  # 在清单但未授予
+    proxy.policy.approvals[ref] = "专家"
+    receipt = proxy.call(ref, "2026-07", step="取数", episode_id="EP-1")
+    assert not receipt.ok and "审批门拦截" in receipt.error  # 在清单但未批 → 挂 pending 挑战
 
-    proxy.policy.grant_approval("CON-001.拉取费用明细")
-    assert proxy.call("CON-001.拉取费用明细", step="取数").ok  # 授予后放行一次（mock 执行）
-    receipt = proxy.call("CON-001.拉取费用明细", step="取数")
-    assert not receipt.ok and "审批门拦截" in receipt.error  # token 已消费
+    # 审批人批准该挑战（挑战绑到本次 episode + params 摘要）
+    [ch] = proxy.policy.pending_challenges()
+    proxy.policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+    assert proxy.call(ref, "2026-07", step="取数", episode_id="EP-1").ok  # 同绑定放行一次（mock 执行）
+    receipt = proxy.call(ref, "2026-07", step="取数", episode_id="EP-1")
+    assert not receipt.ok and "审批门拦截" in receipt.error  # 一次性：consume 后再调即拦
 
 
 def test_mock_fixture_missing(proxy, sample_pack):

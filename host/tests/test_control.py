@@ -200,26 +200,68 @@ async def test_w4_precondition_evaluated_through_proxy(running_host, sample_pack
     assert len(response["episodes"]) == 1
 
 
-async def test_w4_approval_gate_closed_until_challenge(running_host, sample_pack, deploy):
-    """审批 RPC 在 W3 challenge 落地前对全角色关闭——旧 set[action] 授予不从控制通道可达。
+async def test_w3_approval_challenge_control_flow(running_host, sample_pack, deploy):
+    """W3 审批 challenge 控制通道接线：challenges 列待批 → approve（绑 challenge_id，名须相符）→ 一次性 consume。
 
-    M2 的审批门语义仍在（policy 内部授予接口，runner 消费）；W3 用持久化 challenge
-    （pending→approved|denied→consumed，绑定 approver/episode/digest/expiry/nonce）替换它。
+    绑定挑战（pending→approved|denied→consumed，绑 approver/episode/payload digest/expiry/nonce）
+    替换旧无绑定 set[action]：批一张具体挑战、只放行同绑定的那一次写。
     """
     host = running_host
     await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
+    policy = host.policies[pid]
+    action = "终稿发送管理层"  # sample pack approvals：approver=专家
 
-    approver = "approver-token-0001"
-    host.authorizer.register(approver, Principal("审批卡", "approver"))
-    for token in (None, approver):  # admin 与 approver 一视同仁：无绑定授予面不暴露
-        response = await _send({"cmd": "approve", "package_id": pid, "action": "终稿发送管理层"}, host, token=token)
-        assert not response["ok"] and response["error"] == "forbidden"
+    # 模拟一次被审批门拦下的写：挂起一张 pending 挑战（绑 episode + payload 摘要）
+    ok, detail = policy.require_write_approval(action, episode_id="EP-0001", payload={"折扣": "4.5"})
+    assert not ok and "审批门拦截" in detail
 
-    ok, _ = host.policies[pid].grant_approval("终稿发送管理层")  # M2 语义（内部接口）未动
-    assert ok
-    response = await _send({"cmd": "status"}, host)
-    assert response["packages"][0]["policy"]["approvals"]["终稿发送管理层"] == "granted"
+    host.authorizer.register("approver-token-0001", Principal("专家", "approver"))  # name 须与 policy「专家」相符
+    host.authorizer.register("imposter-token-01", Principal("冒名", "approver"))
+
+    # admin（默认 token）无审批面：challenges/approve/deny 都不在 host_admin 能力集
+    assert (await _send({"cmd": "challenges", "package_id": pid}, host))["error"] == "forbidden"
+
+    # approver 拉待批清单（脱敏 DTO，无 nonce）
+    resp = await _send({"cmd": "challenges", "package_id": pid}, host, token="approver-token-0001")
+    assert resp["ok"] and len(resp["challenges"]) == 1
+    ch = resp["challenges"][0]
+    assert ch["action"] == action and ch["approver"] == "专家" and "nonce" not in ch
+
+    # 冒名审批人批不动（by_name 不符 → fail-closed）
+    bad_id = ch["challenge_id"]
+    bad = await _send({"cmd": "approve", "package_id": pid, "challenge_id": bad_id}, host, token="imposter-token-01")
+    assert not bad["ok"] and "审批人不符" in bad["detail"]
+
+    # 正主批准
+    good = await _send({"cmd": "approve", "package_id": pid, "challenge_id": bad_id}, host, token="approver-token-0001")
+    assert good["ok"]
+
+    # 同一绑定的写放行一次（consume），再写即拦（一次性）
+    assert policy.require_write_approval(action, episode_id="EP-0001", payload={"折扣": "4.5"})[0]
+    ok2, d2 = policy.require_write_approval(action, episode_id="EP-0001", payload={"折扣": "4.5"})
+    assert not ok2 and "审批门拦截" in d2
+
+    # status 诚实展示 action→指定审批人
+    st = await _send({"cmd": "status"}, host)
+    assert st["packages"][0]["policy"]["approvals"][action] == "专家"
+
+
+async def test_w3_approval_deny_over_control_channel(running_host, sample_pack, deploy):
+    """W3 deny：approver 经控制通道驳回一张挑战后，该绑定不可放行。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    policy = host.policies[pid]
+    action = "终稿发送管理层"
+    policy.require_write_approval(action, episode_id="EP-1", payload={})  # 挂挑战
+    host.authorizer.register("approver-token-0001", Principal("专家", "approver"))
+
+    resp = await _send({"cmd": "challenges", "package_id": pid}, host, token="approver-token-0001")
+    cid = resp["challenges"][0]["challenge_id"]
+    denied = await _send({"cmd": "deny", "package_id": pid, "challenge_id": cid}, host, token="approver-token-0001")
+    assert denied["ok"] and "驳回" in denied["detail"]
+    assert not policy.require_write_approval(action, episode_id="EP-1", payload={})[0]  # 驳回后不可放行
 
 
 async def test_w4_precondition_blocks_without_bindings(running_host, sample_pack):

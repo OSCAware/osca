@@ -79,8 +79,9 @@ class ConnectorProxy:
         connector = self.connectors[cid]
         if (connector.get("permissions") or {}).get("write") != "forbidden":
             # 写路径的审批门对内对外一视同仁——step=None 的运行时内部调用（watch/precondition/settle）
-            # 也不豁免。不在 approvals 清单的写接口默认拒绝；已授予的 token 一次性消费。
-            ok, reason = self.policy.require_write_approval(interface_ref)
+            # 也不豁免。不在 approvals 清单的写接口默认拒绝；在清单则挂/复用绑定挑战，批准后一次性 consume。
+            # 挑战绑到本次 episode + 被写 payload（params 摘要）——防跨剧集串用与偷梁换柱。
+            ok, reason = self.policy.require_write_approval(interface_ref, episode_id=episode_id, payload=params)
             if not ok:
                 return Receipt(ok=False, interface=interface_ref, error=reason)
 
