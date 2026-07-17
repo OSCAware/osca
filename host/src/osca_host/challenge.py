@@ -4,16 +4,17 @@
 就放行该动作的**任意**一次执行——confused-deputy（批 A 用于 B）+ 重放（批一次用多次）两大风险源。
 
 本状态机把每次高危动作变成一台**一次性**状态机 `pending → approved | denied → consumed`，
-五重绑定，任一不符即 fail-closed：
+四重绑定 + 一次性消费，任一不符即 fail-closed：
 - **approver**：只有 policy 指定的那个审批人（role=approver 且 name 相符）能批——防冒名/越权批；
 - **episode_id**：绑到具体剧集——防跨剧集串用（A 剧集批的授权不能拿去 B 剧集）；
 - **payload_digest**：绑到被审批 payload 的 sha256 摘要——防偷梁换柱（批「临期奶 4.5 折」不能应用到别的改价）；
 - **expires_at**：过期作废——防陈旧授权被翻出来用；
-- **nonce**：一次性随机数 + consume 后即 `consumed`——防重放（同一挑战批准后只能放行一次）。
+- **一次性**：`consume` 成功即 `consumed`，同一挑战再也放行不了第二次——防重放由状态机独担
+  （挑战 id 本身即高熵随机，不可预测不可枚举）。曾有独立 nonce 字段，但协议无任何一处校验它，
+  装饰性防线已删——安全模块的文档必须与代码一致（Review W3 收口）。
 
-授权是一次性的：`consume` 成功即 `consumed`，再也用不了；过期/撤销/驳回一律拒绝放行。
 本模块是纯状态机（时钟可注入），Host 侧的接线（authz approver 能力集 / 控制通道 approve·deny·challenges /
-policy.require_approval 接 consume / connector 传 episode+payload）属 W3.1b。
+policy.require_approval 接 consume_or_raise / connector 传 episode+payload）属 W3.1b。
 """
 
 from __future__ import annotations
@@ -34,7 +35,16 @@ CONSUMED = "consumed"
 EXPIRED = "expired"
 REVOKED = "revoked"
 
+# 机制口径的缺省 TTL。M5/M6 审批闭环接通（真写 + IM 人审 + 剧集内挂起等批）时须按人审时延
+# 重估——5 分钟对「人在 IM 上看到卡片再拍板」偏短，届时调大或按包/按动作配置。
 DEFAULT_TTL_SECONDS = 300.0
+
+# 终态挑战（consumed/denied/expired/revoked）的保留时长：留一段供在场排查，之后惰性清出——
+# store 不无限增长（长驻包的 Host 可运行数月）。裁决/放行的审计真相在 policy.audit
+#（decide_challenge/_allow/_deny 都 _record），不靠本 store 留史。
+TERMINAL_RETENTION_SECONDS = 3600.0
+
+_TERMINAL = (CONSUMED, DENIED, EXPIRED, REVOKED)
 
 
 def payload_digest(payload: object) -> str:
@@ -57,7 +67,6 @@ class Challenge:
     approver: str
     episode_id: str
     payload_digest: str
-    nonce: str
     created_at: float
     expires_at: float
     state: str = PENDING
@@ -72,7 +81,7 @@ class Challenge:
         return (self.package_id, self.action, self.episode_id, self.payload_digest)
 
     def public(self) -> dict:
-        """给控制通道 challenges 命令的脱敏 DTO：不含 nonce（防重放的秘密不外泄）。"""
+        """给控制通道 challenges 命令的 DTO（IM 审批卡的输入）。"""
         return {
             "challenge_id": self.challenge_id,
             "package_id": self.package_id,
@@ -89,16 +98,65 @@ class Challenge:
 class ChallengeStore:
     """绑定挑战的进程内存储与状态机。线程安全：raise/consume 在剧集线程、decide 在控制通道线程，同一锁。
 
-    时钟可注入（测试控时）。过期是惰性的：每次操作前把到点的 pending/approved 迁到 expired。
+    时钟可注入（测试控时）。过期与终态清出都是惰性的：每次操作前把到点的 pending/approved 迁
+    expired、把超保留期的终态挑战清出（_gc_locked）。
     """
 
-    def __init__(self, *, clock: Callable[[], float] = _wall_clock, ttl_seconds: float = DEFAULT_TTL_SECONDS):
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = _wall_clock,
+        ttl_seconds: float = DEFAULT_TTL_SECONDS,
+        terminal_retention_seconds: float = TERMINAL_RETENTION_SECONDS,
+    ):
         self._by_id: dict[str, Challenge] = {}
         self._lock = threading.Lock()
         self._clock = clock
         self._ttl = ttl_seconds
+        self._retention = terminal_retention_seconds
 
     # ── 剧集线程：命中审批门时挂起 / 放行 ──────────────────────────
+
+    def consume_or_raise(
+        self,
+        *,
+        package_id: str,
+        action: str,
+        approver: str,
+        episode_id: str,
+        payload_digest: str,
+        ttl_seconds: float | None = None,
+    ) -> tuple[bool, str, Challenge | None]:
+        """放行或挂起，**单锁原子**——policy.require_approval 的唯一入口。
+
+        先 consume（一次取锁）失败再 raise_or_get（另一次取锁）会留竞态窗：窗内 approver 恰好
+        批准了那张 pending，raise 侧只认 PENDING、看不见 APPROVED，会另开一张新挑战——同一绑定
+        同时存在已批 + 待批两张，审批人把第二张也批掉，同一逻辑动作就有两次一次性放行额度。
+        单锁内先试消费、再复用/挂起，窗口不存在。
+
+        返回 (True, detail, None) = 已批挑战被一次性消费放行；
+        (False, detail, challenge) = 无可消费挑战，已复用/挂起一张 pending 供审批人裁决。
+        """
+        now = self._clock()
+        key = (package_id, action, episode_id, payload_digest)
+        with self._lock:
+            self._gc_locked(now)
+            ok, detail = self._consume_locked(key, now)
+            if ok:
+                return True, detail, None
+            existing = self._find_locked(PENDING, key)
+            if existing is not None:
+                return False, detail, existing
+            ch = self._raise_locked(
+                package_id=package_id,
+                action=action,
+                approver=approver,
+                episode_id=episode_id,
+                payload_digest=payload_digest,
+                ttl=self._ttl if ttl_seconds is None else ttl_seconds,
+                now=now,
+            )
+            return False, detail, ch
 
     def raise_or_get(
         self,
@@ -113,40 +171,29 @@ class ChallengeStore:
         """剧集步命中审批门时挂起一张挑战。同一绑定已有未过期 pending → 复用（幂等，不刷屏）；否则新建。"""
         now = self._clock()
         with self._lock:
-            self._expire_locked(now)
-            key = (package_id, action, episode_id, payload_digest)
-            for ch in self._by_id.values():
-                if ch.state == PENDING and ch.binding == key:
-                    return ch
-            ttl = self._ttl if ttl_seconds is None else ttl_seconds
-            ch = Challenge(
-                challenge_id="CH-" + secrets.token_hex(8),
+            self._gc_locked(now)
+            existing = self._find_locked(PENDING, (package_id, action, episode_id, payload_digest))
+            if existing is not None:
+                return existing
+            return self._raise_locked(
                 package_id=package_id,
                 action=action,
                 approver=approver,
                 episode_id=episode_id,
                 payload_digest=payload_digest,
-                nonce=secrets.token_hex(16),
-                created_at=now,
-                expires_at=now + ttl,
+                ttl=self._ttl if ttl_seconds is None else ttl_seconds,
+                now=now,
             )
-            self._by_id[ch.challenge_id] = ch
-            return ch
 
     def consume(self, *, package_id: str, action: str, episode_id: str, payload_digest: str) -> tuple[bool, str]:
-        """放行路径（policy.require_approval 调）：找绑定全符的 approved 挑战 → 一次性 consume。
+        """放行路径：找绑定全符的 approved 挑战 → 一次性 consume。
 
         无匹配（还在 pending / 绑定不符 / 已过期 / 已 consume）一律拒绝——fail-closed。防重放：consume 后即 consumed。
         """
         now = self._clock()
         with self._lock:
-            self._expire_locked(now)
-            key = (package_id, action, episode_id, payload_digest)
-            for cid, ch in self._by_id.items():
-                if ch.state == APPROVED and ch.binding == key:
-                    self._by_id[cid] = replace(ch, state=CONSUMED, consumed_at=now)
-                    return True, f"审批已获（{ch.approver}），一次性放行（{cid}）"
-            return False, "无匹配的已批准挑战——等待审批人批准，或绑定不符/已过期/已用过（fail-closed）"
+            self._gc_locked(now)
+            return self._consume_locked((package_id, action, episode_id, payload_digest), now)
 
     # ── 控制通道线程：审批人批 / 驳 / 撤销 ─────────────────────────
 
@@ -154,7 +201,7 @@ class ChallengeStore:
         """approver 经控制通道批/驳。fail-closed：角色须 approver、姓名须与挑战审批人相符、状态须 pending 且未过期。"""
         now = self._clock()
         with self._lock:
-            self._expire_locked(now)
+            self._gc_locked(now)
             ch = self._by_id.get(challenge_id)
             if ch is None:
                 return False, f"挑战不存在或已过期：{challenge_id}"
@@ -169,10 +216,14 @@ class ChallengeStore:
             return True, f"挑战 {challenge_id} 已{'批准' if approve else '驳回'}（{by_name}）"
 
     def revoke(self, challenge_id: str) -> tuple[bool, str]:
-        """在线撤销（§7）：pending/approved 未消费的挑战可撤销为 revoked（此后不可放行）。已 consumed 不可撤。"""
+        """在线撤销（§7）：pending/approved 未消费的挑战可撤销为 revoked（此后不可放行）。已 consumed 不可撤。
+
+        **预留待接线**：控制通道尚无 revoke 命令、当前零调用方——接线前须先定权限矩阵归属
+        （撤销权给 approver 本人、还是 host_admin 应急面，authz.ROLE_CAPS 同步）。状态机先备好。
+        """
         now = self._clock()
         with self._lock:
-            self._expire_locked(now)
+            self._gc_locked(now)
             ch = self._by_id.get(challenge_id)
             if ch is None:
                 return False, f"挑战不存在或已过期：{challenge_id}"
@@ -189,18 +240,54 @@ class ChallengeStore:
         """待审批清单（IM 审批卡轮询的输入）：仅 pending 且未过期。"""
         now = self._clock()
         with self._lock:
-            self._expire_locked(now)
+            self._gc_locked(now)
             return [ch for ch in self._by_id.values() if ch.state == PENDING]
 
     def get(self, challenge_id: str) -> Challenge | None:
         with self._lock:
-            self._expire_locked(self._clock())
+            self._gc_locked(self._clock())
             return self._by_id.get(challenge_id)
 
-    # ── 内部 ────────────────────────────────────────────────────
+    # ── 内部（全部须持锁调用）────────────────────────────────────
 
-    def _expire_locked(self, now: float) -> None:
-        """惰性过期：到点的 pending/approved 迁 expired。approved 也会过期——防陈旧授权被翻出来用。"""
+    def _find_locked(self, state: str, key: tuple[str, str, str, str]) -> Challenge | None:
+        for ch in self._by_id.values():
+            if ch.state == state and ch.binding == key:
+                return ch
+        return None
+
+    def _consume_locked(self, key: tuple[str, str, str, str], now: float) -> tuple[bool, str]:
+        ch = self._find_locked(APPROVED, key)
+        if ch is not None:
+            self._by_id[ch.challenge_id] = replace(ch, state=CONSUMED, consumed_at=now)
+            return True, f"审批已获（{ch.approver}），一次性放行（{ch.challenge_id}）"
+        return False, "无匹配的已批准挑战——等待审批人批准，或绑定不符/已过期/已用过（fail-closed）"
+
+    def _raise_locked(
+        self, *, package_id: str, action: str, approver: str, episode_id: str,
+        payload_digest: str, ttl: float, now: float,
+    ) -> Challenge:
+        ch = Challenge(
+            challenge_id="CH-" + secrets.token_hex(8),
+            package_id=package_id,
+            action=action,
+            approver=approver,
+            episode_id=episode_id,
+            payload_digest=payload_digest,
+            created_at=now,
+            expires_at=now + ttl,
+        )
+        self._by_id[ch.challenge_id] = ch
+        return ch
+
+    def _gc_locked(self, now: float) -> None:
+        """惰性过期 + 终态清出：到点的 pending/approved 迁 expired（approved 也过期——防陈旧授权
+        被翻出来用）；终态挑战超保留期清出（store 不无限增长；审计真相在 policy.audit）。"""
         for cid, ch in list(self._by_id.items()):
             if ch.state in (PENDING, APPROVED) and now >= ch.expires_at:
-                self._by_id[cid] = replace(ch, state=EXPIRED)
+                ch = replace(ch, state=EXPIRED)
+                self._by_id[cid] = ch
+            if ch.state in _TERMINAL:
+                settled_at = ch.consumed_at or ch.decided_at or ch.expires_at
+                if now - settled_at >= self._retention:
+                    del self._by_id[cid]

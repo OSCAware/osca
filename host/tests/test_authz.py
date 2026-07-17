@@ -41,8 +41,8 @@ def test_role_caps_matrix_pinned():
     assert "approve" not in ROLE_CAPS["host_admin"]  # admin 不可伪造业务审批
     assert ROLE_CAPS["operator"] == {"status", "enable", "disable", "fire", "episodes"}
     assert "episode" not in ROLE_CAPS["operator"]  # 剧集摘要可看，全量导出不给
-    # W3 审批 challenge（pending→approved|denied→consumed，绑定 approver/episode/digest/
-    # expiry/nonce）：approver 批/驳（绑 challenge_id）+ 看待批清单——绑定挑战替换旧无绑定 set[action]
+    # W3 审批 challenge（pending→approved|denied→consumed，绑定 approver/episode/digest/expiry
+    # + 一次性 consume）：approver 批/驳（绑 challenge_id）+ 看待批清单——绑定挑战替换旧无绑定 set[action]
     assert ROLE_CAPS["approver"] == {"approve", "deny", "challenges"}
     assert "approve" not in ROLE_CAPS["host_admin"]  # admin 管生命周期但不可伪造业务审批（deny/challenges 同理）
     for cap in ("deny", "challenges"):

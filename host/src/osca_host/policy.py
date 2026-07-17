@@ -387,10 +387,12 @@ class PolicyInterceptor:
     # ── 审批门（绑定挑战：批一张、用一次；批/驳入口是控制通道 approve/deny，M4-W3.2 换 IM 审批卡） ──
 
     def require_approval(self, action: str, *, episode_id: str | None, payload: object) -> tuple[bool, str]:
-        """审批门放行路径：绑定挑战（approver/episode/payload digest/expiry/nonce）替换旧无绑定 token。
+        """审批门放行路径：绑定挑战（approver/episode/payload digest/expiry + 一次性 consume）替换旧无绑定 token。
 
-        动作不在审批清单 → 放行；在清单：按同绑定（package/action/episode/payload digest）找已批准挑战
-        一次性 consume 放行；无则挂起/复用一张 pending 挑战供审批人裁决，本次拒绝（fail-closed）。
+        动作不在审批清单 → 放行；在清单：consume_or_raise **单锁原子**——有同绑定
+        （package/action/episode/payload digest）已批准挑战即一次性 consume 放行；无则同一锁内
+        挂起/复用一张 pending 供审批人裁决，本次拒绝（fail-closed）。原子化封死「consume 失败与
+        raise 之间恰好获批 → 同绑定长出第二张 pending → 双倍放行额度」的竞态窗（Review W3 收口）。
         撤销/kill 在 authorize_tool/authorize_llm 已先行拦截，审批门不重复检查。
         """
         if self._approvals_broken:
@@ -398,17 +400,15 @@ class PolicyInterceptor:
         approver = self.approvals.get(action)
         if approver is None:
             return True, "动作不在审批清单，放行"
-        digest = payload_digest(payload)
-        ep = episode_id or ""
-        ok, detail = self._challenges.consume(
-            package_id=self.package_id, action=action, episode_id=ep, payload_digest=digest
+        ok, detail, ch = self._challenges.consume_or_raise(
+            package_id=self.package_id,
+            action=action,
+            approver=approver,
+            episode_id=episode_id or "",
+            payload_digest=payload_digest(payload),
         )
         if ok:
             return self._allow(None, action, detail)
-        # 无匹配的已批准挑战：挂起/复用一张 pending 供审批人裁决（幂等，不刷屏），本次拒绝。
-        ch = self._challenges.raise_or_get(
-            package_id=self.package_id, action=action, approver=approver, episode_id=ep, payload_digest=digest
-        )
         return self._deny(None, action, f"审批门拦截：「{action}」需 {approver} 审批（挑战 {ch.challenge_id} 待批）")
 
     def require_write_approval(
@@ -432,7 +432,7 @@ class PolicyInterceptor:
         return ok, detail
 
     def pending_challenges(self) -> list[dict]:
-        """待审批挑战的脱敏 DTO 清单（控制通道 challenges 命令 / IM 审批卡轮询输入；不含 nonce）。"""
+        """待审批挑战的 DTO 清单（控制通道 challenges 命令 / IM 审批卡轮询输入）。"""
         return [ch.public() for ch in self._challenges.list_pending()]
 
     # ── 脱敏（注入剧集前执行） ─────────────────────────────────────────

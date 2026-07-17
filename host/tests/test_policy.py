@@ -68,7 +68,8 @@ def test_approval_gate_one_shot():
     ok, detail = p.require_approval(action, episode_id="EP-1", payload={"x": 1})
     assert not ok and "审批门拦截" in detail  # 未批 → 拦，同时挂 pending 挑战
     [ch] = p.pending_challenges()
-    assert ch["action"] == action and ch["approver"] == "专家" and "nonce" not in ch  # 脱敏 DTO 不外泄 nonce
+    # 幽灵字段回归：nonce 已删（装饰性防线，协议从未校验）
+    assert ch["action"] == action and ch["approver"] == "专家" and "nonce" not in ch
     ok, _ = p.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
     assert ok
     assert p.require_approval(action, episode_id="EP-1", payload={"x": 1})[0]  # 同绑定放行一次

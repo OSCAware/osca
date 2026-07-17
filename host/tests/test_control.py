@@ -203,8 +203,8 @@ async def test_w4_precondition_evaluated_through_proxy(running_host, sample_pack
 async def test_w3_approval_challenge_control_flow(running_host, sample_pack, deploy):
     """W3 审批 challenge 控制通道接线：challenges 列待批 → approve（绑 challenge_id，名须相符）→ 一次性 consume。
 
-    绑定挑战（pending→approved|denied→consumed，绑 approver/episode/payload digest/expiry/nonce）
-    替换旧无绑定 set[action]：批一张具体挑战、只放行同绑定的那一次写。
+    绑定挑战（pending→approved|denied→consumed，绑 approver/episode/payload digest/expiry
+    + 一次性 consume）替换旧无绑定 set[action]：批一张具体挑战、只放行同绑定的那一次写。
     """
     host = running_host
     await _load_pack(host, sample_pack, deploy)
@@ -222,7 +222,7 @@ async def test_w3_approval_challenge_control_flow(running_host, sample_pack, dep
     # admin（默认 token）无审批面：challenges/approve/deny 都不在 host_admin 能力集
     assert (await _send({"cmd": "challenges", "package_id": pid}, host))["error"] == "forbidden"
 
-    # approver 拉待批清单（脱敏 DTO，无 nonce）
+    # approver 拉待批清单（挑战 DTO；裁决痕迹不外泄——形状钉在 test_challenge）
     resp = await _send({"cmd": "challenges", "package_id": pid}, host, token="approver-token-0001")
     assert resp["ok"] and len(resp["challenges"]) == 1
     ch = resp["challenges"][0]

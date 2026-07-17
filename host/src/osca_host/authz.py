@@ -11,8 +11,8 @@
 M4 权限矩阵：host_admin 管生命周期但**不可授予业务审批**；operator 只有快照、
 启停触发与剧集摘要（脱敏 DTO 属 W2）；approver 经 W3 审批 challenge
 （pending → approved|denied → consumed，绑定 approver/episode/payload digest/
-expiry/nonce）批/驳（绑 challenge_id）与看待批清单——绑定挑战替换旧 set[action]
-无绑定授予；expert 的命令随 M4-W1 专家端落地。
+expiry + 一次性 consume）批/驳（绑 challenge_id）与看待批清单——绑定挑战替换旧
+set[action] 无绑定授予；expert 的命令随 M4-W1 专家端落地。
 """
 
 from __future__ import annotations

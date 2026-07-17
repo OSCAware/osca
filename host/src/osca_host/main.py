@@ -69,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fire.add_argument("package_id")
     p_fire.add_argument("trigger_id", help="全局触发 ID，如 AW-001/T3")
 
-    p_challenges = sub.add_parser("challenges", help="列出某包的待审批挑战（脱敏 DTO，无 nonce）——approver 角色")
+    p_challenges = sub.add_parser("challenges", help="列出某包的待审批挑战（挑战 DTO）——approver 角色")
     p_challenges.add_argument("package_id")
 
     p_approve = sub.add_parser("approve", help="批准一张审批挑战（绑 challenge_id）——approver 角色")

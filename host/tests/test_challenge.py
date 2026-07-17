@@ -9,6 +9,7 @@ from osca_host.challenge import (
     APPROVED,
     CONSUMED,
     DENIED,
+    EXPIRED,
     PENDING,
     REVOKED,
     ChallengeStore,
@@ -134,7 +135,73 @@ def test_payload_digest_stable_order_independent_and_collision_free():
     assert payload_digest({"price": 4.5}) != payload_digest({"price": 6.0})
 
 
-def test_public_dto_excludes_nonce():
+def test_public_dto_shape_pinned():
+    """DTO 字段钉死（审批卡契约）：裁决痕迹（decided_by/decided_at/consumed_at）不外泄，也没有幽灵字段。"""
     ch = _raise(ChallengeStore(clock=Clock()))
     dto = ch.public()
-    assert "nonce" not in dto and dto["state"] == PENDING and dto["challenge_id"] == ch.challenge_id
+    assert set(dto) == {
+        "challenge_id", "package_id", "action", "approver",
+        "episode_id", "payload_digest", "state", "created_at", "expires_at",
+    }
+    assert dto["state"] == PENDING and dto["challenge_id"] == ch.challenge_id
+
+
+# ── consume_or_raise：单锁原子（Review W3 收口）───────────────────
+
+
+def _consume_or_raise(store: ChallengeStore, **kw):
+    d = dict(package_id="pkg", action="折扣<5折", approver="店长", episode_id="EP-1", payload_digest="dig-A")
+    d.update(kw)
+    return store.consume_or_raise(**d)
+
+
+def test_consume_or_raise_consumes_approved_without_new_pending():
+    """已批挑战被消费放行，且**不**另开新 pending——竞态回归：分步 consume→raise 会在此长出第二张。"""
+    store = ChallengeStore(clock=Clock())
+    ch = _raise(store)
+    store.decide(ch.challenge_id, by_name="店长", by_role="approver", approve=True)
+    ok, detail, pending = _consume_or_raise(store)
+    assert ok and pending is None and ch.challenge_id in detail
+    assert store.get(ch.challenge_id).state == CONSUMED
+    assert store.list_pending() == []  # 同绑定没有第二张待批
+
+
+def test_consume_or_raise_reuses_pending_then_creates():
+    store = ChallengeStore(clock=Clock())
+    ok, _, first = _consume_or_raise(store)
+    assert not ok and first.state == PENDING
+    ok, _, again = _consume_or_raise(store)
+    assert not ok and again.challenge_id == first.challenge_id  # 幂等复用，不刷屏
+    ok, _, other = _consume_or_raise(store, payload_digest="dig-B")
+    assert not ok and other.challenge_id != first.challenge_id  # 不同绑定 → 新挑战
+
+
+# ── 终态清出：store 不无限增长（Review W3 收口）───────────────────
+
+
+def test_terminal_challenges_evicted_after_retention():
+    clk = Clock()
+    store = ChallengeStore(clock=clk, ttl_seconds=100, terminal_retention_seconds=1000)
+    ch = _raise(store)
+    store.decide(ch.challenge_id, by_name="店长", by_role="approver", approve=True)
+    assert _consume(store)[0]  # → consumed（终态）
+    clk.advance(999)
+    assert store.get(ch.challenge_id) is not None  # 保留期内可查（排查用）
+    clk.advance(2)
+    assert store.get(ch.challenge_id) is None  # 超保留期清出
+
+
+def test_expired_challenges_evicted_after_retention():
+    clk = Clock()
+    store = ChallengeStore(clock=clk, ttl_seconds=100, terminal_retention_seconds=1000)
+    ch = _raise(store)
+    clk.advance(101)  # pending → expired（终态计时从 expires_at 起）
+    assert store.get(ch.challenge_id).state == EXPIRED
+    clk.advance(1000)
+    assert store.get(ch.challenge_id) is None
+    denied = _raise(store, episode_id="EP-2")
+    store.decide(denied.challenge_id, by_name="店长", by_role="approver", approve=False)
+    clk.advance(999)
+    assert store.get(denied.challenge_id) is not None
+    clk.advance(2)
+    assert store.get(denied.challenge_id) is None  # denied 同样清出

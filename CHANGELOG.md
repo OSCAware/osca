@@ -292,6 +292,26 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   deployments/principals 的 falsy 非容器顶层不再伪装成空配置，生产 principal 的 uid
   必须是非负整数且不可为 null
 
+## [M4-W3.1 · 审批挑战状态机 + Review 收口] - 2026-07-18
+- 绑定挑战替换旧无绑定 `set[action]` 授予：每次高危动作一台一次性状态机
+  `pending → approved|denied → consumed`，绑定 approver（指定审批人且名相符）/
+  episode_id（防跨剧集串用）/ payload sha256 摘要（防偷梁换柱）/ expiry（防陈旧
+  授权），consume 即 consumed（防重放）——冒名/重放/偷梁换柱/跨剧集/过期各有测试钉住
+- 控制通道接线：ROLE_CAPS["approver"] = {approve, deny, challenges}（绑
+  challenge_id 批/驳一张具体挑战 + 看待批清单）；admin/operator/expert 均无审批面
+  （矩阵双向断言）；policy.require_approval / require_write_approval 改带
+  episode_id + payload，connector 写路径传入
+- Review W3 收口：`consume_or_raise` 单锁原子——封死「consume 失败与 raise 之间
+  恰好获批 → 同绑定长出第二张 pending → 双倍一次性放行额度」的竞态窗；终态挑战
+  （consumed/denied/expired/revoked）超保留期（1h）惰性清出，store 不无限增长
+  （审计真相在 policy.audit）；删除装饰性 nonce 字段（生成、存储但协议从未校验——
+  防重放由状态机独担，文档与代码一致）；挑战级 revoke 状态机预留、控制通道命令
+  待矩阵归属定夺后接线
+- 交付限定（诚实标注，README「M4-W3 审批挑战」节）：机制完成，「批准 → 放行一次
+  真写」端到端闭环待 M5/M6——真写执行未接入（payload 摘要恒空串摘要）、runner 无
+  剧集内挂起等批（挑战绑 episode_id，重跑即新剧集，已批挑战等不到 consume）；
+  接通时须一并落地剧集内等批重试、审批卡带人类可读脱敏 payload、TTL 按人审时延重估
+
 ## [Unreleased]
 - 发布 OSCA 开放规范白皮书 v1.0：以 OSCA 为核心、Oscaware 为参考实现，覆盖 O/S/C/A/J、
   双平面 Runtime、判断飞轮、采用路径、兼容与证据边界；历史 v0.1 扩展稿留档
