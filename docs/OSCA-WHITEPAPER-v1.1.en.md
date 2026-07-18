@@ -327,6 +327,46 @@ flowchart LR
     X --> K["Health / Kill switch"]
 ```
 
+#### Methodological Grounding: Why Capture Corrections Instead of Interviewing Experts
+
+"AI distills, people decide" is not merely an engineering preference; it has a methodological
+pedigree in cognitive science. The foundational finding of naturalistic decision-making research
+(Klein, Calderwood & MacGregor, 1989; Crandall, Klein & Hoffman, *Working Minds*, 2006) is that
+expert judgment exists as pattern recognition—cues trigger patterns, and patterns bring
+expectancies and actions (the RPD model)—without passing through an articulable reasoning layer.
+Ask an expert "how do you judge this" and you get post-hoc rationalized generalities that often
+fail to match actual behavior. Experts are not withholding; the judgment itself cannot be spoken.
+
+The Critical Decision Method (CDM) that Klein's team developed imposes three elicitation
+disciplines: talk only about specific events, never general rules—judgment lives in episodic
+memory, not in rationalized generalization; probe only non-routine events—in routine situations
+experts and novices behave alike, and judgment becomes visible only at exceptions; and aim probes
+at cues and expectancies, not steps—"what did you do" yields procedure, while "what did you
+notice, what did you expect" yields judgment.
+
+OSCA's capture design matches these disciplines one for one, with one structural advantage:
+experts are never asked to state rules—they give a one-line verdict on machine-distilled
+Candidates; capture takes only correction Diffs—corrections are exceptions, exactly where
+judgment surfaces; and where CDM must reconstruct critical incidents through retrospective
+interviews, in OSCA's delivery flow critical incidents occur naturally—every expert revision is
+a decision point happening in the present, with no reliance on memory reconstruction.
+
+The five-section Judgment anatomy also maps component by component onto CDM's cognitive
+categories, and in three places it is harder than any interview product:
+
+| CDM component | Where it lives | Why it is harder |
+|---|---|---|
+| Cue | Guard in the Signature | A machine-evaluable trigger condition, not a natural-language description |
+| Judgment | Body (with its "unless") | Negative judgments that suppress noise carry equal weight |
+| Expectancy | Replay assertions | Executable checks—Checkup verifies expectancies in bulk |
+| Boundary | The "unless" clause and Expiry | Wired to automatic re-review driven by overrule counts |
+| Analogue | Birth Cases in Evidence | Not an optional field but a Lint gate |
+
+Expectancies are assertions and analogues are gates—that is the boundary between a judgment
+asset and interview notes. One honest caveat: this section provides design provenance, not proof
+of effect. Whether capture embedded in the delivery flow elicits more real judgment than
+interview-based elicitation remains a proposition to be tested against the P0 real-world corpus.
+
 #### Capture, Distill, Confirm
 
 Capture is deliberately unintelligent: one feedback event becomes one Case and one Git Commit; evidence and counter updates share a transaction. Multiple writers require a package lock, atomic IDs, and rollback discipline.
