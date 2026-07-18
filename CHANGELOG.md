@@ -327,6 +327,14 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   「M4-W3 审批挑战」节）；approver/expert 的 per-principal 包域收窄归 T1/T2 多租户
 
 ## [Unreleased]
+- **SPEC v0.4 定稿（M6-W1）**：v0.4-draft 增量并入 v0.3 全文成正式版 `docs/OSCA-SPEC-v0.4.md`——
+  §4 objective 第五型、§7 受限触发语法+闸门+组合语义、§9 分层三字段+洁净室+限定引用、§10 case kind
+  收编 `引用`、附录 A 运行时求值参考语义（precondition/emit_when/kill_switch/剧集执行/settle/回放判据）
+  全部并入；`format_version` 升 `0.4`。**新增附录 B 企业系统对接约定**（Manifest/Binding/Impl 三层职责
+  + 执行器按 endpoint scheme 分派 + 真实 sql_readonly/openapi 契约 + read-only enforcement + secret 解析
+  + 写路径审批门挂起-等批-恢复消费语义 + 人类可读脱敏 payload + TTL 人审时延——真实执行器落地属部署侧
+  适配，明标不冒充已通）。附录 C 判断库包变体规范占位（W3 补齐）。v0.4-draft 加 superseded 横幅指向全文。
+  措辞纪律：可求值语义与参考实现互证，纯部署侧契约明标 deferred。case kind `引用` 为纯文档收编（lint 不校验 kind 词表）
 - SPEC v0.4-draft §9：判断分层命名空间（commons 行业公共层 / org 企业私有层）与权属
   三字段（scope / provenance / classification）——权属血统无法事后重建，出生即标；
   洁净室规则（client-derived 永不静默进 commons、commons 必须无密级）；跨包限定引用
