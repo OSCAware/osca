@@ -315,6 +315,17 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   指定其名的包、challenges 不按审批人过滤；README 矩阵补多租户告示（与 expert 同款，
   包域收窄归 T1/T2）；挑战存储进程内随 Policy 同寿（包重载即清空 pending）同段明示
 
+## [M4 · 三种界面 收官] - 2026-07-18
+- 公仓侧全景：W0/W0.1/W0.2 控制通道安全内核（见上各条）→ W1 专家只读交付面
+  （expert 角色 episodes 摘要 + episode 全量导出——draft 即交付物；episode 身份
+  随交付面收口）→ W3.1/W3.1b 审批挑战状态机与 approver 命令面（见上条）
+- 私仓侧（oscapipe，随行记录）：W1 双 IM 专家桥接（飞书卡片/企微文本，持久幂等）、
+  W2 运营控制台 `oscapipe-console`（operator 一脸 + 管理层报告区A/C）、W3.2 IM 审批卡
+  桥接（approver_im_id ≠ expert_im_id 职责分离）
+- 收官口径（诚实标注）：**三种界面机制完成**；「批准 → 放行一次真写」闭环、审批卡
+  人类可读 payload、TTL 人审时延重估三债归 M6 真写接通时一并落（host/README
+  「M4-W3 审批挑战」节）；approver/expert 的 per-principal 包域收窄归 T1/T2 多租户
+
 ## [Unreleased]
 - SPEC v0.4-draft §9：判断分层命名空间（commons 行业公共层 / org 企业私有层）与权属
   三字段（scope / provenance / classification）——权属血统无法事后重建，出生即标；

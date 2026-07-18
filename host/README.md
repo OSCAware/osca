@@ -1,9 +1,14 @@
-# osca-host（M2 七组件齐）
+# osca-host（M2 七组件 ＋ M4 控制通道安全内核·审批挑战）
 
 OSCA 运行框架 Host 参考实现——**控制平面确定性常驻，本体无 LLM**；
 LLM 只活在短命的剧集（认知平面）里。把 `.osca` 包从静态资产变成能自己醒来干活的 agent。
 
 ## 当前进度（诚实标注）
+
+M2 七组件之上，M4 已落：控制通道安全内核（W0/W0.1/W0.2：传输层权限 + Principal/角色矩阵 +
+运行目录锚定）、专家只读交付面（W1：expert 角色 episodes/episode）、审批挑战状态机与
+approver 命令面（W3：绑定挑战 + challenges/approve/deny，**闭环限定见「M4-W3 审批挑战」节**）。
+运营控制台（M4-W2）与 IM 审批卡/Creator（M4-W3.2/M5）在私仓 oscapipe。
 
 | 组件（架构 §4） | 状态 |
 |---|---|
