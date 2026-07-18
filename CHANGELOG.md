@@ -366,3 +366,34 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   （# 注释/空行忽略，缺文件跳过词检），路径拦截（Core_docs/、key.md、redlist.txt）始终生效
 - Phase 0 内容线：P0-A 在高频真实场景形成 ≥20 条经专家 Confirm 入账的 Judgment，并观察
   后续独立使用；P0-B 慢场景单独报告，反哺 SPEC
+
+## [SPEC v0.4 · M6] - 2026-07-19
+- 定稿全文（并入 v0.3，§0–§14 + 附录 A/B/C/D），`format_version` 升 "0.4"，v0.4-draft 退休
+- §4 Object 第五型 `kind: objective`；§7 Aware 受限触发语法（时长/schedule 结构化字段/watch/event，
+  废止自由文本 schedule）+ 闸门编译期矛盾检查 + 组合语义定稿
+- §9 判断分层命名空间与权属三字段（scope/provenance/classification）+ 洁净室规则 + 限定引用语法
+  （`<package_id>/<judgment_id>`）；§10 case kind 词表收编 `引用`（公共标准编纂类判断的天然出生证据）
+- 附录 A 运行时求值参考语义（precondition/emit_when/kill_switch 可求值形式 + 健康档案契约、
+  performer 受限集 + 预算记法 + 剧集停三终态、settle 受限形式、回放机器判据）
+- 附录 B 企业系统对接约定（Manifest/Binding/Impl 三层职责 + 执行器分派 + 真实执行器契约 +
+  read-only enforcement + secret 解析 + 写路径挂起-等批-恢复消费语义）
+- 附录 C 判断库包变体规范（`package_kind: library` / 库包免 pipeline / 抽象签名再绑定 rebind /
+  Manifest dependencies 锁版本+完整性哈希 / 合并索引 layer 列 / overrides 跨层遮蔽 /
+  无宿主 replay 退化判据）——**规范语义定稿，cli/host 实现推 Phase 1**
+
+## [CLI · lint 24 条 + replay] - 2026-07-19
+- OSCA060（判断分层权属三字段 + 洁净室机器布防，SPEC §9）、OSCA061（osca.yaml 包级 layering
+  默认段校验，SPEC §1/§9，与 OSCA060 共用枚举/形状/洁净室判据）。共 24 条规则
+- `osca replay <包> <J-id>`：单判断 A/B 体检——同一 case 情境跑注入/不注入两臂，机器判据
+  `score = 相似度(产出, 改后) − 相似度(产出, 改前)`（模型无关、确定性）；样例 `osca replay J-0417` 2/2 绿灯
+
+## [v1.0] - 2026-07-19 — 发布凭据三样齐
+1.0 = **机制可验**（措辞纪律：机制口径，非效果证明；飞轮收敛曲线进 1.x 叙事，曲线出现前不写「已证明」）：
+- **规范**：OSCA-SPEC v0.4 定稿全文（`docs/OSCA-SPEC-v0.4.md`，CC BY 4.0）
+- **参考实现**：运行框架 Host（M2 七组件 + M4 控制通道安全内核 / 审批挑战机制，各带诚实限定）
+  + CLI（lint / pack / load / replay，Apache-2.0）
+- **可回放脱敏样例**：`examples/oper-diagnosis.osca`；`osca replay J-0417` 单条体检 2/2 绿灯
+  （输出从改前移向改后）
+- **限定（诚实标注）**：蒸馏管道 / Creator / 交互层闭源；判断库包变体实现推 Phase 1；真写全接通
+  （真实 sql_readonly/openapi 执行器 + 审批闭环三债 + 可恢复剧集）作 M6-cont → v1.1；八步全链路
+  演练走通的是**机制链路**（mock 连接器 + mock LLM），非业务效果
