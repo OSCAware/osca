@@ -74,6 +74,9 @@
 - kind 特定必填字段（metric 的 unit/direction/source、composite 的 formula 等）未逐一校验。
 - guard 表达式的语法校验（可求值性）留给运行框架 M2。
 - cases 大报文外置逻辑指针（{content_hash, store, key}）的形态校验未做。
+- **判断库包变体分支（SPEC v0.4 附录 C，Phase 1）**：`package_kind: library` 时 OSCA001（必备文件）豁免
+  structure/aware/policy、OSCA040 跳过 pipeline/aware/policy 校验（judgment/case 纪律照常）；`dependencies`
+  锁版本+完整性哈希与 `rebind` 再绑定校验。规范语义已定稿，lint 实现推 Phase 1。
 
 ## 变更记录
 
