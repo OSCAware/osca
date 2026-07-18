@@ -788,6 +788,89 @@ def osca050_secrets(pkg: OscaPackage) -> list[Finding]:
     return findings
 
 
+# ── 分层与权属（SPEC v0.4 §9：commons/org 命名空间 + 洁净室）──────────────────
+
+JUDGMENT_SCOPES = {"commons", "org"}
+PROVENANCE_ORIGINS = {"own-ops", "public-standard", "client-derived", "licensed"}
+CLASSIFICATIONS = {"public", "internal", "restricted"}
+
+
+@rule
+def osca060_layering(pkg: OscaPackage) -> list[Finding]:
+    """OSCA060 判断分层与权属三字段（SPEC v0.4 §9）：scope / provenance / classification。
+
+    权属血统无法事后重建——client-derived 混进 commons 是不可逆污染，必须在出生时机器布防：
+    三字段缺失记 warn（v0.4 起新生判断必填；存量包过渡期不硬拦）；枚举非法 / provenance
+    形状缺陷记 error；洁净室与无密级约束（commons 不收 client-derived、commons 必须 public）
+    记 error。
+    """
+    findings: list[Finding] = []
+    for f in _judgments(pkg):
+        scope = f.mapping.get("scope")
+        prov = f.mapping.get("provenance")
+        cls = f.mapping.get("classification")
+
+        missing = [
+            name
+            for name, value in (("scope", scope), ("provenance", prov), ("classification", cls))
+            if value in (None, "", {})
+        ]
+        if missing:
+            findings.append(
+                _warn(
+                    "OSCA060",
+                    f.relpath,
+                    f"缺分层权属字段 {'/'.join(missing)}（SPEC v0.4 §9：新生判断必填；存量包过渡期警告）",
+                )
+            )
+
+        if scope not in (None, "") and scope not in JUDGMENT_SCOPES:
+            findings.append(_err("OSCA060", f.relpath, f"scope={scope!r} 不在 {sorted(JUDGMENT_SCOPES)} 中"))
+
+        origin = None
+        if prov not in (None, "", {}):
+            if not isinstance(prov, dict):
+                findings.append(
+                    _err(
+                        "OSCA060",
+                        f.relpath,
+                        f"provenance 必须是 mapping（origin/source/rights），现为 {type(prov).__name__}",
+                    )
+                )
+            else:
+                for key in ("origin", "source", "rights"):
+                    if prov.get(key) in (None, ""):
+                        findings.append(
+                            _err("OSCA060", f.relpath, f"provenance 缺 {key}——权属血统无法事后重建，出生即填")
+                        )
+                origin = prov.get("origin")
+                if origin not in (None, "") and origin not in PROVENANCE_ORIGINS:
+                    findings.append(
+                        _err(
+                            "OSCA060", f.relpath, f"provenance.origin={origin!r} 不在 {sorted(PROVENANCE_ORIGINS)} 中"
+                        )
+                    )
+
+        if cls not in (None, "") and cls not in CLASSIFICATIONS:
+            findings.append(_err("OSCA060", f.relpath, f"classification={cls!r} 不在 {sorted(CLASSIFICATIONS)} 中"))
+
+        if scope == "commons":
+            if origin == "client-derived":
+                findings.append(
+                    _err(
+                        "OSCA060",
+                        f.relpath,
+                        "洁净室：origin=client-derived 的判断不得进 commons——合法入口只有 "
+                        "own-ops / public-standard / licensed（客户判断出生在 org，永不静默迁移）",
+                    )
+                )
+            if cls != "public":
+                findings.append(
+                    _err("OSCA060", f.relpath, "commons 层定义=可迁移且无密级：classification 必须是 public")
+                )
+    return findings
+
+
 def run_all(pkg: OscaPackage) -> list[Finding]:
     """跑全部规则。lint 必须是总函数：面对不可信 YAML 只产出 findings、绝不抛异常——
     各规则自带类型防御，这里再兜最后一层（规则异常转 ERROR，CLI/Host 装载永不断掉）。"""

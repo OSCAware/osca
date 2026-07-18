@@ -1,6 +1,14 @@
 judgment_id: J-0405
 status: superseded        # 已被 J-0423 取代。按账本纪律不删除，原样留档、可回放。
 
+# ── 分层与权属（SPEC v0.4 §9）：出生即标——血统无法事后重建 ──
+scope: org                        # 客户边界内的私有判断
+provenance:
+  origin: client-derived          # 从客户的纠错中长出来
+  source: demo-group              # 客户代号（演示包为合成客户）
+  rights: client-owned            # 权属归客户——镜像到合同条款
+classification: internal
+
 signature:
   object: OBJ-002
   aware: AW-001

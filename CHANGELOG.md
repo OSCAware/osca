@@ -316,6 +316,14 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   包域收窄归 T1/T2）；挑战存储进程内随 Policy 同寿（包重载即清空 pending）同段明示
 
 ## [Unreleased]
+- SPEC v0.4-draft §9：判断分层命名空间（commons 行业公共层 / org 企业私有层）与权属
+  三字段（scope / provenance / classification）——权属血统无法事后重建，出生即标；
+  洁净室规则（client-derived 永不静默进 commons、commons 必须无密级）；跨包限定引用
+  语法 `<package_id>/<judgment_id>` 定稿（judgment_id 保持包内局部，ID 语法与
+  OSCA010/011 纪律不动）；overrides（跨层遮蔽，≠supersedes）/ dependencies（判断库包
+  锁版本+哈希）/ 条目级无内容遥测 属规划，仅钉语法
+- lint 新增 OSCA060（共 23 条）：三字段缺失 warn（存量过渡）、枚举/形状非法 error、
+  洁净室与无密级约束 error；样例包与测试黄金模板补三字段，23+6 用例
 - 官网：开放段新增白皮书下载行（三语 PDF 自托管 `site/downloads/`，为国内受众可达性
   不走 GitHub 直链；**PDF 是 docs/ 拷贝，白皮书更新时须同步**）；信任段增第五条
   「方法有出处」（Klein CDM，五十年自然决策研究背书）

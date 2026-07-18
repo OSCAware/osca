@@ -3,6 +3,14 @@ status: active
 supersedes: J-0405        # 旧判断「咨询费超20万一律正文报告」被本判断取代。
                           # J-0405 文件不删除，其 status 已改为 superseded。
 
+# ── 分层与权属（SPEC v0.4 §9）：出生即标——血统无法事后重建 ──
+scope: org                        # 客户边界内的私有判断
+provenance:
+  origin: client-derived          # 从客户的纠错中长出来
+  source: demo-group              # 客户代号（演示包为合成客户）
+  rights: client-owned            # 权属归客户——镜像到合同条款
+classification: internal
+
 # 这是一条「负判断」的示例——它不产生动作，它压制动作。
 # 负判断恰恰是专家推翻 agent 时最自然的产出，价值不低于正向规则。
 

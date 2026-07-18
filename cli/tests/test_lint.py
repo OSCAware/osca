@@ -503,3 +503,67 @@ def test_osca041_watch_duration(make_pkg, base):
     ]
     result = lint_package(make_pkg(base))
     assert any(f.rule == "OSCA041" and "every=一天" in f.message for f in result.findings)
+# ── 分层与权属（OSCA060）──
+
+
+def test_osca060_missing_trio_warns_not_blocks(make_pkg, base):
+    for key in ("scope", "provenance", "classification"):
+        del base["judgments/J-0001.yaml"][key]
+    result = lint_package(make_pkg(base))
+    assert "OSCA060" in rules_hit(result)
+    assert result.ok  # 存量过渡期：warn 不拦（新生判断必填由蒸馏/Creator 出生时保证）
+
+
+def test_osca060_bad_enums_are_errors(make_pkg, base):
+    j = base["judgments/J-0001.yaml"]
+    j["scope"] = "global"
+    j["provenance"]["origin"] = "找不到出处"
+    j["classification"] = "secret"
+    result = lint_package(make_pkg(base))
+    assert not result.ok
+    messages = [f.message for f in result.findings if f.rule == "OSCA060"]
+    assert any("scope=" in m for m in messages)
+    assert any("provenance.origin=" in m for m in messages)
+    assert any("classification=" in m for m in messages)
+
+
+def test_osca060_provenance_shape_and_missing_keys(make_pkg, base):
+    base["judgments/J-0001.yaml"]["provenance"] = "京郊某处"  # 非 mapping
+    result = lint_package(make_pkg(base))
+    assert not result.ok and any(
+        "provenance 必须是 mapping" in f.message for f in result.findings if f.rule == "OSCA060"
+    )
+    base["judgments/J-0001.yaml"]["provenance"] = {"origin": "own-ops"}  # 缺 source/rights
+    result = lint_package(make_pkg(base))
+    assert not result.ok
+    messages = [f.message for f in result.findings if f.rule == "OSCA060"]
+    assert any("缺 source" in m for m in messages) and any("缺 rights" in m for m in messages)
+
+
+def test_osca060_cleanroom_client_derived_cannot_enter_commons(make_pkg, base):
+    j = base["judgments/J-0001.yaml"]
+    j["scope"] = "commons"  # provenance.origin 仍是 client-derived
+    j["classification"] = "public"
+    result = lint_package(make_pkg(base))
+    assert not result.ok
+    assert any("洁净室" in f.message for f in result.findings if f.rule == "OSCA060")
+
+
+def test_osca060_commons_requires_public_classification(make_pkg, base):
+    j = base["judgments/J-0001.yaml"]
+    j["scope"] = "commons"
+    j["provenance"] = {"origin": "own-ops", "source": "自营外呼", "rights": "vendor-owned"}
+    j["classification"] = "internal"
+    result = lint_package(make_pkg(base))
+    assert not result.ok
+    assert any("无密级" in f.message for f in result.findings if f.rule == "OSCA060")
+
+
+def test_osca060_valid_commons_entry_passes(make_pkg, base):
+    j = base["judgments/J-0001.yaml"]
+    j["scope"] = "commons"
+    j["provenance"] = {"origin": "public-standard", "source": "GB/T 9704", "rights": "vendor-owned"}
+    j["classification"] = "public"
+    result = lint_package(make_pkg(base))
+    assert result.ok, [f.format() for f in result.findings]
+    assert result.warnings == 0

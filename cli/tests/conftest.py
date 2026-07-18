@@ -62,6 +62,9 @@ def minimal_package() -> dict[str, object]:
         "judgments/J-0001.yaml": {
             "judgment_id": "J-0001",
             "status": "active",
+            "scope": "org",
+            "provenance": {"origin": "client-derived", "source": "demo-group", "rights": "client-owned"},
+            "classification": "internal",
             "signature": {"object": "OBJ-001", "aware": "AW-001", "guard": "金额 > 20"},
             "body": "演示判断。",
             "evidence": ["C-0001"],

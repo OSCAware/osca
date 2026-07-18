@@ -60,6 +60,12 @@
 |---|---|---|---|
 | OSCA050 | 错误 | 扫描包内**全部文本文件**（含 .md/.sql）：连接串（jdbc/mysql/ssh/…）与密钥特征（AccessKey/token/私钥）绝对禁止；`http://` 明文链接一律禁止；`https://` 链接仅公开文档白名单域放行（creativecommons.org、apache.org、opensource.org、oscaware.com、github.com） | SPEC §13 |
 
+## 分层与权属
+
+| 规则 | 级别 | 内容 | 依据 |
+|---|---|---|---|
+| OSCA060 | 错误/警告 | 判断分层权属三字段（scope/provenance/classification）：三字段缺失 = **警告**（v0.4 起新生判断必填，存量包过渡期不硬拦）；枚举非法、provenance 形状缺陷（缺 origin/source/rights）= 错误；**洁净室** `scope: commons` 且 `origin: client-derived` = 错误（进 commons 只有 own-ops / public-standard / licensed 三入口）；`scope: commons` 且 `classification != public` = 错误（commons 定义=可迁移且无密级） | SPEC v0.4 §9 |
+
 ## v0.2 已知边界（下一批处理）
 
 - 引用「只许用 ID、禁止用文件名/中文名」的反向检查（发现疑似中文名引用）未做；AGENT.md 正文中的 ID 引用不校验。
@@ -70,6 +76,7 @@
 
 ## 变更记录
 
+- **v0.4-draft**（2026-07-18）：新增 OSCA060——判断分层权属三字段 + 洁净室机器布防（SPEC v0.4 §9），共 23 条规则。
 - **v0.3**（2026-07-11）：新增 OSCA041——触发原语与闸门受限语法（SPEC v0.4 草案 §5），共 22 条规则。
 - **v0.2**（2026-07-11）：OSCA050 按 SPEC v0.3 §13 精确化——扫描范围扩到全部文本文件；区分连接串（绝对禁止）与文档链接（https 白名单放行、http 一律禁止）。依据栏改指 SPEC v0.3 章节。
 - **v0.1**（2026-07-11）：首版 21 条规则。
