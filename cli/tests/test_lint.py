@@ -567,3 +567,68 @@ def test_osca060_valid_commons_entry_passes(make_pkg, base):
     result = lint_package(make_pkg(base))
     assert result.ok, [f.format() for f in result.findings]
     assert result.warnings == 0
+
+
+# ── osca.yaml 包级分层默认段（OSCA061）──
+
+
+def test_osca061_absent_layering_ok(make_pkg, base):
+    # 无 layering 默认段 = 合法（judgment 缺字段自有 OSCA060 warn，不由 061 报）
+    assert "layering" not in base["osca.yaml"]
+    result = lint_package(make_pkg(base))
+    assert "OSCA061" not in rules_hit(result)
+
+
+def test_osca061_valid_default_passes(make_pkg, base):
+    base["osca.yaml"]["layering"] = {
+        "scope": "org",
+        "provenance": {"origin": "client-derived", "source": "demo-group", "rights": "client-owned"},
+        "classification": "internal",
+    }
+    result = lint_package(make_pkg(base))
+    assert result.ok, [f.format() for f in result.findings]
+    assert "OSCA061" not in rules_hit(result)
+
+
+def test_osca061_partial_default_ok(make_pkg, base):
+    # 可部分声明：只给 scope + classification（provenance 缺整段），不报（缺整段 ≠ 形状缺陷）
+    base["osca.yaml"]["layering"] = {"scope": "org", "classification": "internal"}
+    result = lint_package(make_pkg(base))
+    assert "OSCA061" not in rules_hit(result)
+
+
+def test_osca061_bad_enum_is_error(make_pkg, base):
+    base["osca.yaml"]["layering"] = {"scope": "global", "classification": "secret"}
+    result = lint_package(make_pkg(base))
+    assert not result.ok
+    messages = [f.message for f in result.findings if f.rule == "OSCA061"]
+    assert any("scope=" in m for m in messages)
+    assert any("classification=" in m for m in messages)
+
+
+def test_osca061_incomplete_provenance_is_error(make_pkg, base):
+    # provenance present 即须完整（缺 source/rights）——错默认会污染整包新生判断，源头拦
+    base["osca.yaml"]["layering"] = {"provenance": {"origin": "own-ops"}}
+    result = lint_package(make_pkg(base))
+    assert not result.ok
+    messages = [f.message for f in result.findings if f.rule == "OSCA061"]
+    assert any("缺 source" in m for m in messages) and any("缺 rights" in m for m in messages)
+
+
+def test_osca061_cleanroom_violation_is_error(make_pkg, base):
+    # 洁净室在 osca.yaml 源头就拦：commons + client-derived 默认会给整包新生判断洗成 commons
+    base["osca.yaml"]["layering"] = {
+        "scope": "commons",
+        "provenance": {"origin": "client-derived", "source": "demo-group", "rights": "client-owned"},
+        "classification": "public",
+    }
+    result = lint_package(make_pkg(base))
+    assert not result.ok
+    assert any("洁净室" in f.message for f in result.findings if f.rule == "OSCA061")
+
+
+def test_osca061_non_mapping_is_error(make_pkg, base):
+    base["osca.yaml"]["layering"] = "org"  # 非 mapping
+    result = lint_package(make_pkg(base))
+    assert not result.ok
+    assert any("layering 必须是 mapping" in f.message for f in result.findings if f.rule == "OSCA061")

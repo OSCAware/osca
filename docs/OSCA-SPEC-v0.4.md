@@ -60,7 +60,17 @@ requires:
   bindings: [FINANCE_DB]          # 部署环境必须注入的 binding;与各 connector
                                   # binding_ref 的并集一致(lint 校验),loader 缺失即报错
 integrity: indexes/checksums.txt  # osca pack 生成;交付件完整性清单,可对包签名
+
+layering:                         # 可选:包级分层权属默认段(§9);蒸馏 confirm 出生判断按此填三字段
+  scope: org                      # 缺此段则新生判断永远缺三字段,带 OSCA060 警告
+  provenance: {origin: client-derived, source: demo-group, rights: client-owned}
+  classification: internal
 ```
+
+**`layering` 包级默认段（可选，OSCA061 校验）：** 为本包新生判断提供 scope / provenance /
+classification 的默认值——蒸馏 `confirm` 出生一条判断时，若判断自身未带这三字段（当前蒸馏候选
+不产它们），即从本段填入（污染不可逆，出生即标，§9.1）。可部分声明；present 即按 §9 洁净室判据
+校验（错的默认在 osca.yaml 源头即拦，比逐条 judgment 报早）。缺此段合法——判断缺字段自有 OSCA060 警告。
 
 ---
 
@@ -406,6 +416,11 @@ replay:                   # 回放断言 = 本判断的单元测试,≥1 条(机
 - 进入 commons 只有三个合法入口：自营业务判断（`own-ops`）、公共标准编纂（`public-standard`）、合同明确授权的贡献（`licensed`）；
 - commons 层定义 = 可迁移**且**无密级：`scope: commons` 要求 `classification: public`；
 - 自营判断同样逐条标注——运营主体自己的账本里也混着带客户方言的 `client-derived` 条目与行业通用的 `own-ops` 条目，自营不等于全部可公共化。
+
+**出生即标的落点（confirm）：** 蒸馏 `confirm` 出生一条判断时按包级 `layering` 默认段（§1，OSCA061 校验）
+填三字段（判断自带的优先，缺则由默认段填，再缺则留空 → OSCA060 警告）。造包器（Creator）生成的
+osca.yaml 默认段取**最严档**（`org` / `client-derived` / `internal`）——错过按最严处理（§2.1 疫苗），
+own-ops / public-standard 包须显式改宽。
 
 **晋升是转世，不是复制**：org 判断晋升 commons 时，其出生证据（含客户报文的 cases）留在原边界内
 不随行；晋升后的判断须在 commons 层重新积累 evidence 与信任计数（从零挣）。这是晋升的真实成本，

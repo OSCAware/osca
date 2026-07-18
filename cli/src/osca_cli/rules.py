@@ -795,6 +795,47 @@ PROVENANCE_ORIGINS = {"own-ops", "public-standard", "client-derived", "licensed"
 CLASSIFICATIONS = {"public", "internal", "restricted"}
 
 
+def _layering_validity(rule_id: str, relpath: str, scope: object, prov: object, cls: object) -> list[Finding]:
+    """分层三字段的枚举 / 形状 / 洁净室校验——judgment（OSCA060）与 osca.yaml 包级默认段
+    （OSCA061）共用同一判据。只管「存在即合法」，缺失是否报由调用方按语境决定。"""
+    findings: list[Finding] = []
+    if scope not in (None, "") and scope not in JUDGMENT_SCOPES:
+        findings.append(_err(rule_id, relpath, f"scope={scope!r} 不在 {sorted(JUDGMENT_SCOPES)} 中"))
+
+    origin = None
+    if prov not in (None, "", {}):
+        if not isinstance(prov, dict):
+            findings.append(
+                _err(rule_id, relpath, f"provenance 必须是 mapping（origin/source/rights），现为 {type(prov).__name__}")
+            )
+        else:
+            for key in ("origin", "source", "rights"):
+                if prov.get(key) in (None, ""):
+                    findings.append(_err(rule_id, relpath, f"provenance 缺 {key}——权属血统无法事后重建，出生即填"))
+            origin = prov.get("origin")
+            if origin not in (None, "") and origin not in PROVENANCE_ORIGINS:
+                findings.append(
+                    _err(rule_id, relpath, f"provenance.origin={origin!r} 不在 {sorted(PROVENANCE_ORIGINS)} 中")
+                )
+
+    if cls not in (None, "") and cls not in CLASSIFICATIONS:
+        findings.append(_err(rule_id, relpath, f"classification={cls!r} 不在 {sorted(CLASSIFICATIONS)} 中"))
+
+    if scope == "commons":
+        if origin == "client-derived":
+            findings.append(
+                _err(
+                    rule_id,
+                    relpath,
+                    "洁净室：origin=client-derived 的判断不得进 commons——合法入口只有 "
+                    "own-ops / public-standard / licensed（客户判断出生在 org，永不静默迁移）",
+                )
+            )
+        if cls != "public":
+            findings.append(_err(rule_id, relpath, "commons 层定义=可迁移且无密级：classification 必须是 public"))
+    return findings
+
+
 @rule
 def osca060_layering(pkg: OscaPackage) -> list[Finding]:
     """OSCA060 判断分层与权属三字段（SPEC v0.4 §9）：scope / provenance / classification。
@@ -823,52 +864,35 @@ def osca060_layering(pkg: OscaPackage) -> list[Finding]:
                     f"缺分层权属字段 {'/'.join(missing)}（SPEC v0.4 §9：新生判断必填；存量包过渡期警告）",
                 )
             )
-
-        if scope not in (None, "") and scope not in JUDGMENT_SCOPES:
-            findings.append(_err("OSCA060", f.relpath, f"scope={scope!r} 不在 {sorted(JUDGMENT_SCOPES)} 中"))
-
-        origin = None
-        if prov not in (None, "", {}):
-            if not isinstance(prov, dict):
-                findings.append(
-                    _err(
-                        "OSCA060",
-                        f.relpath,
-                        f"provenance 必须是 mapping（origin/source/rights），现为 {type(prov).__name__}",
-                    )
-                )
-            else:
-                for key in ("origin", "source", "rights"):
-                    if prov.get(key) in (None, ""):
-                        findings.append(
-                            _err("OSCA060", f.relpath, f"provenance 缺 {key}——权属血统无法事后重建，出生即填")
-                        )
-                origin = prov.get("origin")
-                if origin not in (None, "") and origin not in PROVENANCE_ORIGINS:
-                    findings.append(
-                        _err(
-                            "OSCA060", f.relpath, f"provenance.origin={origin!r} 不在 {sorted(PROVENANCE_ORIGINS)} 中"
-                        )
-                    )
-
-        if cls not in (None, "") and cls not in CLASSIFICATIONS:
-            findings.append(_err("OSCA060", f.relpath, f"classification={cls!r} 不在 {sorted(CLASSIFICATIONS)} 中"))
-
-        if scope == "commons":
-            if origin == "client-derived":
-                findings.append(
-                    _err(
-                        "OSCA060",
-                        f.relpath,
-                        "洁净室：origin=client-derived 的判断不得进 commons——合法入口只有 "
-                        "own-ops / public-standard / licensed（客户判断出生在 org，永不静默迁移）",
-                    )
-                )
-            if cls != "public":
-                findings.append(
-                    _err("OSCA060", f.relpath, "commons 层定义=可迁移且无密级：classification 必须是 public")
-                )
+        findings.extend(_layering_validity("OSCA060", f.relpath, scope, prov, cls))
     return findings
+
+
+@rule
+def osca061_package_layering_default(pkg: OscaPackage) -> list[Finding]:
+    """OSCA061 osca.yaml 包级分层默认段（SPEC v0.4 §1/§9）：`layering: {scope, provenance, classification}`。
+
+    蒸馏 confirm 出生判断按此段填三字段（不填则新账本永远带 OSCA060 warn）。默认段可选、可部分；
+    present 即按 OSCA060 同一判据校验枚举 / 形状 / 洁净室——错的默认会污染整包新生判断，在源头拦
+    （osca.yaml）比逐条 judgment 报更早。缺段合法（judgment 缺字段自有 OSCA060 warn）。
+    """
+    f = pkg.yaml_files.get("osca.yaml")
+    if f is None or f.parse_error:
+        return []  # 缺失 / 解析失败由 OSCA001/003/004 报
+    layering = f.mapping.get("layering")
+    if layering in (None, "", {}):
+        return []
+    if not isinstance(layering, dict):
+        return [
+            _err(
+                "OSCA061",
+                "osca.yaml",
+                f"layering 必须是 mapping（scope/provenance/classification），现为 {type(layering).__name__}",
+            )
+        ]
+    return _layering_validity(
+        "OSCA061", "osca.yaml", layering.get("scope"), layering.get("provenance"), layering.get("classification")
+    )
 
 
 def run_all(pkg: OscaPackage) -> list[Finding]:

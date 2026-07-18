@@ -65,6 +65,7 @@
 | 规则 | 级别 | 内容 | 依据 |
 |---|---|---|---|
 | OSCA060 | 错误/警告 | 判断分层权属三字段（scope/provenance/classification）：三字段缺失 = **警告**（v0.4 起新生判断必填，存量包过渡期不硬拦）；枚举非法、provenance 形状缺陷（缺 origin/source/rights）= 错误；**洁净室** `scope: commons` 且 `origin: client-derived` = 错误（进 commons 只有 own-ops / public-standard / licensed 三入口）；`scope: commons` 且 `classification != public` = 错误（commons 定义=可迁移且无密级） | SPEC v0.4 §9 |
+| OSCA061 | 错误 | osca.yaml 包级分层默认段 `layering: {scope, provenance, classification}`（蒸馏 confirm 出生判断按此填三字段）：可选、可部分；present 即按 OSCA060 同一判据校验枚举/形状/洁净室（错的默认污染整包新生判断，在源头 osca.yaml 拦比逐条 judgment 早）；缺段合法 | SPEC v0.4 §1/§9 |
 
 ## v0.2 已知边界（下一批处理）
 
@@ -76,6 +77,7 @@
 
 ## 变更记录
 
+- **v0.4（M6-W2）**（2026-07-18）：新增 OSCA061——osca.yaml 包级分层默认段校验（SPEC v0.4 §1/§9，与 OSCA060 共用枚举/形状/洁净室判据），共 24 条规则。
 - **v0.4-draft**（2026-07-18）：新增 OSCA060——判断分层权属三字段 + 洁净室机器布防（SPEC v0.4 §9），共 23 条规则。
 - **v0.3**（2026-07-11）：新增 OSCA041——触发原语与闸门受限语法（SPEC v0.4 草案 §5），共 22 条规则。
 - **v0.2**（2026-07-11）：OSCA050 按 SPEC v0.3 §13 精确化——扫描范围扩到全部文本文件；区分连接串（绝对禁止）与文档链接（https 白名单放行、http 一律禁止）。依据栏改指 SPEC v0.3 章节。
