@@ -458,3 +458,11 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   不符即拒（专家批的必须是看过的那份）；账本对账恢复分支同样按指纹——旧判断不再把同名新候选
   误报「已入账」；②双发布者竞争：_publish_candidate 改进程唯一 tmp + os.link 独占占位——
   exists 预检只是快路径、link 才是裁决，同 ID 并发发布只有一个赢、目标绝无混写。公仓无代码变更
+
+## [GPT 九审收口] - 2026-07-19（私仓随行记录）
+- 私仓：候选身份升级 **candidate_revision**（哈希整份候选：问句/草案/证据清单/notes，规范化 dump）
+  ——证据指纹 cases_sha256 区分不了「同 id 同证据、不同归纳」的两份候选（LLM 重归纳），旧卡能批
+  到专家没看过的判断文本。桥接去重/身份守卫/账本对账（判断 meta.candidate_revision）/confirm
+  tombstone 全部改按 (package_id, candidate_id, revision)；cases_sha256 只留给蒸馏封簇（同证据
+  不再骚扰专家——那是对证据的裁决）。旧格式候选以 cases_sha256 作代理身份（surrogate）。
+  公仓本轮无代码变更
