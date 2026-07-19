@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import signal
+import time
 from collections import OrderedDict
+from dataclasses import asdict, replace
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
@@ -28,6 +31,7 @@ from osca_cli.rules import run_all
 
 from osca_host import __version__
 from osca_host.authz import Authorizer, Principal, ensure_admin_token, load_principals
+from osca_host.challenge import TERMINAL_RETENTION_SECONDS, Challenge
 from osca_host.connector import ConnectorProxy
 from osca_host.control import ControlServer, admin_token_path, principals_path
 from osca_host.episode import Episode, assemble
@@ -38,6 +42,7 @@ from osca_host.policy import REPLAY_RED, PolicyInterceptor, ledger_stats
 from osca_host.registry import Registry, RegistryError
 from osca_host.runner import run_episode
 from osca_host.settle import settle_episode
+from osca_host.suspension import SuspensionStore
 from osca_host.triggers import Subscription, TriggerTable
 
 log = logging.getLogger("osca-host")
@@ -72,6 +77,8 @@ class Host:
         self._episode_seq = 0
         self._episode_tasks: set[asyncio.Task] = set()  # 在跑剧集（认知平面，独立线程）
         self._suspensions: dict[str, str] = {}  # challenge_id → episode_id：挂起等批的写剧集（可恢复剧集，D2a）
+        # 挂起快照磁盘持久层（D2b·L2）：run() 里锚定运行目录后建；未建（如单元测试直连）时挂起仅 L1（进程内）
+        self._suspension_store: SuspensionStore | None = None
         self.authorizer = Authorizer()
         self.control = ControlServer(socket_path, self.handle, self.authorizer, control_group)
         self._cmd_lock = asyncio.Lock()  # 命令串行；load 的重活在线程里跑，事件循环保持响应
@@ -311,6 +318,7 @@ class Host:
                 return {"ok": False, "detail": [*result.lines, detail]}
             self._sync_slots(pid)
             lines.append(f"触发表布防 {armed} 条（schedule/watch 挂 watcher，event 待人工发射）")
+        self._reattach_suspensions(loaded.package_id)  # 装载后重挂持久化的挂起剧集（L2 活过重载/重启）
         for line in lines:
             log.info(line)
         return {"ok": True, "package_id": loaded.package_id, "detail": lines}
@@ -329,8 +337,9 @@ class Host:
         if policy is not None:
             # 包停触达认知平面：在途剧集持有此 policy 引用——步间即停、后续调用全拒
             policy.revoke("unload 包停")
-        # 挂起等批的剧集不在跑循环、看不到 revoked——显式迁 stopped 并清登记（否则悬挂等一个已停包的批）
-        self._stop_suspended_episodes(package_id, "包停（unload），挂起等批未兑现（L1 不持久）")
+        # 挂起等批的剧集不在跑循环、看不到 revoked——显式迁 stopped（内存）并清 _suspensions 登记。
+        # L2 磁盘快照**留盘不删**：同包重载时 _reattach 会重挂兑现（活过包重载）；L1（无持久层）则不恢复。
+        self._stop_suspended_episodes(package_id, "包停（unload）：挂起迁 stopped；L2 快照留盘待重载重挂，L1 不恢复")
         self.proxies.pop(package_id, None)
         self.bindings.pop(package_id, None)  # binding 随包清理，不留给后来者
         lines = [f"触发表撤防 {len(removed)} 条"] + self.registry.unregister(package_id)
@@ -534,8 +543,10 @@ class Host:
         self._suspensions[cid] = episode.episode_id
         log.info(f"剧集 {episode.episode_id} 挂起等批（挑战 {cid}）")
         ch = policy.get_challenge(cid)
-        if ch is None or ch.state != "pending":  # 决定已先到（丢唤醒窗）→ 就地自愈恢复
+        if ch is None or ch.state != "pending":  # 决定已先到（丢唤醒窗）→ 就地自愈恢复（马上恢复，不落盘）
             self._schedule_resume(episode.episode_id, loaded, proxy, policy)
+            return
+        self._persist_suspension(episode, policy)  # 挑战仍 pending → L2 持久（活过包重载 / Host 重启）
 
     def _schedule_resume(self, episode_id: str, loaded, proxy, policy) -> None:
         """CAS suspended→running（**事件循环单线程内**，INV-3）+ 调度恢复线程。抢不到即放弃（幂等，防双恢复）。"""
@@ -546,9 +557,112 @@ class Host:
         cid = episode.resume.get("challenge_id") if episode.resume else None
         if cid is not None:
             self._suspensions.pop(cid, None)
+        if self._suspension_store is not None:
+            # 删盘**早于**起写线程——崩溃于「写已落地、终态未记」也不会重挂重批重写（关双写窗，§2.4/L2）；
+            # 崩溃于「已调度、写未完成」则写丢失（fail-closed，安全侧）。残留真·硬件半写归 W6 幂等键。
+            self._suspension_store.delete(episode.operation_id)
         task = asyncio.create_task(self._execute_episode(episode, loaded, proxy, policy))
         self._episode_tasks.add(task)
         task.add_done_callback(self._episode_tasks.discard)
+
+    def _persist_suspension(self, episode: Episode, policy: PolicyInterceptor) -> None:
+        """把挂起剧集快照原子写盘（L2）：{episode 全 dump + 关联挑战全字段 + per_episode 计数 + 版本戳}。
+        运行目录未就绪（单元测试直连）/ 整份快照（含 context）非 JSON 可序列化 / 落盘 I/O 失败 → 静默退回
+        L1（不炸、不改数）。"""
+        store = self._suspension_store
+        cid = episode.resume.get("challenge_id") if episode.resume else None
+        ch = policy.get_challenge(cid) if cid else None
+        if store is None or ch is None:
+            return
+        loaded = self.registry.packages.get(episode.package_id)
+        tool_calls, tokens = policy.episode_budget_used(episode.episode_id)
+        record = {
+            "operation_id": episode.operation_id,
+            "package_id": episode.package_id,
+            "episode": episode.dump(),
+            "challenge": asdict(ch),
+            "tool_calls": tool_calls,
+            "tokens": tokens,
+            "version_stamp": self._pack_stamp(loaded) if loaded is not None else None,
+        }
+        try:
+            store.persist(episode.operation_id, record)
+        except OSError as e:  # 磁盘满/权限/fd 已关等——真正退回 L1（对抗审查 minor-1：不炸成未处理 task 异常）
+            log.warning(f"挂起快照落盘失败（该剧集退回 L1、不活过重载/重启）：{e}")
+
+    @staticmethod
+    def _pack_stamp(loaded) -> str:
+        """包版本戳：git 包用 tree OID（ledger_stamp），非 git 包（zip/演练/CI）用源文件内容指纹——两者皆随
+        任何内容变化而变、**恒非 None**，供重挂时严格比对（任一漂移即 fail-closed 丢弃，§2.4；非 git 侧不再
+        fail-open）。indexes/ 缓存不入指纹（装载会重建、与包身份无关）。"""
+        stamp = ledger_stamp(loaded.root)
+        if stamp is not None:
+            return stamp
+        root = loaded.root
+        h = hashlib.sha256()
+        for p in sorted(root.rglob("*")):
+            if p.is_dir() or "indexes" in p.relative_to(root).parts:
+                continue
+            h.update(p.relative_to(root).as_posix().encode("utf-8") + b"\0")
+            with contextlib.suppress(OSError):
+                h.update(p.read_bytes())
+            h.update(b"\0")
+        return "fp:" + h.hexdigest()
+
+    def _reattach_suspensions(self, package_id: str) -> None:
+        """package 装载后重挂其持久化的挂起剧集（L2）：读盘 → 版本戳/结构校验 → 重建剧集 + 挑战 + 计数 →
+        **重编无冲突展示号**（真键 operation_id）→ 加回台账与 _suspensions → sweep（已决/过期的立即兑现/回落）。
+        包重载与 Host 重启同此一条路径。快照里的挑战恒 pending（决定一到即删盘），故重挂后仍等审批人重发/清扫。"""
+        store = self._suspension_store
+        loaded = self.registry.packages.get(package_id)
+        policy = self.policies.get(package_id)
+        if store is None or loaded is None or policy is None:
+            return
+        current_stamp = self._pack_stamp(loaded)
+        now = time.time()
+        reattached = 0
+        for record in store.load_all():
+            if not isinstance(record, dict):
+                continue  # 合法 JSON 但非 mapping——坏文件跳过，不崩启动（major-1；load_all 已滤，双保险）
+            opid = str(record.get("operation_id", ""))
+            # GC：任意包的挑战过期超保留期 → 顺带清盘（防永不重载包的孤儿快照无限堆积，minor-2）
+            ch_data = record.get("challenge")
+            expires = ch_data.get("expires_at") if isinstance(ch_data, dict) else None
+            stale = isinstance(expires, (int, float)) and not isinstance(expires, bool)
+            if stale and now > expires + TERMINAL_RETENTION_SECONDS:
+                store.delete(opid)
+                continue
+            if record.get("package_id") != package_id:
+                continue
+            try:
+                episode = Episode(**record["episode"])
+                challenge = Challenge(**record["challenge"])
+            except (TypeError, KeyError) as e:
+                log.warning(f"挂起快照结构不符，丢弃：{opid}（{e}）")
+                store.delete(opid)
+                continue
+            if record.get("version_stamp") != current_stamp:
+                # 版本戳不符（含旧快照 None vs 现非 None）→ 包已改版 / 不可证同版 → fail-closed 丢弃（§2.4）
+                log.warning(f"挂起快照与当前包版本不符（包已改版），丢弃不重挂：{opid}")
+                store.delete(opid)
+                continue
+            # 重编无冲突展示号（blocker）：EP 号只是展示、跨重启复用低号会与另一 operation_id 相撞（静默顶掉
+            # 活挂起写、错接挑战）。operation_id 才是真键。挑战仍 pending（未决），故按新号重绑其 episode_id——
+            # payload_digest 不变、恢复用新号消费仍命中；challenge_id 不变（审批人按它批）。
+            self._episode_seq += 1
+            new_id = f"EP-{self._episode_seq:04d}"
+            episode.episode_id = new_id
+            challenge = replace(challenge, episode_id=new_id)
+            policy.restore_challenge(challenge)  # 注回授权状态机（过期由既有 gc 迁 EXPIRED、恢复走回落）
+            tool_calls, tokens = int(record.get("tool_calls", 0)), int(record.get("tokens", 0))
+            policy.restore_episode_budget(new_id, tool_calls, tokens)
+            episode.status = "suspended_pending_approval"  # 快照必为 pending 挑战——重挂即挂起态
+            self.episodes[new_id] = episode
+            self._suspensions[challenge.challenge_id] = new_id
+            reattached += 1
+        if reattached:
+            log.info(f"[{package_id}] 重挂 {reattached} 条挂起剧集（L2 活过重载/重启）")
+            self._sweep_suspensions()  # 已决（含丢唤醒窗）/ 过期的立即恢复：兑现或回落
 
     def _maybe_resume_for_challenge(self, challenge_id: str, package_id: str) -> None:
         """approve/deny 裁决成功后：有挂起剧集在等这张挑战即调度恢复（approve 兑现 / deny 回落）。"""
@@ -659,6 +773,7 @@ class Host:
         # （实例锁 + dev 0600 / prod 0660 socket）。任一步非法都拒绝启动，不降级。
         try:
             runtime = self.control.prepare_runtime()
+            self._suspension_store = SuspensionStore(runtime.fd)  # 挂起快照落这个 fd 锚定的运行目录（L2）
             token_file = admin_token_path(self.control.socket_path)
             # admin token 绑定 Host 自己的 uid：生产模式下别的 uid 偷到也当不了 admin
             admin = Principal("local-admin", "host_admin", os.getuid())

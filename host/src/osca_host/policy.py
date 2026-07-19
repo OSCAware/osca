@@ -486,6 +486,24 @@ class PolicyInterceptor:
         终态超保留期已从 store 清出 → None，调用方按「不可兑现」回落。"""
         return self._challenges.get(challenge_id)
 
+    def restore_challenge(self, challenge: Challenge) -> None:
+        """L2 重挂（D2b）：把持久化的挑战注回本包的 ChallengeStore（重载/重启后恢复挂起写的授权状态机）。"""
+        self._challenges.restore(challenge)
+
+    def episode_budget_used(self, episode_id: str) -> tuple[int, int]:
+        """读本剧集已计的 per_episode (tool_calls, tokens)——L2 挂起快照持久化用（重挂时回灌，不清零）。"""
+        with self._gate:
+            return self._tool_calls.get(episode_id, 0), self._tokens.get(episode_id, 0)
+
+    def restore_episode_budget(self, episode_id: str, tool_calls: int, tokens: int) -> None:
+        """L2 重挂：回灌本剧集已计的 per_episode 计数（重载/重启后不清零——INV-7 挂起不豁免笼子，
+        否则恢复快进跳过已耗步会把硬顶在挂起边界整体重置成 fail-open）。"""
+        with self._gate:
+            if tool_calls:
+                self._tool_calls[episode_id] = tool_calls
+            if tokens:
+                self._tokens[episode_id] = tokens
+
     def decide_challenge(self, challenge_id: str, *, by_name: str, by_role: str, approve: bool) -> tuple[bool, str]:
         """控制通道审批人批/驳一张挑战（绑 challenge_id）。角色/冒名/一次性防护在 ChallengeStore.decide。"""
         ok, detail = self._challenges.decide(challenge_id, by_name=by_name, by_role=by_role, approve=approve)

@@ -248,6 +248,12 @@ class ChallengeStore:
             self._gc_locked(self._clock())
             return self._by_id.get(challenge_id)
 
+    def restore(self, challenge: Challenge) -> None:
+        """L2 重挂（M6-W5-D2b）：把持久化的挑战注回 store（重载/重启后恢复挂起写的授权状态机）。同 id 覆盖。
+        过期由既有惰性 gc 处理——wall-clock `expires_at` 跨重启仍有效，过期即迁 EXPIRED、恢复走回落。"""
+        with self._lock:
+            self._by_id[challenge.challenge_id] = challenge
+
     # ── 内部（全部须持锁调用）────────────────────────────────────
 
     def _find_locked(self, state: str, key: tuple[str, str, str, str]) -> Challenge | None:

@@ -726,3 +726,112 @@ async def test_d2a_evict_excludes_inflight_write_episode(sock_path, monkeypatch)
     h.episodes["R3"] = ep("R3", "running")  # 在途写剧集，台账已满 2 条挂起
     h._evict_old_episodes()
     assert set(h.episodes) == {"S1", "S2", "R3"}  # 无终态可淘汰 → 全留（宁可超顶，不丢在途/挂起）
+
+
+# ── D2b 可恢复剧集 L2 持久：磁盘落盘 + 装载重挂（活过包重载/Host 重启）──────────
+
+
+def _reapply_write_config(host, pid, write_ref="CON-001.拉取费用明细"):
+    """模拟包 policy.yaml 里本就声明的写审批配置——reload 后新 policy/proxy 也须有（真实包由 policy.yaml 承载，
+    此处 monkeypatch 等价于该声明）。"""
+    proxy, policy = host.proxies[pid], host.policies[pid]
+    proxy.connectors["CON-001"].setdefault("permissions", {})["write"] = "allowed_with_approval"
+    policy.permissions["下发"] = {write_ref}
+    policy.approvals[write_ref] = "专家"
+
+
+async def test_d2b_reattach_survives_reload_then_approve_lands(running_host, sample_pack, deploy_w5):
+    """L2 活过包重载：写步挂起 → 快照落盘 → unload（快照留盘）→ reload → 重挂（真键 operation_id，重编展示号）
+    → approve → 在同一剧集恢复兑现 mock 写落地；恢复调度即删盘；per_episode 计数不清零（INV-7）。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)  # 已配写门
+    await host._execute_episode(episode, loaded, proxy, policy)  # 首跑 → 挂起 + 落盘
+    assert episode.status == "suspended_pending_approval"
+    opid = episode.operation_id
+    [ch] = policy.pending_challenges()
+    cid = ch["challenge_id"]
+    used_before = policy.episode_budget_used(episode.episode_id)
+    assert used_before[1] > 0  # agent 步已计 tokens（INV-7 待验的计数）
+    assert [r for r in host._suspension_store.load_all() if r["operation_id"] == opid]  # 快照已落盘
+
+    await _send({"cmd": "unload", "package_id": pid}, host)
+    assert episode.status == "stopped"  # 内存副本迁 stopped（L2 快照留盘）
+    assert [r for r in host._suspension_store.load_all() if r["operation_id"] == opid]  # 快照仍在盘
+
+    await _load_pack(host, sample_pack, deploy_w5)  # reload → _reattach 重挂
+    _reapply_write_config(host, pid)  # reload 后新 policy 须有写配置（真实包由 policy.yaml 承载）
+
+    reattached = next((e for e in host.episodes.values() if e.operation_id == opid), None)
+    assert reattached is not None and reattached.status == "suspended_pending_approval"  # 真键 operation_id 定位
+    new_policy = host.policies[pid]
+    assert new_policy.get_challenge(cid) is not None  # 挑战注回新 store（challenge_id 不变）
+    assert host._suspensions.get(cid) == reattached.episode_id
+    assert new_policy.episode_budget_used(reattached.episode_id) == used_before  # INV-7：计数跨重挂不清零
+
+    host.authorizer.register("approver-token-0001", Principal("专家", "approver"))
+    good = await _send({"cmd": "approve", "package_id": pid, "challenge_id": cid}, host, token="approver-token-0001")
+    assert good["ok"]
+    await _await_status(reattached, "completed")
+    assert reattached.status == "completed"
+    assert next(s for s in reattached.steps if s["step"] == "下发")["status"] == "done"  # 兑现落地
+    assert [r for r in host._suspension_store.load_all() if r["operation_id"] == opid] == []  # 恢复调度即删盘
+
+
+async def test_d2b_reattach_discards_on_version_mismatch(running_host, sample_pack, deploy_w5, monkeypatch):
+    """包版本漂移：快照版本戳与当前包不符（包已改版）→ 重挂时丢弃不兑现 + 删盘（fail-closed，§2.4）。"""
+    from osca_host import host as host_mod
+
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+    await host._execute_episode(episode, loaded, proxy, policy)
+    opid = episode.operation_id
+
+    # 让当前包报一个非 None 版本戳，并把盘上快照的戳改成不同值（模拟挂起后包改版）
+    monkeypatch.setattr(host_mod, "ledger_stamp", lambda root: "TREE-CURRENT")
+    rec = next(r for r in host._suspension_store.load_all() if r["operation_id"] == opid)
+    rec["version_stamp"] = "TREE-STALE"
+    host._suspension_store.persist(opid, rec)
+
+    await _send({"cmd": "unload", "package_id": pid}, host)
+    await _load_pack(host, sample_pack, deploy_w5)  # reload → 戳不符 → 丢弃
+    _reapply_write_config(host, pid)
+
+    assert not any(e.operation_id == opid and e.status == "suspended_pending_approval" for e in host.episodes.values())
+    assert [r for r in host._suspension_store.load_all() if r["operation_id"] == opid] == []  # 快照被丢弃删除
+
+
+async def test_d2b_reattach_same_display_id_no_collision(running_host, sample_pack, deploy_w5):
+    """blocker：两条持久快照展示号相同（EP-0001，跨会话/跨包复用低号）但 operation_id 不同 → 重挂各得独立
+    展示号，两条都在、两挑战各指自己剧集（不静默顶掉一条活挂起写、不错接挑战，击穿 INV-2 的路径已堵）。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    loaded = host.registry.packages[pid]
+    aware = next(a for a in loaded.awares if a.aware_id == "AW-001")
+    stamp = host._pack_stamp(loaded)
+    store = host._suspension_store
+
+    def _record(opid, cid):
+        ep = assemble("EP-0001", loaded, aware, "AW-001/T3")  # 两条都铸同一展示号
+        ep.operation_id = opid
+        ep.status = "suspended_pending_approval"
+        ep.resume = {"step_index": 1, "ref_index": 0, "payloads": {}, "receipts": [],
+                     "write_params": {"x": 1}, "artifacts": {}, "challenge_id": cid}
+        ch = {"challenge_id": cid, "package_id": pid, "action": "CON-001.拉取费用明细", "approver": "专家",
+              "episode_id": "EP-0001", "payload_digest": "d", "created_at": 1.0, "expires_at": 1e12,
+              "state": "pending", "decided_by": None, "decided_at": None, "consumed_at": None}
+        return {"operation_id": opid, "package_id": pid, "episode": ep.dump(), "challenge": ch,
+                "tool_calls": 0, "tokens": 0, "version_stamp": stamp}
+
+    store.persist("EO-aaa", _record("EO-aaa", "CH-a"))
+    store.persist("EO-bbb", _record("EO-bbb", "CH-b"))
+    host._reattach_suspensions(pid)
+
+    suspended = [e for e in host.episodes.values() if e.status == "suspended_pending_approval"]
+    assert {e.operation_id for e in suspended} == {"EO-aaa", "EO-bbb"}  # 两条都在，未互相顶掉
+    assert len({e.episode_id for e in suspended}) == 2  # 各得独立展示号（无冲突）
+    assert host._suspensions["CH-a"] != host._suspensions["CH-b"]  # 两挑战各指自己的剧集（未错接）
