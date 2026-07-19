@@ -72,7 +72,8 @@
 - 引用「只许用 ID、禁止用文件名/中文名」的反向检查（发现疑似中文名引用）未做；AGENT.md 正文中的 ID 引用不校验。
 - §5 衔接约定的「进判断签名或对外交付必须 {ref}」方向性检查未做（当前仅裸字符串放行）。
 - kind 特定必填字段（metric 的 unit/direction/source、composite 的 formula 等）未逐一校验。
-- guard 表达式的语法校验（可求值性）留给运行框架 M2。
+- guard 不做机器语法校验或求值（SPEC §11 定稿：v0.4 无受限求值语法、不参与检索硬过滤——
+  注入后由模型逐条判定应用，事后由回放判据体检；受限语法属后续版本）。
 - cases 大报文外置逻辑指针（{content_hash, store, key}）的形态校验未做。
 - **判断库包变体分支（SPEC v0.4 附录 C，Phase 1）**：`package_kind: library` 时 OSCA001（必备文件）豁免
   structure/aware/policy、OSCA040 跳过 pipeline/aware/policy 校验（judgment/case 纪律照常）；`dependencies`

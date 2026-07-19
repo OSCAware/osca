@@ -49,10 +49,19 @@ def render_system_prompt(episode: Episode) -> str:
     if ctx.get("objects"):
         parts.append("## 对象定义（objects）\n\n```yaml\n" + _yaml(ctx["objects"]) + "\n```")
     if ctx.get("judgments"):
-        parts.append("## 命中判断（依签名检索，各带 1 个代表 case）\n\n```yaml\n" + _yaml(ctx["judgments"]) + "\n```")
         parts.append(
+            "## 候选判断（依签名 object×aware 硬过滤检索，各带 1 个代表 case；guard 未判定）\n\n```yaml\n"
+            + _yaml(ctx["judgments"])
+            + "\n```"
+        )
+        parts.append(
+            "## 判断应用纪律（guard 逐条判定，SPEC §11）\n\n"
+            "上列判断只经 object×aware 确定性硬过滤，`signature.guard` **尚未判定**。应用任何一条之前，"
+            "先按本次情境（输入产物、取数结果）逐条判定其 guard 是否命中："
+            "guard 不命中、或依据不足无法判断的，一律**不得应用、不得标注其判断 ID**；"
+            "只有 guard 命中的判断才依其裁决，并按下述归属纪律标注。\n\n"
             "## 归属纪律（飞轮口径）\n\n"
-            "草稿中凡依据某条命中判断裁决或成文的段落，须在该段落末尾标注其判断 ID（如（J-0417））；"
+            "草稿中凡依据某条 guard 命中判断裁决或成文的段落，须在该段落末尾标注其判断 ID（如（J-0417））；"
             "未依据判断的段落不标。段落级标注是采集器归属计数的唯一依据——"
             "标注随草稿进专家终审：专家整段保留即 confirmed，整段删除即 overruled。"
         )
@@ -83,7 +92,8 @@ def _step_user_prompt(spec: dict, step_name: str, input_key: str | None, input_v
         rendered = input_value if isinstance(input_value, str) else _yaml(input_value)
         parts.append(f"输入产物「{input_key}」：\n\n{rendered}")
     parts.append(
-        "只输出本步骤产出物的内容本身，不要输出解释性前后缀；依据命中判断的段落保留段末判断 ID 标注（归属纪律）。"
+        "只输出本步骤产出物的内容本身，不要输出解释性前后缀；"
+        "依据 guard 命中判断的段落保留段末判断 ID 标注（归属纪律；guard 不命中或无法判断的判断不得应用）。"
     )
     return "\n\n".join(parts)
 

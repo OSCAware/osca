@@ -699,8 +699,8 @@ These are design choices, not business-proven laws.
 
 | Entry | Purpose |
 |---|---|
-| [OSCA SPEC v0.3](OSCA-SPEC-v0.3.md) | Stable package format and ledger discipline |
 | [OSCA SPEC v0.4](OSCA-SPEC-v0.4.md) | Finalized: package format, ledger discipline, Runtime/Settle/Replay/health semantics |
+| [OSCA SPEC v0.3](OSCA-SPEC-v0.3.md) | Historical version (merged into the v0.4 full text) |
 | [Lint rules](OSCA-LINT-RULES.md) | Machine-enforced findings and known limits |
 | [Operating-diagnosis sample](../examples/oper-diagnosis.osca/README.md) | Synthetic/demo package; not real P0 |
 | [CLI guide](../cli/README.md) | Lint, Pack, Load, single Replay |

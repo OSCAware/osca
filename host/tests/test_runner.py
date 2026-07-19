@@ -67,6 +67,17 @@ def test_prompt_carries_attribution_contract(episode):
     assert "判断 ID 标注" in user
 
 
+def test_prompt_carries_guard_application_contract(episode):
+    """guard 提示词契约（SPEC §11 定稿，GPT 四审 P1）：硬过滤只有 object×aware，guard 由模型
+    逐条判定——提示词必须明示「guard 未判定」并规定不命中/无法判断即不得应用、不得标注 ID，
+    否则错误场景照办与归属计数污染两个失败面都开着。"""
+    system = render_system_prompt(episode)
+    assert "guard 未判定" in system or "尚未判定" in system
+    assert "不得应用" in system and "逐条判定" in system
+    user = _step_user_prompt({"step": "成文"}, "成文", None, None)
+    assert "guard" in user
+
+
 def test_full_pipeline_produces_draft(episode, loaded, proxy, policy, llm):
     run_episode(episode, loaded, proxy, policy, llm=llm)
 

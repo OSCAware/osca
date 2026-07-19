@@ -4,8 +4,9 @@
              + 检索命中的判断（top3–7，各带 1 个代表 case）。
 
 判断检索（架构 §6 检索器的 M2 先行版）：签名表直接从已校验的 loaded.pack 生成
-（osca_cli.packer.signature_entries，单一真理源）→ 硬过滤 active 且签名命中本
-Aware 或本剧集引用的 object → 按 trust（high 优先）+ confirmed 降序取 top 7。
+（osca_cli.packer.signature_entries，单一真理源）→ 硬过滤 active 且签名 **object×aware
+合取命中**（本 Aware 且本剧集引用的 object，SPEC §11；guard 不参与，由模型逐条判定）
+→ 按 trust（high 优先）+ confirmed 降序取 top 7。
 磁盘 indexes/ 缓存只服务检索器（oscapipe）与人工查看，装配不读它。
 语义排序（向量）是 M3 索引器的事。
 
