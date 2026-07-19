@@ -153,6 +153,57 @@ def _finish(episode: Episode, status: str, reason: str | None = None) -> Episode
     return episode
 
 
+def _suspend_episode(
+    episode: Episode,
+    index: int,
+    ref_i: int,
+    payloads: dict,
+    receipts: list,
+    write_params: object,
+    artifacts: dict,
+    challenge_id: str | None,
+) -> Episode:
+    """挂起等批（可恢复剧集）：写最小恢复快照 + 置**非终态** + 释放线程（返回，不落终态）。
+
+    INV-1：挂起不持线程——返回即归还线程池，等批期间零 LLM/零线程。挂起是事件而非流水线步，
+    刻意不记入 steps（max_steps 只计已执行步）；挂起态由 status + resume 快照对外可见。
+    """
+    episode.resume = {
+        "step_index": index,
+        "ref_index": ref_i,
+        "payloads": payloads,
+        "receipts": receipts,
+        "write_params": write_params,
+        "artifacts": artifacts,
+        "challenge_id": challenge_id,
+    }
+    episode.status = "suspended_pending_approval"
+    episode.stop_reason = None
+    return episode
+
+
+def _resume_write_ref(policy: PolicyInterceptor, challenge_id: str | None) -> str:
+    """恢复重入挂起的写 ref：按快照 challenge_id 查**当前**挑战态分派（§5.2）。
+
+    approved → 兑现（consume-only 执行写）；pending → 仍待决，保持挂起（幂等）；
+    其余（denied/expired/revoked/consumed/None 已清出）→ 回落保守默认（不写）。
+    绝不在此重入 consume_or_raise——那会对已终态挑战静默新挂一张 pending（§5.2 坑）。
+    """
+    ch = policy.get_challenge(challenge_id) if challenge_id else None
+    state = ch.state if ch is not None else None
+    if state == "approved":
+        return "approved"
+    if state == "pending":
+        return "suspend"
+    return "fallback"
+
+
+def _fallback_marker(ref: str, reason: str) -> dict:
+    """写审批驳回/过期/撤销时的保守默认标记（**不写**）——机制层只「不写 + distinct 记账 + 续跑上报」；
+    「沿用昨日档位」类业务 fallback 归包 pipeline/agent 设计（W5 设计 §5.3 边界）。"""
+    return {"interface": ref, "written": False, "fallback": True, "reason": reason}
+
+
 def run_episode(
     episode: Episode,
     loaded: LoadedPackage,
@@ -186,9 +237,15 @@ def run_episode(
     if not pipeline:
         return _finish(episode, "failed", "structure 无 pipeline，无事可执行")
     system_prompt = render_system_prompt(episode)
-    artifacts: dict[str, object] = {}
+    # 恢复（可恢复剧集）：从挂起快照回灌已产出 artifacts、快进到挂起步——不重跑上游、不重记步。
+    # 诚实标注：max_minutes 墙钟基线在恢复时重置（挂起期间不计活跃运行时）。
+    resume_state = episode.resume
+    resume_step = resume_state["step_index"] if resume_state is not None else None
+    artifacts: dict[str, object] = dict(resume_state["artifacts"]) if resume_state is not None else {}
 
     for index, spec in enumerate(pipeline):
+        if resume_step is not None and index < resume_step:
+            continue  # 已跑过、artifacts 已回灌——恢复只从挂起步续（不重跑不重记，绕过预算/包停复检）
         if not isinstance(spec, dict):
             return _finish(episode, "failed", f"pipeline 第 {index + 1} 项不是步骤声明——宁可拒绝，不可猜测")
         step_name = str(spec.get("step", f"步骤{index + 1}"))
@@ -219,30 +276,81 @@ def run_episode(
             if error:
                 _record(episode, step_name, performer, "failed", error)
                 return _finish(episode, "failed", error)
-            # 写步取上游产物作**写 params**（D1 params 穿透）：写接口经审批门时以其摘要绑定被写内容
-            # （防偷梁换柱）；读接口的执行器忽略 params、也不过写审批门，故对读步无影响（取数步无 input）。
-            # 【D2a 待接】审批门挂起的写目前仍回 Receipt(ok=False)、当场 failed；剧集内挂起等批-恢复重试消费
-            # 随 D2a 可恢复剧集落地——届时须在此区分「待批挂起 / 驳回回落 / 取数真失败」（见 W5 设计 §5）。
-            write_params: object = ""
-            input_key = _input_key(spec)
-            if input_key is not None:
-                if input_key not in artifacts:
-                    detail = f"上游产物「{input_key}」缺失——连接器步声明与执行不符，直接拒绝"
-                    _record(episode, step_name, performer, "failed", detail)
-                    return _finish(episode, "failed", detail)
-                write_params = artifacts[input_key]
-            payloads: dict[str, object] = {}
-            receipts: list[dict] = []
-            for ref in refs:
+            # 写步取上游产物作**写 params**（params 穿透）：写接口经审批门以其摘要绑被写内容（防偷梁换柱）；
+            # 读接口执行器忽略 params、也不过写审批门（取数步无 input）。写命中审批门 → **挂起等批**（可恢复剧集）。
+            resuming = resume_state is not None and index == resume_step
+            if resuming:
+                rs = resume_state
+                payloads, receipts = rs["payloads"], rs["receipts"]
+                write_params, start_ref, pending_cid = rs["write_params"], rs["ref_index"], rs["challenge_id"]
+                episode.resume = None  # 快照已回灌（若仍待决，下方 _suspend_episode 重写）
+                resume_state = None
+            else:
+                write_params, start_ref, pending_cid = "", 0, None
+                input_key = _input_key(spec)
+                if input_key is not None:
+                    if input_key not in artifacts:
+                        detail = f"上游产物「{input_key}」缺失——连接器步声明与执行不符，直接拒绝"
+                        _record(episode, step_name, performer, "failed", detail)
+                        return _finish(episode, "failed", detail)
+                    write_params = artifacts[input_key]
+                payloads, receipts = {}, []
+
+            fell_back = False
+            for ref_i in range(start_ref, len(refs)):
+                ref = refs[ref_i]
+                if resuming and ref_i == start_ref:
+                    # 恢复重入挂起的写 ref：按 challenge_id 当前态分派（§5.2）
+                    verdict = _resume_write_ref(policy, pending_cid)
+                    if verdict == "suspend":  # 仍待决 → 保持挂起（幂等）
+                        return _suspend_episode(
+                            episode, index, ref_i, payloads, receipts, write_params, artifacts, pending_cid
+                        )
+                    if verdict == "fallback":  # 驳回/过期/撤销/已清出 → 回落保守默认（不写）
+                        payloads[ref] = _fallback_marker(ref, f"挑战 {pending_cid} 驳回/过期/撤销，未兑现")
+                        fell_back = True
+                        break
+                    receipt = proxy.call(ref, write_params, step=step_name, episode_id=episode.episode_id, resume=True)
+                    if not receipt.ok and receipt.disposition == "denied":
+                        # consume **未命中**（驳回/过期/撤销/竞态过期，挑战未被消费）→ 回落保守默认（不写）
+                        receipts.append(asdict(receipt))
+                        payloads[ref] = _fallback_marker(ref, f"审批未兑现（consume 未命中）：{receipt.error}")
+                        fell_back = True
+                        break
+                    if not receipt.ok:
+                        # disposition 非 denied：binding/写执行器报错（挑战**已** consume）或 recheck 命中 kill/包停——
+                        # 是真错误、不是审批回落；剧集失败（与首次路径同口径，不吞成 completed 掩盖系统错/烧掉的授权）
+                        receipts.append(asdict(receipt))
+                        _record(episode, step_name, performer, "failed", receipt.error, receipts=receipts)
+                        return _finish(episode, "failed", f"恢复写执行失败：{receipt.error}")
+                    receipts.append(asdict(receipt))
+                    payloads[ref] = receipt.payload
+                    continue
+
                 receipt = proxy.call(ref, write_params, step=step_name, episode_id=episode.episode_id)
+                if receipt.disposition == "pending":  # 首次命中审批门 → 挂起等批（非失败）
+                    return _suspend_episode(
+                        episode, index, ref_i, payloads, receipts, write_params, artifacts, receipt.challenge_id
+                    )
                 receipts.append(asdict(receipt))
                 if not receipt.ok:
-                    # 取数失败即剧集失败：没有取数支撑的草稿是编造（AGENT.md 边界#3）
+                    # 取数真失败 / 写配置拒绝（不在清单/空/非序列化）/ 真实写执行器未接入 → 剧集失败
                     _record(episode, step_name, performer, "failed", receipt.error, receipts=receipts)
                     return _finish(episode, "failed", f"取数失败：{receipt.error}")
                 payloads[ref] = receipt.payload
+
             artifacts[_produces_key(spec, step_name)] = payloads
-            _record(episode, step_name, performer, "done", f"取数 {len(refs)} 接口", receipts=receipts)
+            if fell_back:
+                _record(
+                    episode,
+                    step_name,
+                    performer,
+                    "denied",
+                    "写审批驳回/过期→回落保守默认（不写）+ 上报",
+                    receipts=receipts,
+                )
+            else:
+                _record(episode, step_name, performer, "done", f"取数/写 {len(refs)} 接口", receipts=receipts)
             continue
 
         if kind == "optimizer":

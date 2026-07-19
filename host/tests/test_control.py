@@ -6,12 +6,15 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 
 import pytest
 
 from osca_host.authz import Principal
 from osca_host.control import send_command
+from osca_host.episode import Episode, assemble
 from osca_host.host import Host
+from osca_host.runner import run_episode
 
 
 @pytest.fixture
@@ -577,3 +580,149 @@ async def test_w5_fire_runs_pipeline_to_draft(running_host, sample_pack, deploy_
         episode = (await _send({"cmd": "episode", "episode_id": summary["episode_id"]}, host))["episode"]
     (settlement,) = episode["settlements"]
     assert settlement["settled"] is True and settlement["case"] == "C-0103"
+
+
+# ── D2a 可恢复剧集：Host 编排（挂起登记 / approve·deny 触发恢复 / 登记侧自愈 / 清扫 / 免淘汰）──
+
+def _setup_write_episode(host, pid, write_ref="CON-001.拉取费用明细"):
+    """在已装载包上装 [agent 产草稿 → 写步(input=草稿)] 可恢复剧集，配写门白名单/approvals；
+    LLM 由 deploy_w5 的 mock 通道供给。返回执行所需句柄。"""
+    loaded = host.registry.packages[pid]
+    proxy = host.proxies[pid]
+    policy = host.policies[pid]
+    proxy.connectors["CON-001"].setdefault("permissions", {})["write"] = "allowed_with_approval"
+    policy.permissions["下发"] = {write_ref}
+    policy.approvals[write_ref] = "专家"
+    aware = next(a for a in loaded.awares if a.aware_id == "AW-001")
+    episode = assemble("EP-0001", loaded, aware, "AW-001/T3")
+    episode.context = copy.deepcopy(episode.context)
+    episode.context["structure"]["pipeline"] = [
+        {"step": "生成报警候选", "performer": "agent", "produces": "草稿"},
+        {"step": "下发", "performer": "connector", "uses": write_ref, "input": "草稿"},
+    ]
+    host.episodes[episode.episode_id] = episode
+    return episode, loaded, proxy, policy
+
+
+async def _await_status(episode, target="completed", tries=300):
+    for _ in range(tries):
+        if episode.status == target:
+            return
+        await asyncio.sleep(0.01)
+
+
+async def test_d2a_suspend_approve_resume_lands_through_host(running_host, sample_pack, deploy_w5):
+    """可恢复剧集端到端（async Host）：写步挂起 → 登记 → approver 经控制通道 approve → 恢复 → mock 写落地。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+
+    await host._execute_episode(episode, loaded, proxy, policy)  # 首跑 → 挂起 + 登记
+    assert episode.status == "suspended_pending_approval"
+    [ch] = policy.pending_challenges()
+    assert host._suspensions.get(ch["challenge_id"]) == episode.episode_id
+
+    host.authorizer.register("approver-token-0001", Principal("专家", "approver"))
+    good = await _send(
+        {"cmd": "approve", "package_id": pid, "challenge_id": ch["challenge_id"]}, host, token="approver-token-0001"
+    )
+    assert good["ok"]
+
+    await _await_status(episode, "completed")
+    assert episode.status == "completed"
+    step = next(s for s in episode.steps if s["step"] == "下发")
+    assert step["status"] == "done"
+    assert host._suspensions == {}  # 恢复后清出登记
+
+
+async def test_d2a_deny_through_host_falls_back(running_host, sample_pack, deploy_w5):
+    """deny 经控制通道 → 触发恢复 → 回落保守默认（不写）：剧集 completed（非 failed），写步记 denied。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+    await host._execute_episode(episode, loaded, proxy, policy)
+    [ch] = policy.pending_challenges()
+    host.authorizer.register("approver-token-0001", Principal("专家", "approver"))
+    await _send(
+        {"cmd": "deny", "package_id": pid, "challenge_id": ch["challenge_id"]}, host, token="approver-token-0001"
+    )
+    await _await_status(episode, "completed")
+    assert episode.status == "completed"
+    assert next(s for s in episode.steps if s["step"] == "下发")["status"] == "denied"
+
+
+async def test_d2a_lost_wakeup_self_heals_on_registration(running_host, sample_pack, deploy_w5):
+    """丢唤醒窗（§3.5 blocker）：审批在登记之前到达 → _register_suspension 复查发现已批 → 就地自愈恢复兑现。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+
+    # 直接跑到挂起（绕过 _execute_episode 的登记，模拟「决定先到、登记后到」的窗）
+    await asyncio.to_thread(run_episode, episode, loaded, proxy, policy)
+    assert episode.status == "suspended_pending_approval"
+    [ch] = policy.pending_challenges()
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)  # 登记前批准
+    assert host._suspensions == {}  # 尚未登记
+
+    host._register_suspension(episode, loaded, proxy, policy)  # 登记侧自愈应就地恢复
+    await _await_status(episode, "completed")
+    assert episode.status == "completed"  # 自愈：登记时发现已批 → 恢复兑现（丢唤醒窗被堵）
+
+
+async def test_d2a_sweep_resumes_decided_suspension(running_host, sample_pack, deploy_w5):
+    """惰性清扫（§5.4）：挂起剧集的挑战已离开 pending 但恢复未被触发（漏触发/无决定超时）→ 清扫兜底恢复。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+    await host._execute_episode(episode, loaded, proxy, policy)  # 挂起 + 登记（pending）
+    [ch] = policy.pending_challenges()
+    # 直接裁决、不走控制通道 approve（故不触发 _maybe_resume）——模拟漏触发/无决定超时
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+    assert episode.status == "suspended_pending_approval"  # 仍挂起（未触发恢复）
+
+    host._sweep_suspensions()  # 清扫兜底
+    await _await_status(episode, "completed")
+    assert episode.status == "completed"
+
+
+async def test_d2a_evict_excludes_suspended_episodes(sock_path, monkeypatch):
+    """挂起剧集免 FIFO 淘汰（对抗审查 major-2）——否则已批写随剧集淘汰静默丢弃、击穿 INV-2。"""
+    from osca_host import host as host_mod
+
+    monkeypatch.setattr(host_mod, "EPISODE_LEDGER_CAP", 2)
+    h = Host(sock_path)
+
+    def ep(eid, status):
+        e = Episode(eid, "p", "AW", "t", "", None, {}, {})
+        e.status = status
+        return e
+
+    h.episodes["EP-1"] = ep("EP-1", "suspended_pending_approval")  # 最旧且挂起
+    h.episodes["EP-2"] = ep("EP-2", "completed")
+    h.episodes["EP-3"] = ep("EP-3", "completed")
+    h._evict_old_episodes()
+    assert "EP-1" in h.episodes  # 挂起免淘汰
+    assert "EP-2" not in h.episodes and len(h.episodes) == 2  # 最旧的终态被淘汰
+
+
+async def test_d2a_evict_excludes_inflight_write_episode(sock_path, monkeypatch):
+    """在途（running/assembled）写剧集也免 FIFO 淘汰（对抗审查 major-B）——否则挂起前被淘汰、已批写永不兑现无报错。"""
+    from osca_host import host as host_mod
+
+    monkeypatch.setattr(host_mod, "EPISODE_LEDGER_CAP", 2)
+    h = Host(sock_path)
+
+    def ep(eid, status):
+        e = Episode(eid, "p", "AW", "t", "", None, {}, {})
+        e.status = status
+        return e
+
+    h.episodes["S1"] = ep("S1", "suspended_pending_approval")
+    h.episodes["S2"] = ep("S2", "suspended_pending_approval")
+    h.episodes["R3"] = ep("R3", "running")  # 在途写剧集，台账已满 2 条挂起
+    h._evict_old_episodes()
+    assert set(h.episodes) == {"S1", "S2", "R3"}  # 无终态可淘汰 → 全留（宁可超顶，不丢在途/挂起）

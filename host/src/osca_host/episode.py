@@ -43,7 +43,7 @@ class Episode:
     budget: dict
     context: dict = field(repr=False)
     operation_id: str = ""  # 跨 Host 重启唯一的机器身份；EP-xxxx 只是短展示编号
-    # ── 执行态（runner 写入）：assembled → running → completed | stopped | failed ──
+    # ── 执行态（runner 写入）：assembled → running → suspended_pending_approval ⇄ running → completed|stopped|failed ──
     status: str = "assembled"
     steps: list[dict] = field(default_factory=list)  # 逐步留痕（performer/回执/产出/tokens）
     draft: str | None = None  # 最近一个 agent 步的产出——机器侧的交付物
@@ -51,6 +51,9 @@ class Episode:
     stop_reason: str | None = None  # stopped/failed 的人话原因；completed 为 None
     finished_at: str | None = None
     settlements: list[dict] = field(default_factory=list)  # 对账器落账记录（W5 组件 7）
+    # 挂起-恢复快照（D2a 可恢复剧集）：非 None 即待恢复——写步命中审批门时存最小恢复态
+    # {step_index, ref_index, payloads, receipts, write_params, artifacts, challenge_id}；恢复从挂起步重入后清空。
+    resume: dict | None = field(default=None, repr=False)
 
     def summary(self) -> dict:
         return {

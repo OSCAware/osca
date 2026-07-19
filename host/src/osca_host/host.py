@@ -71,6 +71,7 @@ class Host:
         self.episodes: OrderedDict[str, Episode] = OrderedDict()  # 剧集台账（近期）
         self._episode_seq = 0
         self._episode_tasks: set[asyncio.Task] = set()  # 在跑剧集（认知平面，独立线程）
+        self._suspensions: dict[str, str] = {}  # challenge_id → episode_id：挂起等批的写剧集（可恢复剧集，D2a）
         self.authorizer = Authorizer()
         self.control = ControlServer(socket_path, self.handle, self.authorizer, control_group)
         self._cmd_lock = asyncio.Lock()  # 命令串行；load 的重活在线程里跑，事件循环保持响应
@@ -114,6 +115,7 @@ class Host:
 
     def _dispatch(self, cmd: str, request: dict, principal: Principal) -> dict:
         if cmd == "status":
+            self._sweep_suspensions()  # 轮询顺带清扫过期/已决挂起（§5.4：无决定超时 + 丢唤醒窗第二保险）
             snapshot = self.registry.status()
             for pkg in snapshot["packages"]:
                 pkg["gates"] = [
@@ -132,6 +134,8 @@ class Host:
                 request["challenge_id"], by_name=principal.name, by_role=principal.role, approve=(cmd == "approve")
             )
             log.info(detail)
+            if ok:  # 裁决成功 → 触发挂起剧集恢复（approve 兑现 / deny 回落，均从审批步重入本剧集，§3）
+                self._maybe_resume_for_challenge(request["challenge_id"], request["package_id"])
             return {"ok": ok, "detail": detail}
         if cmd == "challenges":
             policy = self.policies.get(request["package_id"])
@@ -325,6 +329,8 @@ class Host:
         if policy is not None:
             # 包停触达认知平面：在途剧集持有此 policy 引用——步间即停、后续调用全拒
             policy.revoke("unload 包停")
+        # 挂起等批的剧集不在跑循环、看不到 revoked——显式迁 stopped 并清登记（否则悬挂等一个已停包的批）
+        self._stop_suspended_episodes(package_id, "包停（unload），挂起等批未兑现（L1 不持久）")
         self.proxies.pop(package_id, None)
         self.bindings.pop(package_id, None)  # binding 随包清理，不留给后来者
         lines = [f"触发表撤防 {len(removed)} 条"] + self.registry.unregister(package_id)
@@ -462,8 +468,8 @@ class Host:
         self._episode_seq += 1
         episode = assemble(f"EP-{self._episode_seq:04d}", loaded, aware, trigger_id)
         self.episodes[episode.episode_id] = episode
-        while len(self.episodes) > EPISODE_LEDGER_CAP:
-            self.episodes.popitem(last=False)
+        self._evict_old_episodes()  # 淘汰最旧终态剧集；挂起等批剧集免淘汰（否则已批写随淘汰静默丢弃）
+        self._sweep_suspensions()  # 每次唤醒顺带清扫过期/已决挂起（§5.4）
         s = episode.summary()
         log.info(
             f"剧集 {episode.episode_id} 装配完成：判断 {len(s['judgments'])} 条（{', '.join(s['judgments'])}）"
@@ -484,9 +490,17 @@ class Host:
             episode.stop_reason = "执行器内部错误（见 Host 日志）"
             episode.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
             log.exception(f"剧集 {episode.episode_id} 执行器内部错误")
+        if episode.status == "suspended_pending_approval":
+            # 挂起等批（可恢复剧集）：登记 + 登记侧自愈（§3.5）；**不落终态、不对账**——等 approve/deny/清扫触发恢复
+            self._register_suspension(episode, loaded, proxy, policy)
+            return
         tail = f"（{episode.stop_reason}）" if episode.stop_reason else ""
         log.info(f"剧集 {episode.episode_id} 终态 {episode.status}{tail}：tokens {episode.tokens_used}")
         if episode.status != "completed":
+            return
+        if any(s.get("status") == "denied" for s in episode.steps):
+            # 写审批驳回/过期 → 回落保守默认（未写）：保守态不对账，不落 outcome case（§3.7，回落不误采集）
+            log.info(f"剧集 {episode.episode_id} 含写回落（保守默认未写）——不对账，不落 outcome case")
             return
         # 对账器（组件 7）：objective 型对象自动落 outcome case，不消耗剧集
         try:
@@ -497,6 +511,100 @@ class Host:
                     log.info(f"对账未执行：{entry['object']}——{entry['note']}")
         except Exception:
             log.exception(f"剧集 {episode.episode_id} 对账器内部错误（剧集本身已 completed）")
+
+    # ── 可恢复剧集编排（D2a）：挂起登记 / 恢复调度 / 惰性清扫 ──────────────
+
+    def _register_suspension(self, episode: Episode, loaded, proxy, policy) -> None:
+        """登记挂起剧集（challenge_id → episode_id）+ **登记侧自愈**（§3.5 blocker）：登记同一事件循环临界区内
+        立即复查挑战当前态，若已 approve/deny/expire（决定先到、登记后到的丢唤醒窗），就地调度一次恢复。"""
+        cid = episode.resume.get("challenge_id") if episode.resume else None
+        if cid is None:  # 挂起却无 challenge_id——内部不一致，防御性收尾成 failed（不静默悬挂）
+            episode.status = "failed"
+            episode.stop_reason = "挂起态缺 challenge_id（内部不一致）"
+            episode.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            return
+        if self.episodes.get(episode.episode_id) is not episode:
+            # 剧集已不在台账（被淘汰/替换）——登记也无从恢复（_schedule_resume 找不到它）。收尾成 failed，
+            # 不留悬空 _suspensions（否则已批写永不兑现且无报错）。有 _evict 免淘汰在途/挂起后此路应不可达，留作兜底。
+            episode.status = "failed"
+            episode.stop_reason = "剧集已不在台账，挂起无法登记恢复（避免悬空、不静默丢已批写）"
+            episode.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            log.error(f"剧集 {episode.episode_id} 挂起时已不在台账——拒绝登记恢复")
+            return
+        self._suspensions[cid] = episode.episode_id
+        log.info(f"剧集 {episode.episode_id} 挂起等批（挑战 {cid}）")
+        ch = policy.get_challenge(cid)
+        if ch is None or ch.state != "pending":  # 决定已先到（丢唤醒窗）→ 就地自愈恢复
+            self._schedule_resume(episode.episode_id, loaded, proxy, policy)
+
+    def _schedule_resume(self, episode_id: str, loaded, proxy, policy) -> None:
+        """CAS suspended→running（**事件循环单线程内**，INV-3）+ 调度恢复线程。抢不到即放弃（幂等，防双恢复）。"""
+        episode = self.episodes.get(episode_id)
+        if episode is None or episode.status != "suspended_pending_approval":
+            return  # 已淘汰/已恢复/已终态——放弃（幂等）
+        episode.status = "running"  # CAS：单线程读到 suspended 才改 running，其间无 await 交错
+        cid = episode.resume.get("challenge_id") if episode.resume else None
+        if cid is not None:
+            self._suspensions.pop(cid, None)
+        task = asyncio.create_task(self._execute_episode(episode, loaded, proxy, policy))
+        self._episode_tasks.add(task)
+        task.add_done_callback(self._episode_tasks.discard)
+
+    def _maybe_resume_for_challenge(self, challenge_id: str, package_id: str) -> None:
+        """approve/deny 裁决成功后：有挂起剧集在等这张挑战即调度恢复（approve 兑现 / deny 回落）。"""
+        episode_id = self._suspensions.get(challenge_id)
+        if episode_id is None:
+            return  # 无挂起剧集等它（或登记侧自愈已处理，或已淘汰）
+        loaded = self.registry.packages.get(package_id)
+        proxy = self.proxies.get(package_id)
+        policy = self.policies.get(package_id)
+        if loaded is not None and proxy is not None and policy is not None:
+            self._schedule_resume(episode_id, loaded, proxy, policy)
+
+    def _evict_old_episodes(self) -> None:
+        """台账超顶只淘汰最旧的**终态**（completed/stopped/failed）剧集；在途/挂起（assembled/running/
+        suspended_pending_approval）一律**免淘汰**（对抗审查 major-2）——否则在途或挂起的写剧集被 FIFO 淘汰出
+        台账后，其已批高危写永不兑现且无报错（击穿 INV-2）。backlog 时台账暂时超顶，可接受。"""
+        while len(self.episodes) > EPISODE_LEDGER_CAP:
+            victim = next(
+                (eid for eid, ep in self.episodes.items() if ep.status in ("completed", "stopped", "failed")), None
+            )
+            if victim is None:
+                return  # 无终态可淘汰（全在途/挂起）——宁可超顶，不丢在途/已批写
+            del self.episodes[victim]
+
+    def _sweep_suspensions(self) -> None:
+        """惰性清扫（§5.4）：凡挂起剧集其挑战已离开 pending（approved/denied/expired/revoked/已清出）→ 调度一次
+        恢复（走 §5.2 分派）。堵「无决定超时（TTL 过期无事件）」+ 丢唤醒窗第二重保险。"""
+        for cid, episode_id in list(self._suspensions.items()):
+            episode = self.episodes.get(episode_id)
+            if episode is None or episode.status != "suspended_pending_approval":
+                self._suspensions.pop(cid, None)  # 已淘汰/已恢复/已终态——清出登记
+                continue
+            policy = self.policies.get(episode.package_id)
+            loaded = self.registry.packages.get(episode.package_id)
+            proxy = self.proxies.get(episode.package_id)
+            if policy is None or loaded is None or proxy is None:
+                continue
+            ch = policy.get_challenge(cid)
+            if ch is None or ch.state != "pending":
+                self._schedule_resume(episode_id, loaded, proxy, policy)
+
+    def _stop_suspended_episodes(self, package_id: str | None, reason: str) -> None:
+        """把挂起等批的剧集迁 stopped 并清出 _suspensions（§3.4 包停/关停）——package_id=None 为全体（关停）。
+        诚实标注：L1 不持久，挂起态随包/进程消亡、重启不恢复（活过重载/重启是 L2 的事）。"""
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        for episode in self.episodes.values():
+            if episode.status != "suspended_pending_approval":
+                continue
+            if package_id is not None and episode.package_id != package_id:
+                continue
+            episode.status = "stopped"
+            episode.stop_reason = reason
+            episode.finished_at = now
+            cid = episode.resume.get("challenge_id") if episode.resume else None
+            if cid is not None:
+                self._suspensions.pop(cid, None)
 
     def _sync_slots(self, package_id: str) -> None:
         """注册表槽位状态跟随布防事实：armed（已挂 watcher/待人工发射）或 disabled。"""
@@ -528,6 +636,8 @@ class Host:
             _, pending = await asyncio.wait(list(self._episode_tasks), timeout=60)
             if pending:
                 log.warning(f"{len(pending)} 个剧集未在 60s 内收尾，放弃等待")
+        # 挂起等批的剧集无 task（INV-1 不持线程）→ 不会被上面等到；显式迁 stopped（L1 不持久，重启不恢复）
+        self._stop_suspended_episodes(None, "Host 关停，挂起等批未兑现（L1 不持久，重启不恢复）")
 
         # 关停 = 全体包停：逐包撤防注销（三级停之「包停」的机制复用）
         for package_id in list(self.registry.packages):

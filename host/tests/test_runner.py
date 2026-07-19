@@ -194,14 +194,9 @@ def test_connector_failure_fails_episode(episode, loaded, policy):
     assert "取数失败" in episode.stop_reason and "binding" in episode.stop_reason
 
 
-def test_connector_write_step_binds_upstream_params_to_challenge(episode, loaded, proxy, policy, llm):
-    """D1 params 穿透（端到端真触达写审批门）：连接器写步把 input 上游产物作写 params → 过工具白名单
-    + 写审批门 → 挂 pending 挑战，其摘要绑**真实被写内容**（=上游草稿）、绑本剧集。写仍被门拦故 D1
-    剧集 failed（挂起-恢复留 D2a）。断言真触达写门：删掉写门本测试会红（挂不出挑战）。"""
-    from osca_host.challenge import payload_digest
-
+def _write_pipeline(episode, proxy, policy, write_ref="CON-001.拉取费用明细"):
+    """装一条 [agent 产草稿 → connector 写步(input=草稿)] 的可恢复剧集管线；写接口进白名单+approvals。"""
     episode.context = copy.deepcopy(episode.context)  # structure 与包共享引用，改前先拷贝
-    write_ref = "CON-001.拉取费用明细"
     proxy.connectors["CON-001"].setdefault("permissions", {})["write"] = "allowed_with_approval"
     policy.permissions["下发"] = {write_ref}  # 写步过工具白名单，才真正触达写门（否则被白名单提前拦下）
     policy.approvals[write_ref] = "专家"
@@ -209,13 +204,128 @@ def test_connector_write_step_binds_upstream_params_to_challenge(episode, loaded
         {"step": "生成报警候选", "performer": "agent", "produces": "草稿"},
         {"step": "下发", "performer": "connector", "uses": write_ref, "input": "草稿"},
     ]
+    return write_ref
+
+
+def _write_step(episode):
+    return next(s for s in episode.steps if s["step"] == "下发")
+
+
+def _landed(step):
+    return [r for r in step.get("receipts", []) if isinstance(r.get("payload"), dict) and r["payload"].get("landed")]
+
+
+def test_write_step_suspends_on_approval_gate(episode, loaded, proxy, policy, llm):
+    """写命中审批门 → 剧集**挂起**（非 failed）：status=suspended_pending_approval + resume 快照 + 挂 pending
+    挑战，摘要绑真实被写内容（=上游草稿）、绑本剧集。断言真触达写门：删掉写门挂不出挑战、本测试会红。"""
+    from osca_host.challenge import payload_digest
+
+    _write_pipeline(episode, proxy, policy)
     run_episode(episode, loaded, proxy, policy, llm=llm)
 
-    assert episode.status == "failed" and "审批门拦截" in episode.stop_reason  # 写门拦下（非白名单）
+    assert episode.status == "suspended_pending_approval" and episode.finished_at is None
+    assert episode.resume is not None and episode.resume["step_index"] == 1
     [ch] = policy.pending_challenges()
-    assert ch["payload_digest"] == payload_digest(episode.draft)  # 摘要绑真实被写内容=上游草稿（穿透成立）
-    assert ch["payload_digest"] != payload_digest("")  # 非空串摘要
-    assert ch["episode_id"] == episode.episode_id  # 绑本剧集
+    assert episode.resume["challenge_id"] == ch["challenge_id"]
+    assert ch["payload_digest"] == payload_digest(episode.draft)  # 绑真实被写内容=上游草稿（穿透成立）
+    assert ch["payload_digest"] != payload_digest("") and ch["episode_id"] == episode.episode_id
+
+
+def test_suspend_then_approve_resumes_and_lands(episode, loaded, proxy, policy, llm):
+    """挂起 → approve → 恢复（consume-only 兑现）→ mock 写落地；剧集 completed，写回执落地=被批准内容。"""
+    _write_pipeline(episode, proxy, policy)
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "suspended_pending_approval"
+    draft = episode.draft
+    [ch] = policy.pending_challenges()
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+
+    run_episode(episode, loaded, proxy, policy, llm=llm)  # 恢复（读 episode.resume）
+    assert episode.status == "completed" and episode.resume is None
+    step = _write_step(episode)
+    assert step["status"] == "done"
+    [landed] = _landed(step)
+    assert landed["ok"] and landed["payload"]["applied"] == draft  # 落地=被批准的被写内容
+    assert policy.pending_challenges() == []  # 一次性：挑战已 consumed
+
+
+def test_suspend_then_deny_resumes_to_fallback(episode, loaded, proxy, policy, llm):
+    """挂起 → deny → 恢复 → 回落保守默认（不写）：剧集 completed（**非 failed**），写步记 denied、无落地。"""
+    _write_pipeline(episode, proxy, policy)
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    [ch] = policy.pending_challenges()
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=False)
+
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "completed" and episode.resume is None
+    step = _write_step(episode)
+    assert step["status"] == "denied" and _landed(step) == []  # 回落=不写
+
+
+def test_suspend_then_expired_approval_falls_back(loaded, llm, tmp_path):
+    """approve 后 TTL 前未及恢复消费 → approved 也过期（防陈旧授权翻用）→ 恢复按 EXPIRED 回落（不写）。"""
+    from osca_host.challenge import ChallengeStore
+
+    clock = {"t": 1000.0}
+    store = ChallengeStore(clock=lambda: clock["t"], ttl_seconds=300.0)
+    pf = loaded.pack.yaml_files["policy.yaml"]
+    policy = PolicyInterceptor(loaded.package_id, pf.mapping, ledger_stats(loaded.pack), challenges=store)
+    write_ref = "CON-001.拉取费用明细"
+    policy.permissions["下发"] = {write_ref}
+    policy.approvals[write_ref] = "专家"
+    fixtures = tmp_path / "f"
+    fixtures.mkdir()
+    proxy = ConnectorProxy(loaded, {"FINANCE_DB": {"endpoint": f"mock://{fixtures}"}}, policy)
+    proxy.connectors["CON-001"].setdefault("permissions", {})["write"] = "allowed_with_approval"
+    aware = next(a for a in loaded.awares if a.aware_id == "AW-001")
+    episode = assemble("EP-0009", loaded, aware, "AW-001/T3")
+    episode.context = copy.deepcopy(episode.context)
+    episode.context["structure"]["pipeline"] = [
+        {"step": "生成报警候选", "performer": "agent", "produces": "草稿"},
+        {"step": "下发", "performer": "connector", "uses": write_ref, "input": "草稿"},
+    ]
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "suspended_pending_approval"
+    [ch] = policy.pending_challenges()
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+    clock["t"] += 400.0  # 越过 TTL：approved 也被 _gc_locked 迁 expired
+
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "completed"
+    assert _write_step(episode)["status"] == "denied"  # 过期未兑现 → 回落（不写）
+
+
+def test_resume_after_consumed_challenge_falls_back_no_double_write(episode, loaded, proxy, policy, llm):
+    """一次性兜底（INV-4 运行时侧）：恢复消费后挑战 consumed，再以旧快照恢复 → 见 consumed → 回落，不第二次写。"""
+    _write_pipeline(episode, proxy, policy)
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    snap = copy.deepcopy(episode.resume)  # 保存挂起快照（深拷贝：浅拷会与恢复共享 receipts 列表）
+    [ch] = policy.pending_challenges()
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+    run_episode(episode, loaded, proxy, policy, llm=llm)  # 恢复 → 兑现（consume）
+    assert episode.status == "completed" and len(_landed(_write_step(episode))) == 1
+
+    episode.resume = snap  # 强行以旧快照再恢复一次（Host CAS 正常挡；这里验运行时一次性兜底）
+    episode.status = "suspended_pending_approval"
+    episode.steps = []
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "completed"
+    step = _write_step(episode)
+    assert step["status"] == "denied" and _landed(step) == []  # consumed → 回落，不第二次写
+
+
+def test_resume_executor_error_fails_not_fallback(episode, loaded, proxy, policy, llm):
+    """恢复兑现时写执行器/binding 真错误（挑战**已** consume）→ 剧集 failed（非回落 completed），不掩盖系统错、
+    不谎报审批回落（对抗审查 major-A）。一次性授权已烧，诚实：真错误不退还额度。"""
+    _write_pipeline(episode, proxy, policy)
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    [ch] = policy.pending_challenges()
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+    proxy.bindings.pop("FINANCE_DB", None)  # 兑现前抽掉 binding → consume 成功后写执行失败（disposition!=denied）
+
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "failed" and "恢复写执行失败" in episode.stop_reason
+    assert policy.get_challenge(ch["challenge_id"]).state == "consumed"  # 一次性授权已烧（真错误不退还）
 
 
 def test_connector_step_missing_input_artifact_fails(episode, loaded, proxy, policy, llm):

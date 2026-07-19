@@ -40,7 +40,11 @@ from osca_cli.triggers import (  # 数量记法与预算键的单一真理源（
     parse_quantity,
 )
 
-from osca_host.challenge import ChallengeStore, payload_digest  # W3 审批：绑定挑战替换旧无绑定 set[action]
+from osca_host.challenge import (  # W3 审批：绑定挑战替换旧无绑定 set[action]
+    Challenge,
+    ChallengeStore,
+    payload_digest,
+)
 
 __all__ = ["PolicyInterceptor", "REDACTORS", "ledger_stats", "parse_quantity", "replay_health"]
 
@@ -301,21 +305,29 @@ class PolicyInterceptor:
 
     # ── 工具白名单（默认拒绝） ─────────────────────────────────────────
 
-    def authorize_tool(self, step: str | None, tool: str, episode_id: str | None = None) -> tuple[bool, str]:
+    def authorize_tool(
+        self, step: str | None, tool: str, episode_id: str | None = None, *, recheck_only: bool = False
+    ) -> tuple[bool, str]:
         """step=None 表示运行时内部调用（precondition/watch 轮询），不走模型白名单。
 
         整个决策（revoke/kill 读取 + 预算预留）在授权锁内——与 revoke()/kill 发布
         同一线性化边界（Review 十一轮：锁外读取会在 revoke 返回后仍放行）。
+
+        recheck_only（D2a 恢复重入挂起的写步）：仍复核 revoked/kill/白名单（INV-7 挂起不豁免笼子），
+        但**不重复计 tool_call 额度**——该步在首次挂起前已计过一次，budget 计的是「已录用调用」，
+        不因恢复而双计；也因此额度已满时已录用的写仍能被恢复兑现（不被自己占的最后一格挡死）。
         """
         with self._gate:
-            return self._authorize_tool_locked(step, tool, episode_id)
+            return self._authorize_tool_locked(step, tool, episode_id, recheck_only)
 
-    def _authorize_tool_locked(self, step: str | None, tool: str, episode_id: str | None) -> tuple[bool, str]:
+    def _authorize_tool_locked(
+        self, step: str | None, tool: str, episode_id: str | None, recheck_only: bool = False
+    ) -> tuple[bool, str]:
         if self.revoked:
             return self._deny(step, tool, f"包已停：{self.revoked}")
         if self.kill_tripped:
             return self._deny(step, tool, self.kill_reason)
-        if episode_id is not None and self.max_tool_calls is not None:
+        if not recheck_only and episode_id is not None and self.max_tool_calls is not None:
             used = self._tool_calls.get(episode_id, 0)
             if used >= self.max_tool_calls:
                 return self._deny(step, tool, f"预算硬顶：本剧集 tool_calls 已用满 {self.max_tool_calls}")
@@ -437,6 +449,42 @@ class PolicyInterceptor:
             return self._deny(
                 None, interface_ref, f"写 params 非 JSON 可序列化、无法绑定审批摘要——拒绝（宁可拒绝，不可炸）：{e}"
             )
+
+    def consume_write_approval(
+        self, interface_ref: str, *, episode_id: str | None, payload: object
+    ) -> tuple[bool, str]:
+        """恢复路径的写放行：**只消费已批挑战、不新建**（§5.2）——恢复重入写步时用。杜绝 get→consume 间
+        挑战过期又静默新挂一张 pending（consume_or_raise 会）。消费不到（过期/驳回/撤销/绑定不符/已用过）
+        即失败，由 runner 回落保守默认。空/非序列化两条 fail-closed 与 require_write_approval 同守。"""
+        if interface_ref not in self.approvals:
+            return self._deny(None, interface_ref, f"写接口「{interface_ref}」不在 approvals 清单——恢复放行拒绝")
+        if payload == "" or payload is None:
+            return self._deny(None, interface_ref, f"写接口「{interface_ref}」被写内容为空——恢复放行拒绝")
+        try:
+            digest = payload_digest(payload)
+        except (TypeError, ValueError) as e:
+            return self._deny(None, interface_ref, f"写 params 非 JSON 可序列化——恢复放行拒绝：{e}")
+        ok, detail = self._challenges.consume(
+            package_id=self.package_id, action=interface_ref, episode_id=episode_id or "", payload_digest=digest
+        )
+        return (self._allow if ok else self._deny)(None, interface_ref, detail)
+
+    def find_pending_challenge(
+        self, interface_ref: str, *, episode_id: str | None, payload: object
+    ) -> Challenge | None:
+        """查本绑定（package/action/episode/摘要）当前是否有 pending 挑战——proxy 据此把审批门拦截分辨成
+        「待批挂起（pending）」还是「配置/内容拒绝（denied）」。摘要不可算即 None（坏输入不算 pending）。"""
+        try:
+            digest = payload_digest(payload)
+        except (TypeError, ValueError):
+            return None
+        key = (self.package_id, interface_ref, episode_id or "", digest)
+        return next((ch for ch in self._challenges.list_pending() if ch.binding == key), None)
+
+    def get_challenge(self, challenge_id: str) -> Challenge | None:
+        """按 id 查单张挑战当前态——恢复分派 / 登记侧自愈 / 惰性清扫读态的单一入口（§3.6）。
+        终态超保留期已从 store 清出 → None，调用方按「不可兑现」回落。"""
+        return self._challenges.get(challenge_id)
 
     def decide_challenge(self, challenge_id: str, *, by_name: str, by_role: str, approve: bool) -> tuple[bool, str]:
         """控制通道审批人批/驳一张挑战（绑 challenge_id）。角色/冒名/一次性防护在 ChallengeStore.decide。"""
