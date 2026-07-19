@@ -194,6 +194,40 @@ def test_connector_failure_fails_episode(episode, loaded, policy):
     assert "取数失败" in episode.stop_reason and "binding" in episode.stop_reason
 
 
+def test_connector_write_step_binds_upstream_params_to_challenge(episode, loaded, proxy, policy, llm):
+    """D1 params 穿透（端到端真触达写审批门）：连接器写步把 input 上游产物作写 params → 过工具白名单
+    + 写审批门 → 挂 pending 挑战，其摘要绑**真实被写内容**（=上游草稿）、绑本剧集。写仍被门拦故 D1
+    剧集 failed（挂起-恢复留 D2a）。断言真触达写门：删掉写门本测试会红（挂不出挑战）。"""
+    from osca_host.challenge import payload_digest
+
+    episode.context = copy.deepcopy(episode.context)  # structure 与包共享引用，改前先拷贝
+    write_ref = "CON-001.拉取费用明细"
+    proxy.connectors["CON-001"].setdefault("permissions", {})["write"] = "allowed_with_approval"
+    policy.permissions["下发"] = {write_ref}  # 写步过工具白名单，才真正触达写门（否则被白名单提前拦下）
+    policy.approvals[write_ref] = "专家"
+    episode.context["structure"]["pipeline"] = [
+        {"step": "生成报警候选", "performer": "agent", "produces": "草稿"},
+        {"step": "下发", "performer": "connector", "uses": write_ref, "input": "草稿"},
+    ]
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+
+    assert episode.status == "failed" and "审批门拦截" in episode.stop_reason  # 写门拦下（非白名单）
+    [ch] = policy.pending_challenges()
+    assert ch["payload_digest"] == payload_digest(episode.draft)  # 摘要绑真实被写内容=上游草稿（穿透成立）
+    assert ch["payload_digest"] != payload_digest("")  # 非空串摘要
+    assert ch["episode_id"] == episode.episode_id  # 绑本剧集
+
+
+def test_connector_step_missing_input_artifact_fails(episode, loaded, proxy, policy, llm):
+    """连接器步声明 input 但上游产物缺失 = 流水线声明与执行不符，直接拒绝（与 agent 步同口径）。"""
+    episode.context = copy.deepcopy(episode.context)
+    episode.context["structure"]["pipeline"] = [
+        {"step": "下发", "performer": "connector", "uses": "CON-001.拉取费用明细", "input": "并不存在的产物"},
+    ]
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "failed" and "并不存在的产物" in episode.stop_reason
+
+
 def test_llm_unconfigured_fails_with_plain_words(episode, loaded, proxy, policy, monkeypatch):
     monkeypatch.delenv("OSCA_LLM_URL", raising=False)
     run_episode(episode, loaded, proxy, policy, llm=None)

@@ -59,9 +59,13 @@ class ConnectorProxy:
         self.pack_root = loaded.root
 
     def call(
-        self, interface_ref: str, params: str = "", *, step: str | None = None, episode_id: str | None = None
+        self, interface_ref: str, params: object = "", *, step: str | None = None, episode_id: str | None = None
     ) -> Receipt:
-        """按名调用。step=None 为运行时内部调用（precondition/watch 轮询）。"""
+        """按名调用。step=None 为运行时内部调用（precondition/watch 轮询）。
+
+        params：读接口的过滤参数（str）或**写接口被写内容**（结构体，D1 params 穿透）。写接口经审批门时
+        以 params 的 sha256 摘要绑定挑战（防偷梁换柱）；读执行器忽略 params、也不过写审批门。
+        """
         ok, reason = self.policy.authorize_tool(step, interface_ref, episode_id)
         if not ok:
             return Receipt(ok=False, interface=interface_ref, error=reason)
@@ -77,10 +81,11 @@ class ConnectorProxy:
 
         cid = interface_ref.split(".", 1)[0]
         connector = self.connectors[cid]
-        if (connector.get("permissions") or {}).get("write") != "forbidden":
+        is_write = (connector.get("permissions") or {}).get("write") != "forbidden"
+        if is_write:
             # 写路径的审批门对内对外一视同仁——step=None 的运行时内部调用（watch/precondition/settle）
             # 也不豁免。不在 approvals 清单的写接口默认拒绝；在清单则挂/复用绑定挑战，批准后一次性 consume。
-            # 挑战绑到本次 episode + 被写 payload（params 摘要）——防跨剧集串用与偷梁换柱。
+            # 挑战绑到本次 episode + 被写 payload（params 摘要，D1 起为真实被写内容）——防跨剧集串用与偷梁换柱。
             ok, reason = self.policy.require_write_approval(interface_ref, episode_id=episode_id, payload=params)
             if not ok:
                 return Receipt(ok=False, interface=interface_ref, error=reason)
@@ -97,7 +102,12 @@ class ConnectorProxy:
 
         endpoint = str(binding.get("endpoint", ""))
         if endpoint.startswith("mock://"):
-            payload, error = self._execute_mock(endpoint, interface_ref, itf)
+            # 写接口走 mock 写执行器（落地被批准的 params）；读接口走 mock 固件执行器
+            payload, error = (
+                self._execute_mock_write(interface_ref, params)
+                if is_write
+                else self._execute_mock(endpoint, interface_ref, itf)
+            )
         else:
             payload, error = self._execute_real(endpoint)
         if error:
@@ -113,6 +123,12 @@ class ConnectorProxy:
         if not fixture.is_file():
             return None, f"mock 固件缺失：{fixture}"
         return yaml.safe_load(fixture.read_text(encoding="utf-8")), None
+
+    def _execute_mock_write(self, interface_ref: str, params: object) -> tuple[object, str | None]:
+        """mock 写执行器（测试与全链路演练）：不落真实系统，回一张确定性 mock 写回执，回显被批准的
+        被写内容（params）+ 落地标记。走通此路 = 审批闭环机制通，**非真实系统写验证**——真实
+        sql_readonly/openapi 写执行器属部署侧适配（W6/M6 对接约定，`_execute_real` 仍桩）。"""
+        return {"mock_write": interface_ref, "applied": params, "landed": True}, None
 
     def _execute_real(self, endpoint: str) -> tuple[object, str | None]:
         m = ENDPOINT_HOST.match(endpoint)

@@ -199,12 +199,16 @@ def test_write_approval_defaults_to_deny():
     ok, reason = p.require_write_approval(ref, episode_id="EP-1", payload="")
     assert not ok and "默认拒绝" in reason
     p.approvals[ref] = "专家"
+    # 在清单但被写内容为空 → 仍 fail-closed（不对空摘要拍板），不挂挑战
     ok, detail = p.require_write_approval(ref, episode_id="EP-1", payload="")
-    assert not ok and "审批门拦截" in detail  # 在清单但未批 → 拦（挂 pending 挑战）
+    assert not ok and "被写内容" in detail and p.pending_challenges() == []
+    payload = {"工单": "WO-1", "结论": "已处理"}
+    ok, detail = p.require_write_approval(ref, episode_id="EP-1", payload=payload)
+    assert not ok and "审批门拦截" in detail  # 在清单、有内容、未批 → 拦（挂 pending 挑战）
     [ch] = p.pending_challenges()
     p.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
-    assert p.require_write_approval(ref, episode_id="EP-1", payload="")[0]  # 批后放行一次
-    assert not p.require_write_approval(ref, episode_id="EP-1", payload="")[0]  # 一次性：consume 后再拦
+    assert p.require_write_approval(ref, episode_id="EP-1", payload=payload)[0]  # 批后同内容放行一次
+    assert not p.require_write_approval(ref, episode_id="EP-1", payload=payload)[0]  # 一次性：consume 后再拦
 
 
 def test_redaction():

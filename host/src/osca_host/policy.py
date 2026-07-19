@@ -418,12 +418,25 @@ class PolicyInterceptor:
 
         与 require_approval 的缺省放行相反：写动作**默认拒绝**——不在审批清单的
         写接口连审批的机会都没有（policy 没给名分的写动作不存在合法路径）。
+
+        两条 fail-closed（宁可拒绝，不可炸/不可对空摘要拍板）：被写内容为空（params 未提供）→ 拒绝，
+        不让空串摘要绑定挑战（否则审批人对空内容拍板）；被写内容非 JSON 可序列化（如 YAML 原生 date）→
+        拒绝，不让 payload_digest 的 json.dumps 抛未捕获异常退化成不透明崩溃。
         """
         if interface_ref not in self.approvals:
             return self._deny(
                 None, interface_ref, f"写接口「{interface_ref}」不在 policy approvals 清单——写动作默认拒绝"
             )
-        return self.require_approval(interface_ref, episode_id=episode_id, payload=payload)
+        if payload == "" or payload is None:
+            return self._deny(
+                None, interface_ref, f"写接口「{interface_ref}」未提供被写内容（params 空）——拒绝，不对空摘要拍板"
+            )
+        try:
+            return self.require_approval(interface_ref, episode_id=episode_id, payload=payload)
+        except (TypeError, ValueError) as e:
+            return self._deny(
+                None, interface_ref, f"写 params 非 JSON 可序列化、无法绑定审批摘要——拒绝（宁可拒绝，不可炸）：{e}"
+            )
 
     def decide_challenge(self, challenge_id: str, *, by_name: str, by_role: str, approve: bool) -> tuple[bool, str]:
         """控制通道审批人批/驳一张挑战（绑 challenge_id）。角色/冒名/一次性防护在 ChallengeStore.decide。"""
