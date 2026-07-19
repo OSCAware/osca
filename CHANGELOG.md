@@ -435,3 +435,11 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   候选未删」窗口时残留候选不得入账——专家否决不可静默反转，误否走 unreject 显式解除）；
   record_rejection 幂等（崩溃重试不重复记）；快照存在性按**字段是否携带**判定（"structure": null/
   坏形状同样不回读磁盘）。公仓本轮无代码变更
+
+## [GPT 六审收口] - 2026-07-19（私仓随行记录）
+- 私仓：reject 与 confirm **同持包级账本锁**（候选装载均在锁内）——封「confirm 查完 tombstone、
+  reject 插队否决、confirm 继续立法」的 TOCTOU（入账+否决同真）；confirm 抢先后 reject 报
+  「候选不存在」，绝不给已立法候选补 tombstone。tombstone 身份键统一为
+  **(package_id, candidate_id, cases_sha256) 三元组**——蒸馏跳过/幂等写入/confirm 拒绝三处同语义：
+  --batch 复用产同名新内容候选时，新内容的否决必被记录（旧口径按 id 幂等会静默吞掉）、
+  旧 tombstone 不误拦新内容入账（内容变化即解封契约贯通）。公仓本轮无代码变更
