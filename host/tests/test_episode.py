@@ -28,8 +28,16 @@ def test_retrieval_active_only_ranked(loaded):
     assert ids == ["J-0417", "J-0423"]
 
 
+def test_retrieval_is_conjunctive(loaded):
+    """签名硬过滤是合取（签名 = object × aware，SPEC §11）：单维命中不注入。
+    析取时代的两个误注入面（GPT 复审 P1 负向用例）：错误 Aware + 正确 Object、
+    正确 Aware + 错误 Object——都不得命中，否则判断被照办到错误场景。"""
+    assert retrieve_judgments(loaded, "AW-999", {"OBJ-002"}) == []
+    assert retrieve_judgments(loaded, "AW-001", {"OBJ-999"}) == []
+
+
 def test_representative_case_is_latest_evidence(loaded):
-    judgments = {j["judgment_id"]: j for j in retrieve_judgments(loaded, "AW-001", set())}
+    judgments = {j["judgment_id"]: j for j in retrieve_judgments(loaded, "AW-001", {"OBJ-002"})}
     # J-0417 evidence = [C-0091, C-0094] → 代表 case 取编号最新的 C-0094
     assert judgments["J-0417"]["case"]["case_id"] == "C-0094"
 

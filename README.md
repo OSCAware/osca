@@ -91,7 +91,7 @@ osca/
 ├── docs/OSCA-WHITEPAPER-v1.1.en.pdf    # downloadable English PDF
 ├── docs/OSCA-WHITEPAPER-v1.1.zh-CN.pdf # downloadable Chinese PDF
 ├── docs/OSCA-WHITEPAPER-v1.1.ja.pdf    # downloadable Japanese PDF
-├── docs/OSCA-SPEC-v0.3.md         # the specification (CC BY 4.0); v0.4 draft alongside, v0.2 kept for history
+├── docs/OSCA-SPEC-v0.4.md         # the finalized specification (CC BY 4.0); v0.3/v0.2 kept for history
 ├── docs/OSCA-LINT-RULES.md        # lint rule catalogue (ledger discipline, machine-enforced)
 ├── examples/oper-diagnosis.osca/  # a full synthetic demo pack (with supersedes chains and spoken-language cases)
 ├── cli/                           # osca lint / pack / load / replay
@@ -103,9 +103,9 @@ osca/
 
 ## Status & roadmap
 
-- **Public implementation/tests are reproducible**: SPEC v0.3 (+ v0.4 draft), the synthetic demo, CLI, and Host
+- **Public implementation/tests are reproducible**: the finalized SPEC v0.4, the synthetic demo, CLI, and Host
   are public; a fresh clone can reproduce Lint/Pack/Load and the automated tests. Actual Replay needs an LLM/mock;
-  a full Episode also needs Bindings, a Connector fixture/Executor, and an LLM. The demo passes all 22 lint rules;
+  a full Episode also needs Bindings, a Connector fixture/Executor, and an LLM. The demo passes all 24 lint rules;
   that does not mean an enterprise environment is connected.
 - **First-party feedback flywheel engineering loop (M3)**: Capture → Distill → Candidate Queue →
   Confirm/Reject → Git Judgment Ledger → Index → Retrieve → Checkup is complete in the private implementation

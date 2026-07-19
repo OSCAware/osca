@@ -327,14 +327,6 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   「M4-W3 审批挑战」节）；approver/expert 的 per-principal 包域收窄归 T1/T2 多租户
 
 ## [Unreleased]
-- **SPEC v0.4 定稿（M6-W1）**：v0.4-draft 增量并入 v0.3 全文成正式版 `docs/OSCA-SPEC-v0.4.md`——
-  §4 objective 第五型、§7 受限触发语法+闸门+组合语义、§9 分层三字段+洁净室+限定引用、§10 case kind
-  收编 `引用`、附录 A 运行时求值参考语义（precondition/emit_when/kill_switch/剧集执行/settle/回放判据）
-  全部并入；`format_version` 升 `0.4`。**新增附录 B 企业系统对接约定**（Manifest/Binding/Impl 三层职责
-  + 执行器按 endpoint scheme 分派 + 真实 sql_readonly/openapi 契约 + read-only enforcement + secret 解析
-  + 写路径审批门挂起-等批-恢复消费语义 + 人类可读脱敏 payload + TTL 人审时延——真实执行器落地属部署侧
-  适配，明标不冒充已通）。附录 C 判断库包变体规范占位（W3 补齐）。v0.4-draft 加 superseded 横幅指向全文。
-  措辞纪律：可求值语义与参考实现互证，纯部署侧契约明标 deferred。case kind `引用` 为纯文档收编（lint 不校验 kind 词表）
 - SPEC v0.4-draft §9：判断分层命名空间（commons 行业公共层 / org 企业私有层）与权属
   三字段（scope / provenance / classification）——权属血统无法事后重建，出生即标；
   洁净室规则（client-derived 永不静默进 commons、commons 必须无密级）；跨包限定引用
@@ -397,3 +389,19 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
 - **限定（诚实标注）**：蒸馏管道 / Creator / 交互层闭源；判断库包变体实现推 Phase 1；真写全接通
   （真实 sql_readonly/openapi 执行器 + 审批闭环三债 + 可恢复剧集）作 M6-cont → v1.1；八步全链路
   演练走通的是**机制链路**（mock 连接器 + mock LLM），非业务效果
+
+## [v1.0.1] - 2026-07-19 — GPT 外审收口（5 P1 + 2 P2）
+- **检索硬过滤析取→合取（P1，跨仓同步）**：Host `retrieve_judgments` 与私仓检索器的签名硬过滤
+  原为「aware 命中 或 object 命中」——错误 Aware + 正确 Object（或反之）也会注入，判断被照办
+  到错误场景。收紧为合取（签名 = object × aware × guard，SPEC §11；调用方未给的维度作通配），
+  补两个负向用例
+- **OSCA060/061 分层枚举判定类型防御**：不可哈希叶子（list/mapping）不再退化成不指字段的
+  「规则执行异常」（d370996，v1.0 后落）
+- **文档同步（P2）**：SPEC v0.4 状态行去掉过时的「W1 / 附录 C 待 W3」；三语 README 目录树与
+  状态节 v0.3+draft/22 条 → v0.4 定稿/24 条；CHANGELOG 去掉 Unreleased 里与已发布节重复的
+  M6-W1 条目；三语白皮书里程碑表按 M6 (b) 裁决对齐（M4/M5 机制完成·私有，M6 机制集成完成，
+  软件 v1.0=机制可验发布、真实内容门槛整体移 1.x 不删）。**白皮书 PDF/站点副本仍为旧快照**
+  （生成脚本不在仓内，随行纪律见前），下次导出时更新
+- **CI 门禁实绿**：`ruff format` 全仓收口（cli/host 此前 3 文件漂移）
+- 私仓/集成工程随行（另仓提交）：capture 聚类键改锚裁决工件、Creator policy 白名单接缝修复、
+  CDM boundary 企微生产路径接入、Creator→pack→load 真实接缝测试、联调基线 BASELINE.txt

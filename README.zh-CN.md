@@ -83,7 +83,7 @@ osca/
 ├── docs/OSCA-WHITEPAPER-v1.1.en.pdf    # 英文白皮书 PDF 下载版
 ├── docs/OSCA-WHITEPAPER-v1.1.zh-CN.pdf # 中文白皮书 PDF 下载版
 ├── docs/OSCA-WHITEPAPER-v1.1.ja.pdf    # 日文白皮书 PDF 下载版
-├── docs/OSCA-SPEC-v0.3.md        # 规范正文（CC BY 4.0）；v0.4 草案与历史版本 v0.2 同目录
+├── docs/OSCA-SPEC-v0.4.md        # 规范正文定稿（CC BY 4.0）；v0.3/v0.2 历史版本同目录
 ├── docs/OSCA-LINT-RULES.md       # lint 规则清单（账本纪律的机器化）
 ├── examples/oper-diagnosis.osca/  # 完整合成演示包（含 supersedes 链与口述 case）
 ├── cli/                           # osca lint / pack / load / replay
@@ -95,9 +95,9 @@ osca/
 
 ## 状态与路线
 
-- **公开实现/测试可复现**：SPEC v0.3（＋ v0.4 草案）、合成演示包、CLI 和 Host 均已公开；
+- **公开实现/测试可复现**：SPEC v0.4 定稿、合成演示包、CLI 和 Host 均已公开；
   fresh clone 可复现 Lint/Pack/Load 与自动测试。实际 Replay 需要 LLM/mock；完整 Episode 还
-  需要 Binding、Connector fixture/Executor 与 LLM。样例通过全部 22 条 lint 规则；这不等于
+  需要 Binding、Connector fixture/Executor 与 LLM。样例通过全部 24 条 lint 规则；这不等于
   企业环境已经接通。
 - **第一方反馈飞轮工程闭环（M3）**：Capture → Distill → Candidate Queue → Confirm/Reject → Git
   Judgment Ledger → Index → Retrieve → Checkup 已在私有实现中完成，并由合成夹具与自动测试

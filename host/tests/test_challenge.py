@@ -140,8 +140,15 @@ def test_public_dto_shape_pinned():
     ch = _raise(ChallengeStore(clock=Clock()))
     dto = ch.public()
     assert set(dto) == {
-        "challenge_id", "package_id", "action", "approver",
-        "episode_id", "payload_digest", "state", "created_at", "expires_at",
+        "challenge_id",
+        "package_id",
+        "action",
+        "approver",
+        "episode_id",
+        "payload_digest",
+        "state",
+        "created_at",
+        "expires_at",
     }
     assert dto["state"] == PENDING and dto["challenge_id"] == ch.challenge_id
 

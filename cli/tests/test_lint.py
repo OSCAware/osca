@@ -503,6 +503,8 @@ def test_osca041_watch_duration(make_pkg, base):
     ]
     result = lint_package(make_pkg(base))
     assert any(f.rule == "OSCA041" and "every=一天" in f.message for f in result.findings)
+
+
 # ── 分层与权属（OSCA060）──
 
 

@@ -447,7 +447,7 @@ This chapter separates publicly reproducible capabilities from the complete adop
 | Mock Host, Trigger/Gate, Episode, three stop scopes | Public implementation/tests | Full Episode needs Binding/fixture/LLM | | Replace Runtime |
 | Real SQL/OpenAPI/MCP Executor, identity, HA | | Required | | Implement for environment |
 | Capture, Distill, Confirm, vector Retrieve, whole Checkup | | | M3 complete, private | Implement from public discipline |
-| Diff/Confirm UI, console, approval cards | | Product adaptation | M4 incomplete | Build another UI |
+| Diff/Confirm UI, console, approval cards | | Product adaptation | M4 mechanism complete, private | Build another UI |
 
 Third parties can adopt OSCA without private `oscapipe`, but must implement feedback transactions from the public ledger discipline.
 
@@ -540,11 +540,11 @@ Public readers cannot inspect the whole first-party flywheel. “M3 implemented�
 | M2 | Seven Host components, Episode Runner, Policy, stops, Settle, single Replay | Complete; synthetic/demo exercise |
 | M3 | Capture/Sweep, Distill/Queue/Confirm/Reject, Index/Retrieve, Checkup, three-state Kill | W1–W4 complete; private flywheel, public health contract |
 | P0 | P0-A ≥20 L1 and some L3/L4; P0-B separate | Incomplete; business value unvalidated |
-| M4 | Diff/Confirm, operations, approval interfaces | Incomplete |
-| M5 | Creator interview assistant and editor | Incomplete |
-| M6 | Real Connector conventions, production integration, software 1.0 | Incomplete |
+| M4 | Diff/Confirm, operations, approval interfaces | Mechanism complete; first-party private |
+| M5 | Creator interview assistant and editor | Mechanism complete; first-party private |
+| M6 | Real Connector conventions, full-link integration, software v1.0 release | Mechanism integration complete; connector conventions in SPEC v0.4 Appendix B; software v1.0 released as a mechanism-verifiable release |
 
-Software 1.0 requires P0-A evidence, M4–M6, the specification, reference implementation, and a replayable controlled real sample ledger. Whitepaper 1.0 is only this document version; the real ledger remains subject to customer data rights and does not mean a published raw ledger.
+Software v1.0 has been released as a **mechanism-verifiable** release: it ships the finalized SPEC v0.4, the reference implementation, and replayable synthetic samples (`osca replay` lets you watch a judgment move output from before-edit toward after-edit). It contains **no business-effect proof**. The real-content bar originally attached to 1.0 moves wholesale to 1.x (not dropped): P0-A with at least 20 L1 real judgments plus some L3/L4 follow-up-usage evidence, a replayable controlled real sample ledger, and production integration — until then every metric is mechanism-level. Whitepaper 1.0 is only this document version; the real ledger remains subject to customer data rights and does not mean a published raw ledger.
 
 The maintainers are separately exploring an internal R-line design for preserving raw observations that the
 current system cannot assimilate, together with long-term guardrails and controlled shadow comparisons. It is

@@ -92,7 +92,7 @@ osca/
 ├── docs/OSCA-WHITEPAPER-v1.1.en.pdf    # 英語ホワイトペーパー PDF
 ├── docs/OSCA-WHITEPAPER-v1.1.zh-CN.pdf # 中国語ホワイトペーパー PDF
 ├── docs/OSCA-WHITEPAPER-v1.1.ja.pdf    # 日本語ホワイトペーパー PDF
-├── docs/OSCA-SPEC-v0.3.md             # 安定仕様。v0.4 Draft と v0.2 History も同 Directory
+├── docs/OSCA-SPEC-v0.4.md             # 確定仕様。v0.3 / v0.2 History も同 Directory
 ├── docs/OSCA-LINT-RULES.md             # Lint Rule Catalog
 ├── examples/oper-diagnosis.osca/      # 完全な合成 Demo Package
 ├── cli/                               # osca lint / pack / load / replay
@@ -104,7 +104,7 @@ osca/
 
 ## 状態と Roadmap
 
-- **公開実装/Test は再現可能：** SPEC v0.3（+ v0.4 Draft）、合成 Demo、CLI、Host は公開済み。
+- **公開実装/Test は再現可能：** 確定版 SPEC v0.4、合成 Demo、CLI、Host は公開済み。
   Fresh Clone で Lint/Pack/Load と自動 Test を再現できる。実 Replay には LLM/mock、Full Episode
   には Binding、Connector Fixture/Executor、LLM が必要であり、企業環境接続済みという意味ではない。
 - **ファーストパーティ Feedback Flywheel（M3）：** Capture → Distill → Candidate Queue →

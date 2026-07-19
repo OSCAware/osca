@@ -41,7 +41,7 @@ DEFAULT_TTL_SECONDS = 300.0
 
 # 终态挑战（consumed/denied/expired/revoked）的保留时长：留一段供在场排查，之后惰性清出——
 # store 不无限增长（长驻包的 Host 可运行数月）。裁决/放行的审计真相在 policy.audit
-#（decide_challenge/_allow/_deny 都 _record），不靠本 store 留史。
+# （decide_challenge/_allow/_deny 都 _record），不靠本 store 留史。
 TERMINAL_RETENTION_SECONDS = 3600.0
 
 _TERMINAL = (CONSUMED, DENIED, EXPIRED, REVOKED)
@@ -264,8 +264,15 @@ class ChallengeStore:
         return False, "无匹配的已批准挑战——等待审批人批准，或绑定不符/已过期/已用过（fail-closed）"
 
     def _raise_locked(
-        self, *, package_id: str, action: str, approver: str, episode_id: str,
-        payload_digest: str, ttl: float, now: float,
+        self,
+        *,
+        package_id: str,
+        action: str,
+        approver: str,
+        episode_id: str,
+        payload_digest: str,
+        ttl: float,
+        now: float,
     ) -> Challenge:
         ch = Challenge(
             challenge_id="CH-" + secrets.token_hex(8),
