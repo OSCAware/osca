@@ -466,3 +466,11 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   tombstone 全部改按 (package_id, candidate_id, revision)；cases_sha256 只留给蒸馏封簇（同证据
   不再骚扰专家——那是对证据的裁决）。旧格式候选以 cases_sha256 作代理身份（surrogate）。
   公仓本轮无代码变更
+
+## [GPT 十审收口] - 2026-07-19（私仓随行记录）
+- 私仓：revision 补齐**动作链路与消费端**两个缺口——①消费端不信自报摘要：revision_of 一律按
+  内容**重算**（文件里的 candidate_revision 字段只是给人看的落款）——改内容不改落款/伪造落款
+  都改变不了身份判定；②动作携带版本：确认卡按钮值带 candidate_revision（专家点的是这张卡），
+  daemon→handler→confirm/reject 核心逐层透传 expected_revision，与队列当前重算 revision 不符
+  即拒（轮询重发卡后专家点旧卡的窗口由此关死——记录守卫在该窗口会误放行）；CLI 补 --revision、
+  queue 展示版本。公仓本轮无代码变更
