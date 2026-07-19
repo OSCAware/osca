@@ -100,9 +100,11 @@ def _representative_case(judgment: dict, cases: dict[str, dict]) -> dict | None:
 def retrieve_judgments(loaded: LoadedPackage, aware_id: str, object_ids: set[str]) -> list[dict]:
     """签名表硬过滤 + trust/confirmed 排序，top 7，各带 1 个代表 case。
 
-    硬过滤是**合取**（签名 = object × aware × guard，SPEC §11）：aware 与 object 须同时命中。
-    早期版本写成析取——错误 Aware + 正确 Object（或反之）也会注入，判断被照办到错误场景
-    （GPT 复审 P1）。签名字段是 lint 必填（OSCA040），缺字段的判断按不命中处理（保守不注入）。"""
+    硬过滤是 **object × aware 合取**（SPEC §11）：两维须同时命中。早期版本写成析取——错误
+    Aware + 正确 Object（或反之）也会注入，判断被照办到错误场景（GPT 复审 P1）。签名第三维
+    guard **不参与硬过滤**（§11 定稿口径）：guard 是自由文本「可求值风格」，无受限求值语法且其
+    变量（连接器数据）在装配时刻尚未绑定——随判断注入后由模型在语境中应用、由回放判据事后体检。
+    签名字段是 lint 必填（OSCA040），缺字段的判断按不命中处理（保守不注入）。"""
     hits = [
         e
         for e in _signature_table(loaded)

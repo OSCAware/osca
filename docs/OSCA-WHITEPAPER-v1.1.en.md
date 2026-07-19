@@ -4,8 +4,8 @@
 
 - **Whitepaper version:** 1.1 (document version, not a software release)
 - **Published:** 2026-07-12
-- **Specification baseline:** OSCA SPEC v0.3 + v0.4 draft (2026-07-12 Profile)
-- **Reference implementation status:** public Host 0.2.0; first-party feedback-flywheel engineering (M3) complete; real-world validation not complete
+- **Specification baseline:** OSCA SPEC v0.4 finalized (2026-07-19; v0.3/v0.2 kept for history)
+- **Reference implementation status:** public Host reference implementation (M2 seven components + M4 control-channel security kernel / approval challenges); first-party feedback flywheel and interaction layer (M3–M5) mechanism-complete, private; software v1.0 is a mechanism-verifiable release; real-world validation not complete
 
 **Languages:** **English** · [简体中文](OSCA-WHITEPAPER-v1.1.zh-CN.md) · [日本語](OSCA-WHITEPAPER-v1.1.ja.md)
 
@@ -74,7 +74,7 @@ Three authority boundaries hold throughout: machines preserve source evidence, A
 
 | Layer | Status |
 |---|---|
-| SPEC v0.3 | Published stable specification |
+| SPEC v0.4 | Finalized current specification (v0.3/v0.2 kept for history) |
 | Lint / Pack / Load / single-Judgment Replay | Implemented with public automated tests |
 | Seven-component Host, Episode, three stop scopes, Settle | Implemented; exercised with synthetic/demo material |
 | Capture → Distill → Queue/Confirm/Reject → Ledger → Retrieve/Checkup | First-party M3 implementation; synthetic fixtures exercised |
@@ -571,7 +571,7 @@ Compatibility is not a binary badge. Implementations must declare at least four 
 
 Natural-language output need not match byte for byte, nor must process, model, vector store, or UI. Authority boundaries, state transitions, and evidence chains must remain equivalent. Unknown critical fields, unsupported Performers, and unevaluable conditions must be rejected or conservatively degraded with an audit trail, never guessed.
 
-v0.4 is still a draft; there is no independent certifier or formal Conformance Suite. Third parties should declare Package version, runtime semantics snapshot, supported Trigger/Executor, Guard behavior, and Replay Evaluator. Future conformance should compare positive/negative packages, Lint results, Runtime event traces, Policy failures, fixed Mock Replay, and upgrades—not class names or log wording.
+v0.4 is finalized, but there is no independent certifier or formal Conformance Suite. Third parties should declare Package version, runtime semantics snapshot, supported Trigger/Executor, Guard behavior, and Replay Evaluator. Future conformance should compare positive/negative packages, Lint results, Runtime event traces, Policy failures, fixed Mock Replay, and upgrades—not class names or log wording.
 
 #### Agent as Connector
 
@@ -700,7 +700,7 @@ These are design choices, not business-proven laws.
 | Entry | Purpose |
 |---|---|
 | [OSCA SPEC v0.3](OSCA-SPEC-v0.3.md) | Stable package format and ledger discipline |
-| [OSCA SPEC v0.4 draft](OSCA-SPEC-v0.4-draft.md) | Incremental Runtime, Settle, Replay, and health semantics |
+| [OSCA SPEC v0.4](OSCA-SPEC-v0.4.md) | Finalized: package format, ledger discipline, Runtime/Settle/Replay/health semantics |
 | [Lint rules](OSCA-LINT-RULES.md) | Machine-enforced findings and known limits |
 | [Operating-diagnosis sample](../examples/oper-diagnosis.osca/README.md) | Synthetic/demo package; not real P0 |
 | [CLI guide](../cli/README.md) | Lint, Pack, Load, single Replay |
