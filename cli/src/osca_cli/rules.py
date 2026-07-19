@@ -797,9 +797,13 @@ CLASSIFICATIONS = {"public", "internal", "restricted"}
 
 def _layering_validity(rule_id: str, relpath: str, scope: object, prov: object, cls: object) -> list[Finding]:
     """分层三字段的枚举 / 形状 / 洁净室校验——judgment（OSCA060）与 osca.yaml 包级默认段
-    （OSCA061）共用同一判据。只管「存在即合法」，缺失是否报由调用方按语境决定。"""
+    （OSCA061）共用同一判据。只管「存在即合法」，缺失是否报由调用方按语境决定。
+
+    枚举判定先过 isinstance(str)：不可信 YAML 里 scope/classification/origin 可能是 list/mapping
+    （不可哈希），直接进 set 成员测试会 TypeError——run_all 兜底虽不炸，但报错退化成不指字段的
+    「规则执行异常」且吞掉本规则其余 findings。类型防御在此，报错精确到字段。"""
     findings: list[Finding] = []
-    if scope not in (None, "") and scope not in JUDGMENT_SCOPES:
+    if scope not in (None, "") and (not isinstance(scope, str) or scope not in JUDGMENT_SCOPES):
         findings.append(_err(rule_id, relpath, f"scope={scope!r} 不在 {sorted(JUDGMENT_SCOPES)} 中"))
 
     origin = None
@@ -813,12 +817,12 @@ def _layering_validity(rule_id: str, relpath: str, scope: object, prov: object, 
                 if prov.get(key) in (None, ""):
                     findings.append(_err(rule_id, relpath, f"provenance 缺 {key}——权属血统无法事后重建，出生即填"))
             origin = prov.get("origin")
-            if origin not in (None, "") and origin not in PROVENANCE_ORIGINS:
+            if origin not in (None, "") and (not isinstance(origin, str) or origin not in PROVENANCE_ORIGINS):
                 findings.append(
                     _err(rule_id, relpath, f"provenance.origin={origin!r} 不在 {sorted(PROVENANCE_ORIGINS)} 中")
                 )
 
-    if cls not in (None, "") and cls not in CLASSIFICATIONS:
+    if cls not in (None, "") and (not isinstance(cls, str) or cls not in CLASSIFICATIONS):
         findings.append(_err(rule_id, relpath, f"classification={cls!r} 不在 {sorted(CLASSIFICATIONS)} 中"))
 
     if scope == "commons":

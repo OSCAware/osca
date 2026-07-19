@@ -527,6 +527,22 @@ def test_osca060_bad_enums_are_errors(make_pkg, base):
     assert any("classification=" in m for m in messages)
 
 
+def test_osca060_unhashable_values_report_precise_field(make_pkg, base):
+    """不可哈希叶子（list/mapping）不得让规则崩进 run_all 兜底——报错须精确到字段、
+    且同规则其余 findings 不被吞（此前 set 成员测试直接 TypeError）。"""
+    j = base["judgments/J-0001.yaml"]
+    j["scope"] = ["commons"]  # YAML 手滑写成列表
+    j["provenance"]["origin"] = {"kind": "own-ops"}
+    j["classification"] = ["public"]
+    result = lint_package(make_pkg(base))
+    assert not result.ok
+    messages = [f.message for f in result.findings if f.rule == "OSCA060"]
+    assert any("scope=" in m for m in messages)
+    assert any("provenance.origin=" in m for m in messages)
+    assert any("classification=" in m for m in messages)
+    assert not any("规则执行异常" in f.message for f in result.findings)
+
+
 def test_osca060_provenance_shape_and_missing_keys(make_pkg, base):
     base["judgments/J-0001.yaml"]["provenance"] = "京郊某处"  # 非 mapping
     result = lint_package(make_pkg(base))
@@ -625,6 +641,15 @@ def test_osca061_cleanroom_violation_is_error(make_pkg, base):
     result = lint_package(make_pkg(base))
     assert not result.ok
     assert any("洁净室" in f.message for f in result.findings if f.rule == "OSCA061")
+
+
+def test_osca061_unhashable_values_report_precise_field(make_pkg, base):
+    base["osca.yaml"]["layering"] = {"scope": ["org"], "classification": {"level": "internal"}}
+    result = lint_package(make_pkg(base))
+    assert not result.ok
+    messages = [f.message for f in result.findings if f.rule == "OSCA061"]
+    assert any("scope=" in m for m in messages) and any("classification=" in m for m in messages)
+    assert not any("规则执行异常" in f.message for f in result.findings)
 
 
 def test_osca061_non_mapping_is_error(make_pkg, base):
