@@ -454,8 +454,9 @@ class PolicyInterceptor:
             action=action,
             approver=approver,
             episode_id=episode_id or "",
-            payload_digest=payload_digest(payload),
+            payload_digest=payload_digest(payload),  # 绑**原始** params（防偷梁换柱、写执行器写原文）
             ttl_seconds=self.approval_ttls.get(action),  # 每动作 TTL 覆盖；None → store 包级默认（挂新挑战时用）
+            payload_display=self.redact(payload)[0],  # 脱敏人类可读写内容（W6-4）——给审批卡，只脱显示、不动被写内容
         )
         if ok:
             return self._allow(None, action, detail)
@@ -555,7 +556,13 @@ class PolicyInterceptor:
     # ── 脱敏（注入剧集前执行） ─────────────────────────────────────────
 
     def redact(self, value):
-        """递归脱敏字符串值；返回 (脱敏后值, 命中次数)。"""
+        """递归脱敏字符串值（含 dict **键**）；返回 (脱敏后值, 命中次数)。
+
+        键也脱（W6-4）：payload_display 复用 redact 上审批卡，PII 藏进键（如 {"经办手机138…": …}）不许漏进人审卡面。
+        键脱敏对读回执几乎无影响（列名是 schema 文本、不匹配数字 PII 正则）；对显示路径若两 PII 键塌成同一标记，
+        至多少一行显示——payload_digest 仍绑**原始** params（键不脱），写内容与防偷梁换柱不受影响。
+        数字型标量**不脱**：手机/身份证按惯例是字符串；对裸整数脱敏会误伤合法大额金额（如 138 亿的价格整数命中手机
+        正则），既污染读回执又对审批人隐藏真实写值——弊大于利。数字型 PII 的规范是以字符串承载。"""
         hits = 0
 
         def walk(node):
@@ -566,7 +573,7 @@ class PolicyInterceptor:
                     hits += n
                 return node
             if isinstance(node, dict):
-                return {k: walk(v) for k, v in node.items()}
+                return {walk(k): walk(v) for k, v in node.items()}  # 键与值同脱（非 str 键 walk 原样返回）
             if isinstance(node, list):
                 return [walk(v) for v in node]
             return node

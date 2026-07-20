@@ -576,3 +576,19 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
 - **立身口径**：内置参考适配器测 **fake 后端**（本地 sqlite / 本地 http.server）；生产库/生产 API 真系统验证归
   部署侧（1.1/部署验收）。门禁全绿：host 295 passed（+对抗审查回归：多语句/注入异常无泄漏/SSRF 锚定/截断/超限）
   + ruff check/format 双绿。W6 末片：人类可读 payload（W6-4，跨仓 host+oscapipe）。
+
+## [M6-W6-4 · 审批卡人类可读脱敏 payload（跨仓 host + oscapipe）] - 2026-07-20
+真写「变真」块（W6）末片，还清审批卡橡皮图章设计债（五 lens 对抗审查 → 逐条真跑核实 → 收口）：
+- **host（公仓）**：`Challenge` 新增 `payload_display` = `policy.redact(原始 params)`（PII 已抹的脱敏视图），
+  随 `public()` DTO + L2 快照（asdict/重挂）跟随；`payload_digest` 仍绑**原始** params（防偷梁换柱、写执行器
+  写原文，不变）。`redact` 递归**含 dict 键**（键位 PII 不漏进人审卡面）；数字型标量刻意不脱（对裸整数脱敏会
+  误伤合法大额金额、既污染读回执又对审批人隐藏真实写值——PII 规范以字符串承载）。
+- **oscapipe（私仓）**：`notices.approval_notice` 呈现脱敏写内容原文供人拍板（digest 降为技术核对小字）；渲染
+  叠显示安全——键/值**同包 inline code span** 中和 markdown（假批准链接/伪权威粗体）注入、总长截断**丢整行**
+  （不按字符切断、绝不留半截 code span）+ 字段/总长上限。
+- **对抗审查捉 9 缺陷（10 raw→9 confirmed，各真跑复现后修），收敛为 3 类根因：** ① dict **键**未包 code span
+  → 键内 markdown 假链接/粗体注入误导审批人（4 lens 独立命中）；② 总长截断按字符切断可切掉值 code span 闭反引号
+  → 重新激活注入；③ `redact` 不脱 dict 键 → 键位 PII 漏进卡片。修：键值同包 span + 截断丢整行 + redact 脱键。
+- **立身口径**：脱敏在 host 侧、桥接只呈现再叠显示安全；诚实标注。门禁全绿：host 299 passed + oscapipe 332 passed
+  （+对抗审查回归：键注入中和/截断不断 span/键位 PII 脱敏）+ 两仓 ruff check/format 双绿。**W6 四片全收（TTL /
+  secret / 真实执行器 / 人类可读 payload）；真实写连接器语义化样例 + 端到端演练 + tag v1.1 属 W7。**

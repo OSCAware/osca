@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
+
 from osca_host.challenge import (
     APPROVED,
     CONSUMED,
@@ -12,6 +14,7 @@ from osca_host.challenge import (
     EXPIRED,
     PENDING,
     REVOKED,
+    Challenge,
     ChallengeStore,
     payload_digest,
 )
@@ -146,11 +149,43 @@ def test_public_dto_shape_pinned():
         "approver",
         "episode_id",
         "payload_digest",
+        "payload_display",
         "state",
         "created_at",
         "expires_at",
     }
     assert dto["state"] == PENDING and dto["challenge_id"] == ch.challenge_id
+
+
+def test_payload_display_survives_asdict_roundtrip():
+    """W6-4：payload_display 随 L2 快照持久（asdict → Challenge(**...) 重挂路径），脱敏视图完整还原。"""
+    store = ChallengeStore(clock=Clock())
+    display = {"折扣": "4.5", "经办手机": "***手机号已脱敏***"}
+    _, _, ch = store.consume_or_raise(
+        package_id="p", action="a", approver="x", episode_id="E", payload_digest="d", payload_display=display
+    )
+    dumped = asdict(ch)
+    assert dumped["payload_display"] == display
+    assert Challenge(**dumped).payload_display == display  # L2 重挂重建
+
+
+def test_challenge_reconstructs_without_payload_display_field():
+    """向后兼容：W6-4 前的旧 L2 快照（无 payload_display 键）重挂 → 回落 None，不炸。"""
+    old = {
+        "challenge_id": "CH-x",
+        "package_id": "p",
+        "action": "a",
+        "approver": "x",
+        "episode_id": "E",
+        "payload_digest": "d",
+        "created_at": 1.0,
+        "expires_at": 2.0,
+        "state": PENDING,
+        "decided_by": None,
+        "decided_at": None,
+        "consumed_at": None,
+    }
+    assert Challenge(**old).payload_display is None
 
 
 # ── consume_or_raise：单锁原子（Review W3 收口）───────────────────

@@ -265,6 +265,43 @@ def test_ttl_illegal_per_action_falls_back_to_package_default_and_keeps_gate():
     assert p.require_approval("终稿发送管理层", episode_id="EP-1", payload={"x": 1})[0]
 
 
+def test_approval_display_redacts_pii_but_digest_binds_original():
+    """W6-4：审批卡 payload_display 脱敏（PII 抹），但 payload_digest 仍绑**原始** params——写执行器写原文、
+    防偷梁换柱不变。审批人看脱敏视图、批的是这个动作，不批 PII。"""
+    from osca_host.challenge import payload_digest as _digest
+
+    p = make()  # POLICY: data.redact=[身份证号,手机号] + approvals 终稿发送管理层
+    action = "终稿发送管理层"
+    original = {"结论": "同意", "经办手机": "13812345678"}
+    p.require_approval(action, episode_id="EP-1", payload=original)
+    [dto] = p.pending_challenges()
+    # display 脱敏：手机号被抹，非 PII 原样可读
+    assert "13812345678" not in str(dto["payload_display"])
+    assert "已脱敏" in str(dto["payload_display"])
+    assert dto["payload_display"]["结论"] == "同意"
+    # digest 仍绑**原始**（未脱敏）params——防偷梁换柱、写执行器写原文
+    assert dto["payload_digest"] == _digest(original)
+    assert dto["payload_digest"] != _digest({"结论": "同意", "经办手机": "***手机号已脱敏***"})
+    # 原始 params 仍能一次性放行（脱敏没动被写内容、digest 未变）
+    p.decide_challenge(dto["challenge_id"], by_name="专家", by_role="approver", approve=True)
+    assert p.require_approval(action, episode_id="EP-1", payload=original)[0]
+
+
+def test_approval_display_redacts_pii_in_dict_keys():
+    """W6-4 对抗审查捉：PII 藏进 dict **键**（如 {经办手机138…: 值}）也须脱进 display，不漏进审批卡；
+    digest 仍绑**原始**（未脱）键——写原文、防偷梁换柱不变。"""
+    from osca_host.challenge import payload_digest as _digest
+
+    p = make()
+    action = "终稿发送管理层"
+    original = {"经办手机13812345678": "同意", "嵌套": {"办事人身份证11010119900307461X": "张三"}}
+    p.require_approval(action, episode_id="EP-1", payload=original)
+    [dto] = p.pending_challenges()
+    assert "13812345678" not in str(dto["payload_display"])  # 顶层键 PII 脱
+    assert "11010119900307461X" not in str(dto["payload_display"])  # 嵌套键 PII 脱
+    assert dto["payload_digest"] == _digest(original)  # digest 仍绑原始键（未脱）
+
+
 def test_redaction():
     p = make()
     payload = {"rows": [{"经办": "张三 13812345678", "证件": "110101199001011234"}]}

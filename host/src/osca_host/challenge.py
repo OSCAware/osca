@@ -73,6 +73,10 @@ class Challenge:
     decided_by: str | None = None
     decided_at: float | None = None
     consumed_at: float | None = None
+    # 人类可读**脱敏**写内容（W6-4）：= policy.redact(原始 params)，给审批卡呈现供人拍板。与 payload_digest 分离——
+    # digest 仍绑**原始** params（防偷梁换柱、写执行器写原文），display 只脱**显示**、不动被写内容（批动作不批 PII）。
+    # 默认 None：兼容旧 L2 快照重挂（缺字段回落 None）与不含写内容的挑战。须 JSON 可序列化（随 L2 快照持久）。
+    payload_display: object = None
 
     @property
     def binding(self) -> tuple[str, str, str, str]:
@@ -89,6 +93,7 @@ class Challenge:
             "approver": self.approver,
             "episode_id": self.episode_id,
             "payload_digest": self.payload_digest,
+            "payload_display": self.payload_display,  # 脱敏人类可读写内容（W6-4，审批卡呈现）
             "state": self.state,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
@@ -126,6 +131,7 @@ class ChallengeStore:
         episode_id: str,
         payload_digest: str,
         ttl_seconds: float | None = None,
+        payload_display: object = None,
     ) -> tuple[bool, str, Challenge | None]:
         """放行或挂起，**单锁原子**——policy.require_approval 的唯一入口。
 
@@ -155,6 +161,7 @@ class ChallengeStore:
                 payload_digest=payload_digest,
                 ttl=self._ttl if ttl_seconds is None else ttl_seconds,
                 now=now,
+                payload_display=payload_display,
             )
             return False, detail, ch
 
@@ -167,6 +174,7 @@ class ChallengeStore:
         episode_id: str,
         payload_digest: str,
         ttl_seconds: float | None = None,
+        payload_display: object = None,
     ) -> Challenge:
         """剧集步命中审批门时挂起一张挑战。同一绑定已有未过期 pending → 复用（幂等，不刷屏）；否则新建。"""
         now = self._clock()
@@ -183,6 +191,7 @@ class ChallengeStore:
                 payload_digest=payload_digest,
                 ttl=self._ttl if ttl_seconds is None else ttl_seconds,
                 now=now,
+                payload_display=payload_display,
             )
 
     def consume(self, *, package_id: str, action: str, episode_id: str, payload_digest: str) -> tuple[bool, str]:
@@ -279,6 +288,7 @@ class ChallengeStore:
         payload_digest: str,
         ttl: float,
         now: float,
+        payload_display: object = None,
     ) -> Challenge:
         ch = Challenge(
             challenge_id="CH-" + secrets.token_hex(8),
@@ -287,6 +297,7 @@ class ChallengeStore:
             approver=approver,
             episode_id=episode_id,
             payload_digest=payload_digest,
+            payload_display=payload_display,
             created_at=now,
             expires_at=now + ttl,
         )

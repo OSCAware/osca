@@ -151,7 +151,11 @@ W3 落地的是**机制**：绑定挑战状态机（approver / episode / payload
   读上限 + 截断/超限 fail-closed）；生产驱动（postgres/mysql/生产网关）由部署侧按 `Executor` 协议注入，未注册
   scheme / mcp 一律 fail-closed；执行器异常统一兜成 fail-closed 回执（`call()` 恒回 Receipt）。**诚实标注：测
   fake 后端（本地 sqlite / 本地 http.server）——生产库/生产 API 的真系统验证仍归部署侧（1.1/部署验收）。**
-- **审批卡人类可读脱敏 payload**（W6-4）：现仅给摘要；须呈现脱敏后的写内容原文供审批人拍板。
+- **审批卡人类可读脱敏 payload ✅**（W6-4，跨仓 host + oscapipe）：`Challenge` 新增 `payload_display`
+  = `policy.redact(原始 params)`（PII 已抹的脱敏视图，含 dict 键），随 DTO / L2 快照跟随；`payload_digest`
+  仍绑**原始** params（防偷梁换柱、写执行器写原文，不变）。审批卡（oscapipe notices）呈现脱敏写内容原文供人
+  拍板（不再是橡皮图章哈希，digest 降为技术核对小字），渲染叠**防注入**（键/值同包 code span 中和 markdown、
+  截断丢整行不切断 span）+ **防超长**（字段/总长截断标注）。redact 只脱**显示**、不动被写内容（批动作不批 PII）。
 - **TTL 按人审时延重估 ✅**（W6-1）：授权过期窗口从硬编码 300s 变 **policy 可配**——包级
   `default_ttl_seconds` + 每 action `ttl_seconds` 覆盖；缺省/非法一律 fail-closed 回落机制默认 300s
   （绝不 fail-open 成无过期），公仓 osca-cli lint 校验字段形状（正有限数秒）。诚实标注：**真实人审
