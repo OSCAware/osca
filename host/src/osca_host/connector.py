@@ -7,9 +7,10 @@
 3. 调用与回执：每次调用产出一张回执（谁调的、走哪个 binding、结果如何），
    结果注入剧集前先过 Policy 脱敏。
 
-执行器按 kind 可插拔。参考实现内置 mock 执行器（endpoint 以 mock:// 开头，
-从目录读 <接口名>.yaml 固件）——用于测试与全链路演练；真实 sql_readonly/openapi
-执行器属部署侧适配（M6 对接约定）。
+执行器按 endpoint scheme 分派、可插拔（W6-3）。内置 mock 执行器（endpoint 以 mock:// 开头，
+从目录读 <接口名>.yaml 固件，供测试与演练）+ 真实参考适配器（sql_readonly=sqlite ro / openapi=urllib，
+见 executor.py，测 fake 后端）；生产驱动（postgres/mysql/生产网关）由部署侧按 Executor 协议注入。
+未注册 scheme fail-closed（不猜、不兜底）；mcp 预留不实现。
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import yaml
 
+from osca_host.executor import Executor, default_executors
 from osca_host.loader import LoadedPackage
 from osca_host.policy import PolicyInterceptor
 from osca_host.secret_resolver import EnvVarSecretResolver, SecretResolver
@@ -54,12 +56,16 @@ class ConnectorProxy:
         policy: PolicyInterceptor,
         *,
         secret_resolver: SecretResolver | None = None,
+        executors: dict[str, Executor] | None = None,
     ):
         self.package_id = loaded.package_id
         self.bindings = bindings  # 部署环境注入的 binding 表（永不进包）
         self.policy = policy
         # secret 解析器（W6-2）：默认 env-var 参考实现；部署侧可按 SecretResolver 协议注入 file/vault/callable。
         self.secret_resolver = secret_resolver if secret_resolver is not None else EnvVarSecretResolver()
+        # 真实执行器注册表（W6-3，scheme → Executor）：默认内置参考适配器（sqlite ro / urllib openapi）；
+        # 部署侧可按 Executor 协议注入生产驱动覆盖。未注册的 scheme 由 _execute_real fail-closed。
+        self.executors = executors if executors is not None else default_executors()
         # manifest 编译：接口按「CON-xxx.名字」扁平注册；漂移在这里当场暴露
         self.interfaces: dict[str, dict] = {}
         self.connectors: dict[str, dict] = {}
@@ -152,7 +158,7 @@ class ConnectorProxy:
                 else self._execute_mock(endpoint, interface_ref, itf)
             )
         else:
-            payload, error = self._execute_real(endpoint, binding)
+            payload, error = self._execute_real(endpoint, binding, itf, params, is_write)
         if error:
             return Receipt(ok=False, interface=interface_ref, binding_ref=binding_ref, error=error)
 
@@ -176,28 +182,29 @@ class ConnectorProxy:
 
     def _execute_mock_write(self, interface_ref: str, params: object) -> tuple[object, str | None]:
         """mock 写执行器（测试与全链路演练）：不落真实系统，回一张确定性 mock 写回执，回显被批准的
-        被写内容（params）+ 落地标记。走通此路 = 审批闭环机制通，**非真实系统写验证**——真实
-        sql_readonly/openapi 写执行器随 W6-3 接入（`_execute_real` 已过 egress + secret 前置，执行器分派仍桩）。"""
+        被写内容（params）+ 落地标记。走通此路 = 审批闭环机制通，**非真实系统写验证**——真实写
+        走真实执行器（openapi 写 / 生产 sql 写驱动，`_execute_real` 分派），本 mock 写执行器仅供演练。"""
         return {"mock_write": interface_ref, "applied": params, "landed": True}, None
 
-    def _execute_real(self, endpoint: str, binding: dict) -> tuple[object, str | None]:
+    def _execute_real(
+        self, endpoint: str, binding: dict, itf: dict, params: object, is_write: bool
+    ) -> tuple[object, str | None]:
+        """真实执行器分派（W6-3）：egress → secret 前置 → 按 endpoint scheme 分派执行器。
+
+        顺序即防御纵深：egress 拒则不解析凭据、不外呼；secret 取不到则不分派执行器。secret 值解析后
+        **只传给执行器**（建连接/鉴权），绝不进回执/日志/剧集。"""
         m = ENDPOINT_HOST.match(endpoint)
         host = m.group(2) if m else endpoint
         ok, reason = self.policy.authorize_egress(host)
         if not ok:
             return None, reason
-        # secret 前置（W6-2，三不：值不进包/日志/剧集）：binding 声明了 secret_ref 却取不到值 → fail-closed，
-        # 错误只带名、绝不带值；resolver 返回值即用即弃（W6-3 执行器接入时才把值传入执行器建连接/带鉴权）。
+        # secret 前置（W6-2，三不：值不进包/日志/剧集）：binding 声明了 secret_ref → 必须解析出非空值，否则
+        # fail-closed（错误只带名、绝不带值）。值绑到局部、只往下传给执行器。
         secret_ref = binding.get("secret_ref")
+        secret: str | None = None
         if secret_ref:
             try:
-                # 强制点自持 fail-closed，不信任 pluggable resolver 自律：None 或空串一律拒（契约 B.3「空串=没给凭据」
-                # 落在强制点，非只靠参考 resolver 的 `or None`）；`not` 用真值判定——真实凭据从不为空串。
-                if not self.secret_resolver.resolve(str(secret_ref)):
-                    return (
-                        None,
-                        f"secret「{secret_ref}」未在部署环境解析——fail-closed（凭据缺失即拒；值永不进包/日志/剧集）",
-                    )
+                secret = self.secret_resolver.resolve(str(secret_ref))
             except Exception:
                 # resolver 抛错（vault 超时/鉴权失败等）即 fail-closed（宁可拒不可炸，call() 恒回 Receipt）；错误串
                 # **绝不带异常内文**——异常消息/栈可能含连接串或 token，带进来即踩穿「值永不进日志」。
@@ -205,5 +212,31 @@ class ConnectorProxy:
                     None,
                     f"secret「{secret_ref}」解析出错——fail-closed（凭据取值失败即拒；值永不进包/日志/剧集）",
                 )
-        # 真实执行器（sql_readonly/openapi/mcp）随 W6-3 接入；此处仍桩（egress + secret 前置已生效、真跑）。
-        return None, f"真实执行器未接入：endpoint 主机 {host} 已过 egress + secret 前置，执行适配随 W6-3 落地"
+            # 强制点自持 fail-closed，不信任 pluggable resolver 自律：None 或空串一律拒（契约 B.3「空串=没给凭据」
+            # 落在强制点，非只靠参考 resolver 的 `or None`）；`not` 用真值判定——真实凭据从不为空串。
+            if not secret:
+                return (
+                    None,
+                    f"secret「{secret_ref}」未在部署环境解析——fail-closed（凭据缺失即拒；值永不进包/日志/剧集）",
+                )
+        # 分派：按 endpoint scheme 选执行器（不按 manifest kind——SPEC B.3）。mcp 预留不实现；未注册即 fail-closed。
+        scheme = endpoint.split("://", 1)[0] if "://" in endpoint else ""
+        if scheme == "mcp":
+            return None, "mcp 执行器 W6 预留未实现（更大集成推后，不在 W6 范围）——fail-closed，不猜、不兜底"
+        executor = self.executors.get(scheme)
+        if executor is None:
+            return None, f"不识别的 endpoint scheme「{scheme}」——fail-closed（无对应执行器；生产驱动由部署侧注入）"
+        try:
+            return executor.execute(
+                endpoint=endpoint,
+                interface=itf,
+                params=params,
+                secret=secret,
+                is_write=is_write,
+                pack_root=self.pack_root,
+            )
+        except Exception:
+            # 执行器不许炸穿 call()（契约：call() 恒回 Receipt）——任何执行器异常（含可插拔生产驱动的意外异常、
+            # sqlite3.Warning 多语句、http.client 截断响应、MemoryError 巨响应体）统一转 fail-closed 回执。
+            # 错误串**绝不带异常内文**——异常消息/栈可能含连接串或 secret，带进来即踩穿「值永不进日志」。
+            return None, f"「{scheme}」执行器执行异常——fail-closed（执行器不许炸穿；异常内文不外泄）"

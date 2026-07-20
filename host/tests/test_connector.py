@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 import yaml
 
@@ -169,13 +171,28 @@ class _StaticResolver:
         return self.mapping.get(secret_ref)
 
 
-def _real_proxy(sample_pack, bindings, *, resolver=None, allow="db.internal.example"):
+class _RecordingExecutor:
+    """测试用可注入执行器：记录收到的 secret（证明值传给了执行器），回一份 fake payload。
+    secret 值只该在这里出现，绝不该到回执/审计——三不的注入型验证锚点。"""
+
+    def __init__(self, payload=None):
+        self.payload = payload if payload is not None else {"fake_row": 1}
+        self.received_secret = "UNSET"
+        self.received_is_write = None
+
+    def execute(self, *, secret, is_write, **kw):
+        self.received_secret = secret
+        self.received_is_write = is_write
+        return self.payload, None
+
+
+def _real_proxy(sample_pack, bindings, *, resolver=None, allow="db.internal.example", executors=None):
     """egress 放行 allow 的真实执行器代理（非 mock endpoint）——secret 前置由此可达。"""
     _, loaded = load_for_host(sample_pack)
     policy = PolicyInterceptor(
         loaded.package_id, {"policy_version": 1, "egress": {"allow_domains": [allow]}}, ledger_stats(loaded.pack)
     )
-    return ConnectorProxy(loaded, bindings, policy, secret_resolver=resolver)
+    return ConnectorProxy(loaded, bindings, policy, secret_resolver=resolver, executors=executors)
 
 
 def test_secret_ref_unresolved_fails_closed_name_only(sample_pack, monkeypatch):
@@ -187,42 +204,62 @@ def test_secret_ref_unresolved_fails_closed_name_only(sample_pack, monkeypatch):
     assert "未在部署环境解析" in r.error and "FINANCE_DB_RO_KEY" in r.error  # 名可出现
 
 
-def test_secret_value_never_leaks_into_receipt_or_audit(sample_pack):
-    """三不：解析出的 secret 值绝不进回执任何字段、绝不进审计日志。"""
+def test_secret_value_passed_to_executor_but_never_leaks(sample_pack):
+    """三不 + 交接：解析出的 secret **值传给执行器**（建连接/鉴权），但绝不进回执任何字段/审计日志。"""
     sentinel = "S3CR3T-CONN-STRING-must-never-appear"
     resolver = _StaticResolver({"FINANCE_DB_RO_KEY": sentinel})
+    ex = _RecordingExecutor()
     proxy = _real_proxy(
-        sample_pack, {"FINANCE_DB": {"endpoint": SQL_RO_EP, "secret_ref": "FINANCE_DB_RO_KEY"}}, resolver=resolver
+        sample_pack,
+        {"FINANCE_DB": {"endpoint": SQL_RO_EP, "secret_ref": "FINANCE_DB_RO_KEY"}},
+        resolver=resolver,
+        executors={"sql_readonly": ex},
     )
     r = proxy.call("CON-001.拉取费用明细", step=None)
-    assert not r.ok and "未接入" in r.error  # secret 解析通过 → 到执行器桩（W6-3 接入）
+    assert r.ok  # fake 执行器成功
     assert resolver.asked == ["FINANCE_DB_RO_KEY"]  # 按名解析过
+    assert ex.received_secret == sentinel  # 值确实传给了执行器（建连接用）
     blob = repr(r.__dict__) + repr(proxy.policy.audit)
-    assert sentinel not in blob  # 值不在回执/审计任何角落
+    assert sentinel not in blob  # 但值不在回执/审计任何角落
 
 
 def test_secret_resolver_is_pluggable(sample_pack):
     resolver = _StaticResolver({"K": "v"})
-    proxy = _real_proxy(sample_pack, {"FINANCE_DB": {"endpoint": SQL_RO_EP, "secret_ref": "K"}}, resolver=resolver)
+    ex = _RecordingExecutor()
+    proxy = _real_proxy(
+        sample_pack,
+        {"FINANCE_DB": {"endpoint": SQL_RO_EP, "secret_ref": "K"}},
+        resolver=resolver,
+        executors={"sql_readonly": ex},
+    )
     proxy.call("CON-001.拉取费用明细", step=None)
-    assert resolver.asked == ["K"]  # 注入的 resolver 被调用（默认 env-var 被覆盖）
+    assert resolver.asked == ["K"] and ex.received_secret == "v"  # 注入的 resolver 被调用、值传给执行器
 
 
 def test_no_secret_ref_skips_resolution(sample_pack):
     resolver = _StaticResolver({})
-    proxy = _real_proxy(sample_pack, {"FINANCE_DB": {"endpoint": SQL_RO_EP}}, resolver=resolver)  # 无 secret_ref
+    ex = _RecordingExecutor()
+    proxy = _real_proxy(
+        sample_pack, {"FINANCE_DB": {"endpoint": SQL_RO_EP}}, resolver=resolver, executors={"sql_readonly": ex}
+    )  # binding 无 secret_ref
     r = proxy.call("CON-001.拉取费用明细", step=None)
     assert resolver.asked == []  # 不问 resolver
-    assert not r.ok and "未接入" in r.error  # 无凭据需求 → 直达执行器桩
+    assert r.ok and ex.received_secret is None  # 无凭据需求 → 执行器收到 secret=None
 
 
 def test_sql_readonly_scheme_host_extracted_for_egress(sample_pack):
     """回归：sql_readonly:// 下划线 scheme 主机名可被抽取（否则 egress 永远拒、secret 前置不可达）。"""
     resolver = _StaticResolver({"K": "v"})
-    proxy = _real_proxy(sample_pack, {"FINANCE_DB": {"endpoint": SQL_RO_EP, "secret_ref": "K"}}, resolver=resolver)
+    ex = _RecordingExecutor()
+    proxy = _real_proxy(
+        sample_pack,
+        {"FINANCE_DB": {"endpoint": SQL_RO_EP, "secret_ref": "K"}},
+        resolver=resolver,
+        executors={"sql_readonly": ex},
+    )
     r = proxy.call("CON-001.拉取费用明细", step=None)
-    assert "egress 默认全禁" not in r.error  # 没被 egress 拦（host 正确抽取为 db.internal.example）
-    assert resolver.asked == ["K"] and "未接入" in r.error  # 过了 egress、问了 secret、到执行器桩
+    assert r.ok  # 过了 egress + secret 前置 → 到执行器（host 正确抽取为 db.internal.example）
+    assert resolver.asked == ["K"] and ex.received_secret == "v"
 
 
 def test_secret_not_resolved_before_egress_passes(sample_pack):
@@ -266,3 +303,64 @@ def test_secret_resolver_exception_fails_closed_no_leak(sample_pack):
     assert not r.ok and "解析出错" in r.error and "K" in r.error  # fail-closed，名可出现
     blob = repr(r.__dict__) + repr(proxy.policy.audit)
     assert sentinel not in blob  # 异常内文（含值）绝不进回执/审计
+
+
+# ── 执行器分派（W6-3：按 endpoint scheme 选执行器；未注册 / mcp 预留 fail-closed） ──
+
+
+def test_unknown_scheme_fails_closed(sample_pack):
+    """未注册 scheme（如 postgresql://，生产驱动由部署侧注入）→ fail-closed，不猜、不兜底。"""
+    proxy = _real_proxy(
+        sample_pack, {"FINANCE_DB": {"endpoint": "postgresql://db.internal.example/x"}}, allow="db.internal.example"
+    )
+    r = proxy.call("CON-001.拉取费用明细", step=None)
+    assert not r.ok and "不识别的 endpoint scheme" in r.error
+
+
+def test_mcp_scheme_reserved_not_implemented(sample_pack):
+    """mcp:// 预留不实现（W6 范围外）→ fail-closed（与「未识别 scheme」区分，给明确的预留口径）。"""
+    proxy = _real_proxy(
+        sample_pack, {"FINANCE_DB": {"endpoint": "mcp://srv.internal.example/x"}}, allow="srv.internal.example"
+    )
+    r = proxy.call("CON-001.拉取费用明细", step=None)
+    assert not r.ok and "mcp" in r.error and "预留" in r.error
+
+
+def test_real_sql_readonly_read_end_to_end(sample_pack, tmp_path):
+    """端到端 connector → SqlReadonlyExecutor（真 sqlite 只读）：命名参数化查询回结果、经脱敏注入回执。"""
+    db = tmp_path / "fin.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE 合并报表_费用明细(单位名称,费用科目,统计周期,环比涨幅,绝对金额)")
+    conn.executemany(
+        "INSERT INTO 合并报表_费用明细 VALUES(?,?,?,?,?)",
+        [("甲厂", "差旅费", "2026-07", 0.3, 45), ("乙厂", "差旅费", "2026-06", 0.1, 20)],
+    )
+    conn.commit()
+    conn.close()
+    proxy = _real_proxy(sample_pack, {"FINANCE_DB": {"endpoint": f"sql_readonly://localhost{db}"}}, allow="localhost")
+    # 直接传命名参数 dict 验执行器契约（runner→执行器的 params 穿透属 W7 端到端；此处验适配器真跑）
+    r = proxy.call("CON-001.拉取费用明细", {"统计周期": "2026-07", "费用科目": None}, step=None)
+    assert r.ok, r.error
+    assert r.payload == [
+        {"单位名称": "甲厂", "费用科目": "差旅费", "统计周期": "2026-07", "环比涨幅": 0.3, "绝对金额": 45}
+    ]  # 只回 2026-07 的甲厂（命名参数过滤生效），乙厂 2026-06 被过滤
+
+
+def test_executor_exception_never_crashes_call_no_leak(sample_pack):
+    """对抗审查捉·契约：执行器抛任意异常绝不炸穿 call()（恒回 Receipt）；异常内文（可能含连接串/secret）不外泄。
+    覆盖 sqlite3.Warning（多语句）/ http.client 截断响应 / MemoryError / 可插拔生产驱动的意外异常。"""
+    sentinel = "postgres://u:LEAK-TOKEN@db.internal"
+
+    class _BoomExecutor:
+        def execute(self, **kw):
+            raise RuntimeError(f"驱动内部炸了，连接串：{sentinel}")
+
+    proxy = _real_proxy(
+        sample_pack,
+        {"FINANCE_DB": {"endpoint": SQL_RO_EP}},
+        executors={"sql_readonly": _BoomExecutor()},
+    )
+    r = proxy.call("CON-001.拉取费用明细", step=None)  # 不抛
+    assert not r.ok and "执行器执行异常" in r.error  # 统一 fail-closed 回执
+    blob = repr(r.__dict__) + repr(proxy.policy.audit)
+    assert sentinel not in blob  # 异常内文（含连接串）绝不进回执/审计

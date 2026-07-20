@@ -555,3 +555,24 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   错误串**绝不带异常内文**。另 3 lens（egress 顺序 / 正则安全 / 注入路径）真跑后无真问题。
 - **立身口径**：W6-2 建 resolver + 契约强制，测 fake（env 注入 / 桩 resolver）；真实 secret manager 取值连通
   归部署侧（1.1/部署验收）。门禁全绿：host 273 passed（+2 对抗审查回归）+ ruff check/format 双绿。真实执行器（W6-3）。
+
+## [Host M6-W6-3 · 真实执行器] - 2026-07-20
+真写「变真」块（W6）第三片真实执行器（最高危真读/写路径 + 凭据；七 lens 对抗审查 → 逐条真跑核实 → 收口）：
+- **可插拔 Executor 分派**：新 `executor.py`——`Executor` 协议 + 内置参考适配器 `SqlReadonlyExecutor`（sqlite）
+  / `OpenapiExecutor`（urllib）+ `default_executors()`。`_execute_real` 按 endpoint scheme 分派（egress → secret
+  前置 → 执行器）；`ConnectorProxy` 可注入执行器注册表（部署侧覆盖生产驱动）。未注册 scheme / mcp（预留不实现）
+  一律 fail-closed，不猜、不兜底。
+- **sql_readonly**：只读靠**连接模式**（`mode=ro`，非关键字黑名单）；跑包内固化 impl SQL、params 参数化命名
+  绑定（防注入）；impl 缺失/写路径/多语句一律拒。**openapi**：method+path+params，secret 作 Bearer 头，**不跟随
+  重定向**（防 SSRF 绕 egress），响应非 2xx/非 JSON/截断/超限 fail-closed。
+- **对抗审查捉 7 缺陷（11 raw→7 confirmed，各真跑复现后修），收敛为 2 类根因：**
+  ① **执行器炸穿 call()**（sqlite3.Warning 多语句 / http.client 截断响应 / MemoryError 巨响应体 / 注入驱动意外
+  异常）——违反「call() 恒回 Receipt」。修：`_execute_real` 分派处统一 try/except 兜成 fail-closed 回执（异常内文
+  绝不入串，守三不）+ 执行器各自补捕获 + 响应体读上限。
+  ② **BLOCKER openapi SSRF + secret 外泄**——URL=netloc+manifest path，path 无前导 `/` 时向右延展 netloc、把真实
+  连接引到 egress 从未校验的主机并送 secret Bearer。修：path 强制锚定 `/`（`"/"+lstrip("/")`），host 永不被 path
+  污染（7 种逃逸 path 真跑复核全落在 netloc host）。另修 `urlparse` 对含下划线 scheme（sql_readonly）静默失效
+  → 自持 `_split_endpoint` 手工切。
+- **立身口径**：内置参考适配器测 **fake 后端**（本地 sqlite / 本地 http.server）；生产库/生产 API 真系统验证归
+  部署侧（1.1/部署验收）。门禁全绿：host 295 passed（+对抗审查回归：多语句/注入异常无泄漏/SSRF 锚定/截断/超限）
+  + ruff check/format 双绿。W6 末片：人类可读 payload（W6-4，跨仓 host+oscapipe）。
