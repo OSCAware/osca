@@ -584,6 +584,7 @@ async def test_w5_fire_runs_pipeline_to_draft(running_host, sample_pack, deploy_
 
 # ── D2a 可恢复剧集：Host 编排（挂起登记 / approve·deny 触发恢复 / 登记侧自愈 / 清扫 / 免淘汰）──
 
+
 def _setup_write_episode(host, pid, write_ref="CON-001.拉取费用明细"):
     """在已装载包上装 [agent 产草稿 → 写步(input=草稿)] 可恢复剧集，配写门白名单/approvals；
     LLM 由 deploy_w5 的 mock 通道供给。返回执行所需句柄。"""
@@ -779,25 +780,23 @@ async def test_d2b_reattach_survives_reload_then_approve_lands(running_host, sam
     assert [r for r in host._suspension_store.load_all() if r["operation_id"] == opid] == []  # 恢复调度即删盘
 
 
-async def test_d2b_reattach_discards_on_version_mismatch(running_host, sample_pack, deploy_w5, monkeypatch):
-    """包版本漂移：快照版本戳与当前包不符（包已改版）→ 重挂时丢弃不兑现 + 删盘（fail-closed，§2.4）。"""
-    from osca_host import host as host_mod
-
+async def test_d2b_reattach_discards_on_version_mismatch(running_host, sample_pack, deploy_w5):
+    """包版本漂移：挂起后改包源文件（含**未提交**改动——版本戳按实际字节内容指纹，不靠 git tree OID）→
+    重挂时戳不符 → 丢弃不兑现 + 删盘（fail-closed，§2.4 / GPT 外审 P1）。"""
     host = running_host
     await _load_pack(host, sample_pack, deploy_w5)
     pid = "demo-group-oper-diagnosis"
     episode, loaded, proxy, policy = _setup_write_episode(host, pid)
     await host._execute_episode(episode, loaded, proxy, policy)
     opid = episode.operation_id
+    assert [r for r in host._suspension_store.load_all() if r["operation_id"] == opid]  # 已落盘
 
-    # 让当前包报一个非 None 版本戳，并把盘上快照的戳改成不同值（模拟挂起后包改版）
-    monkeypatch.setattr(host_mod, "ledger_stamp", lambda root: "TREE-CURRENT")
-    rec = next(r for r in host._suspension_store.load_all() if r["operation_id"] == opid)
-    rec["version_stamp"] = "TREE-STALE"
-    host._suspension_store.persist(opid, rec)
+    # 改包源文件（不 commit，只加 YAML 注释）——模拟挂起后运行语义变更：指纹变、旧快照不可安全兑现
+    pf = sample_pack / "policy.yaml"
+    pf.write_text(pf.read_text(encoding="utf-8") + "\n# drift（未提交改动）\n", encoding="utf-8")
 
     await _send({"cmd": "unload", "package_id": pid}, host)
-    await _load_pack(host, sample_pack, deploy_w5)  # reload → 戳不符 → 丢弃
+    await _load_pack(host, sample_pack, deploy_w5)  # reload → 内容指纹不符 → 丢弃
     _reapply_write_config(host, pid)
 
     assert not any(e.operation_id == opid and e.status == "suspended_pending_approval" for e in host.episodes.values())
@@ -819,13 +818,38 @@ async def test_d2b_reattach_same_display_id_no_collision(running_host, sample_pa
         ep = assemble("EP-0001", loaded, aware, "AW-001/T3")  # 两条都铸同一展示号
         ep.operation_id = opid
         ep.status = "suspended_pending_approval"
-        ep.resume = {"step_index": 1, "ref_index": 0, "payloads": {}, "receipts": [],
-                     "write_params": {"x": 1}, "artifacts": {}, "challenge_id": cid}
-        ch = {"challenge_id": cid, "package_id": pid, "action": "CON-001.拉取费用明细", "approver": "专家",
-              "episode_id": "EP-0001", "payload_digest": "d", "created_at": 1.0, "expires_at": 1e12,
-              "state": "pending", "decided_by": None, "decided_at": None, "consumed_at": None}
-        return {"operation_id": opid, "package_id": pid, "episode": ep.dump(), "challenge": ch,
-                "tool_calls": 0, "tokens": 0, "version_stamp": stamp}
+        ep.resume = {
+            "step_index": 1,
+            "ref_index": 0,
+            "payloads": {},
+            "receipts": [],
+            "write_params": {"x": 1},
+            "artifacts": {},
+            "challenge_id": cid,
+        }
+        ch = {
+            "challenge_id": cid,
+            "package_id": pid,
+            "action": "CON-001.拉取费用明细",
+            "approver": "专家",
+            "episode_id": "EP-0001",
+            "payload_digest": "d",
+            "created_at": 1.0,
+            "expires_at": 1e12,
+            "state": "pending",
+            "decided_by": None,
+            "decided_at": None,
+            "consumed_at": None,
+        }
+        return {
+            "operation_id": opid,
+            "package_id": pid,
+            "episode": ep.dump(),
+            "challenge": ch,
+            "tool_calls": 0,
+            "tokens": 0,
+            "version_stamp": stamp,
+        }
 
     store.persist("EO-aaa", _record("EO-aaa", "CH-a"))
     store.persist("EO-bbb", _record("EO-bbb", "CH-b"))
@@ -835,3 +859,70 @@ async def test_d2b_reattach_same_display_id_no_collision(running_host, sample_pa
     assert {e.operation_id for e in suspended} == {"EO-aaa", "EO-bbb"}  # 两条都在，未互相顶掉
     assert len({e.episode_id for e in suspended}) == 2  # 各得独立展示号（无冲突）
     assert host._suspensions["CH-a"] != host._suspensions["CH-b"]  # 两挑战各指自己的剧集（未错接）
+
+
+async def test_d2b_delete_failure_keeps_suspended_not_fake_running(running_host, sample_pack, deploy_w5, monkeypatch):
+    """删快照失败（磁盘/权限）→ 保留挂起态、不推进成永卡的假 running（GPT 外审 P1）：_suspensions 映射仍在、可重试。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+    await host._execute_episode(episode, loaded, proxy, policy)  # 挂起 + 落盘
+    [ch] = policy.pending_challenges()
+    cid = ch["challenge_id"]
+
+    def _boom(_opid):
+        raise OSError("模拟删盘失败（权限/磁盘）")
+
+    monkeypatch.setattr(host._suspension_store, "delete", _boom)
+    host._schedule_resume(episode.episode_id, loaded, proxy, policy)  # 删盘失败 → 不推进
+
+    assert episode.status == "suspended_pending_approval"  # 仍挂起（未变假 running）
+    assert host._suspensions.get(cid) == episode.episode_id  # 映射保留，可重试
+
+
+async def test_d2b_survives_host_restart(sock_path, sample_pack, deploy_w5):
+    """活过 Host 重启（真实进程边界回归，GPT 外审 P2）：Host A 挂起写剧集 + 退出（关 runtime fd / socket）→
+    Host B 复用同一运行目录、_episode_seq 归零、全新 policy/authorizer → 装载重挂 → 重新 approve → 兑现。"""
+
+    async def _ready(h):
+        for _ in range(200):
+            if h.control.socket_path.exists():
+                return
+            await asyncio.sleep(0.01)
+
+    pid = "demo-group-oper-diagnosis"
+    # ── Host A：起、装载、挂起、退出 ──
+    host_a = Host(sock_path)
+    task_a = asyncio.create_task(host_a.run())
+    await _ready(host_a)
+    await _load_pack(host_a, sample_pack, deploy_w5)
+    ep_a, loaded, proxy, policy = _setup_write_episode(host_a, pid)
+    await host_a._execute_episode(ep_a, loaded, proxy, policy)
+    assert ep_a.status == "suspended_pending_approval"
+    opid = ep_a.operation_id
+    host_a._stop.set()
+    await asyncio.wait_for(task_a, timeout=5)  # A 退出：关 socket/runtime fd，susp 快照留盘
+
+    # ── Host B：同 sock_path 复用运行目录，全新对象，装载重挂 ──
+    host_b = Host(sock_path)
+    task_b = asyncio.create_task(host_b.run())
+    try:
+        await _ready(host_b)
+        assert host_b._episode_seq == 0  # 新进程序号归零（真键 operation_id）
+        await _load_pack(host_b, sample_pack, deploy_w5)  # → _reattach 读 A 的快照
+        _reapply_write_config(host_b, pid)
+        reattached = next((e for e in host_b.episodes.values() if e.operation_id == opid), None)
+        assert reattached is not None and reattached.status == "suspended_pending_approval"
+        cid = host_b.policies[pid].pending_challenges()[0]["challenge_id"]
+        host_b.authorizer.register("approver-token-0001", Principal("专家", "approver"))
+        good = await _send(
+            {"cmd": "approve", "package_id": pid, "challenge_id": cid}, host_b, token="approver-token-0001"
+        )
+        assert good["ok"]
+        await _await_status(reattached, "completed")
+        assert reattached.status == "completed"  # 跨重启兑现
+        assert next(s for s in reattached.steps if s["step"] == "下发")["status"] == "done"
+    finally:
+        host_b._stop.set()
+        await asyncio.wait_for(task_b, timeout=5)

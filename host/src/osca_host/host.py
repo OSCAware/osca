@@ -549,18 +549,23 @@ class Host:
         self._persist_suspension(episode, policy)  # 挑战仍 pending → L2 持久（活过包重载 / Host 重启）
 
     def _schedule_resume(self, episode_id: str, loaded, proxy, policy) -> None:
-        """CAS suspended→running（**事件循环单线程内**，INV-3）+ 调度恢复线程。抢不到即放弃（幂等，防双恢复）。"""
+        """删盘 → CAS suspended→running（事件循环单线程内，INV-3）→ 调度恢复线程。抢不到即放弃（幂等，防双恢复）。"""
         episode = self.episodes.get(episode_id)
         if episode is None or episode.status != "suspended_pending_approval":
             return  # 已淘汰/已恢复/已终态——放弃（幂等）
-        episode.status = "running"  # CAS：单线程读到 suspended 才改 running，其间无 await 交错
+        if self._suspension_store is not None:
+            # 删盘**早于**改状态与起写线程：① 崩溃于「写已落地、终态未记」也不会重挂重批重写（关双写窗，§2.4）；
+            # ② 删盘失败（磁盘/权限）则**保留挂起态、不提交 running**——否则会推进成永卡的假 running（GPT 外审 P1）：
+            # 留 _suspensions 映射，下次清扫/审批事件重试。删盘与改状态间无 await，事件循环上原子。
+            try:
+                self._suspension_store.delete(episode.operation_id)
+            except OSError as e:
+                log.warning(f"删除挂起快照失败，保留挂起态待清扫重试（不推进假 running）：{episode_id}（{e}）")
+                return
+        episode.status = "running"  # CAS：删盘成功后才提交内存状态
         cid = episode.resume.get("challenge_id") if episode.resume else None
         if cid is not None:
             self._suspensions.pop(cid, None)
-        if self._suspension_store is not None:
-            # 删盘**早于**起写线程——崩溃于「写已落地、终态未记」也不会重挂重批重写（关双写窗，§2.4/L2）；
-            # 崩溃于「已调度、写未完成」则写丢失（fail-closed，安全侧）。残留真·硬件半写归 W6 幂等键。
-            self._suspension_store.delete(episode.operation_id)
         task = asyncio.create_task(self._execute_episode(episode, loaded, proxy, policy))
         self._episode_tasks.add(task)
         task.add_done_callback(self._episode_tasks.discard)
@@ -592,16 +597,18 @@ class Host:
 
     @staticmethod
     def _pack_stamp(loaded) -> str:
-        """包版本戳：git 包用 tree OID（ledger_stamp），非 git 包（zip/演练/CI）用源文件内容指纹——两者皆随
-        任何内容变化而变、**恒非 None**，供重挂时严格比对（任一漂移即 fail-closed 丢弃，§2.4；非 git 侧不再
-        fail-open）。indexes/ 缓存不入指纹（装载会重建、与包身份无关）。"""
-        stamp = ledger_stamp(loaded.root)
-        if stamp is not None:
-            return stamp
+        """包版本戳 = **源文件内容指纹**（sha256 of 排序后的「相对路径 + 字节」），排除 `.git/`（版本控制内部）
+        与 `indexes/`（装载重建的缓存，与包身份无关）。
+
+        为何不用 git tree OID：OID 只反映 **已提交** 内容——直接改 policy.yaml/pipeline/connector 而不提交，
+        HEAD tree 不变，旧快照会重挂到新运行语义（GPT 外审 P1）。内容指纹按**实际工作树字节**计，未提交改动
+        照样变戳。重挂时严格比对，任一漂移即 fail-closed 丢弃（§2.4）。持久/重挂皆低频（挂起时 / 装载时），
+        小包成本可忽略。"""
         root = loaded.root
         h = hashlib.sha256()
         for p in sorted(root.rglob("*")):
-            if p.is_dir() or "indexes" in p.relative_to(root).parts:
+            parts = p.relative_to(root).parts
+            if p.is_dir() or ".git" in parts or "indexes" in parts:
                 continue
             h.update(p.relative_to(root).as_posix().encode("utf-8") + b"\0")
             with contextlib.suppress(OSError):

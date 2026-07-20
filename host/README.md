@@ -124,14 +124,14 @@ shasum -a 256 operator.token           # 将摘要写入 Host 侧 principals 文
 | `approver` | challenges / approve / deny（M4-W3：绑 challenge_id 批/驳一张具体挑战；principal 名须与挑战指定审批人相符——冒名/越权/一次性/过期由挑战状态机 fail-closed。**名绑定是全局的、无包域**：同名审批人可批任何指定其名的包，challenges 覆盖任意包全部待批项、不按审批人过滤；per-principal 包域收窄归 T1/T2，之前勿在多租户 Host 上授予——与 expert 同款告示） | 其余全部（无生命周期/快照/启停/剧集面） |
 | `expert` | episodes / episode（M4-W1 专家端只读交付面——draft 即交付物；episodes 摘要当前覆盖 Host 上全部包，per-principal 包域收窄未做，勿在多租户 Host 上授予） | 其余全部 |
 
-### M4-W3 审批挑战 + M6-W5 可恢复剧集（诚实标注：闭环通到 L1，真实系统写 / 持久化待续）
+### M4-W3 审批挑战 + M6-W5 可恢复剧集（诚实标注：审批闭环 + L2 持久化已落，真实系统写待续）
 
 W3 落地的是**机制**：绑定挑战状态机（approver / episode / payload 摘要 / 过期 +
 一次性 consume，冒名/重放/偷梁换柱/跨剧集/过期各有测试钉住；`consume_or_raise`
 单锁原子，无「消费失败与挂起之间恰好获批 → 同绑定双份放行额度」竞态窗）+ 控制通道
 `challenges/approve/deny` + IM 审批卡桥接（私仓 oscapipe W3.2）。
 
-**「批准 → 放行一次真写」的端到端闭环 M6-W5 已通到 L1（进程内）：**
+**「批准 → 放行一次真写」的端到端闭环 M6-W5 已通（含 L2 磁盘持久，活过包重载 / Host 重启）：**
 - **W5-D1 传写 params**：connector 写路径把模型给出的写 params 传入，payload 摘要绑
   **真实被写内容**（不再是空串摘要）；写门两条 fail-closed（空内容拒 / 非 JSON 可序列化拒）。
 - **W5-D2a 可恢复剧集**：写命中审批门 → 剧集**挂起**（`suspended_pending_approval`，释放
@@ -145,9 +145,10 @@ W3 落地的是**机制**：绑定挑战状态机（approver / episode / payload
 - **真实系统写**（W6）：真实 sql_readonly/openapi 执行器 + secret 解析。
 - **审批卡人类可读脱敏 payload**（W6）：现仅给摘要；须呈现脱敏后的写内容原文供审批人拍板。
 - **TTL 按人审时延重估**（W6）：现值 300s 是机制口径。
-- **挑战 + 挂起态持久化**（W5-D2b 在做）：现进程内、随 Policy 同寿——包重载 / Host 重启即
-  清空 pending 与挂起剧集（迁 stopped，L1 不恢复）；L2 磁盘持久 + 装载重挂后活过重载/重启，
-  跨崩溃 exactly-once「写重复侧」靠 W6 写执行器幂等键。
+- **挑战 + 挂起态持久化 ✅**（W5-D2b · L2）：挂起快照原子写盘（fd 锚定运行目录）+ 装载时重挂——
+  活过**包重载**且活过 **Host 重启**（同一重挂路径；版本戳按源文件内容指纹，漂移即 fail-closed 丢弃）。
+  诚实标注：approve 决定不活过重启（盘上挑战恒 pending，须重发）；跨崩溃 exactly-once「写重复侧」靠 W6
+  写执行器幂等键（删盘早于写执行已关 reload/restart 双写窗，残留只真·硬件半写）。
 - **approver 名绑定无包域**（见上表告示）：包域收窄归 T1/T2 多租户。
 
 `load` 只收 `deployment_id`：包路径、bindings、解压目录一律由 Host 侧
