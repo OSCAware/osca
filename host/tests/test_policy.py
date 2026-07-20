@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from osca_host.policy import PolicyInterceptor
 
 POLICY = {
@@ -209,6 +211,58 @@ def test_write_approval_defaults_to_deny():
     p.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
     assert p.require_write_approval(ref, episode_id="EP-1", payload=payload)[0]  # 批后同内容放行一次
     assert not p.require_write_approval(ref, episode_id="EP-1", payload=payload)[0]  # 一次性：consume 后再拦
+
+
+# ── 审批授权 TTL 配置（W6-1：包级默认 default_ttl_seconds + 每动作 ttl_seconds 覆盖） ──
+
+
+def _pending_ttl(p, action="终稿发送管理层", payload=None):
+    """挂一张 pending 挑战并返回其 TTL = expires_at − created_at（二者同一 now，相减即配置窗口）。"""
+    p.require_approval(action, episode_id="EP-1", payload=payload if payload is not None else {"x": 1})
+    dto = next(c for c in p.pending_challenges() if c["action"] == action)
+    return dto["expires_at"] - dto["created_at"]
+
+
+def test_ttl_defaults_to_mechanism_300_when_unconfigured():
+    assert _pending_ttl(make()) == pytest.approx(300.0)  # 未配 → 机制默认 DEFAULT_TTL_SECONDS
+
+
+def test_ttl_package_default_applies():
+    assert _pending_ttl(make({**POLICY, "default_ttl_seconds": 900})) == pytest.approx(900.0)
+
+
+def test_ttl_per_action_overrides_package_default():
+    policy = {
+        **POLICY,
+        "default_ttl_seconds": 900,
+        "approvals": [{"action": "终稿发送管理层", "approver": "专家", "ttl_seconds": 1800}],
+    }
+    assert _pending_ttl(make(policy)) == pytest.approx(1800.0)  # 每动作覆盖包默认
+
+
+def test_ttl_illegal_default_falls_back_to_300_not_no_expiry():
+    """fail-closed：非法包默认一律回落机制默认 300s（绝不 fail-open 成无过期/inf），且留审计警告。"""
+    for bad in (-5, 0, "banana", float("inf"), float("nan"), True, 10**400):
+        p = make({**POLICY, "default_ttl_seconds": bad})
+        assert _pending_ttl(p) == pytest.approx(300.0), f"非法 default_ttl_seconds={bad!r} 未回落 300s"
+        assert any(a["decision"] == "warn" and a["step"] == "default_ttl_seconds" for a in p.audit)
+
+
+def test_ttl_illegal_per_action_falls_back_to_package_default_and_keeps_gate():
+    """非法每动作 TTL：只警告 + 回落包默认；action/approver 合法 → 审批门**不** broken（与项形状错区分）。"""
+    policy = {
+        **POLICY,
+        "default_ttl_seconds": 600,
+        "approvals": [{"action": "终稿发送管理层", "approver": "专家", "ttl_seconds": "oops"}],
+    }
+    p = make(policy)
+    assert _pending_ttl(p) == pytest.approx(600.0)  # 非法每动作 TTL → 回落包默认，不回落到 300
+    assert any(a["decision"] == "warn" and "ttl_seconds" in str(a["step"]) for a in p.audit)
+    assert p.snapshot()["approvals"] == {"终稿发送管理层": "专家"}  # 门仍在，未 fail-closed 一律拒
+    # 端到端仍可批可放行（非法 TTL 没关门）
+    [ch] = p.pending_challenges()
+    assert p.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)[0]
+    assert p.require_approval("终稿发送管理层", episode_id="EP-1", payload={"x": 1})[0]
 
 
 def test_redaction():

@@ -19,9 +19,11 @@ data:
   redact: [身份证号, 手机号]     # 注入剧集前脱敏
   scope: 数据不出集团合并库
 
+default_ttl_seconds: 900        # 审批授权过期窗口默认 15 分钟（人在 IM 上看卡再拍板；部署侧按实际人审节奏重估）
 approvals:
   - action: 终稿发送管理层
     approver: 专家
+    ttl_seconds: 1800           # 该动作单独放宽到 30 分钟（覆盖包默认；缺省则用 default_ttl_seconds/机制默认 300s）
 
 budgets:
   per_episode: {max_tokens: 200k, max_tool_calls: 30}

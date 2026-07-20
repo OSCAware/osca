@@ -142,9 +142,12 @@ W3 落地的是**机制**：绑定挑战状态机（approver / episode / payload
   sql_readonly/openapi 写执行器仍是桩（`_execute_real` 返回未接入），属部署侧适配（W6）。
 
 **仍待续（诚实标注）：**
-- **真实系统写**（W6）：真实 sql_readonly/openapi 执行器 + secret 解析。
-- **审批卡人类可读脱敏 payload**（W6）：现仅给摘要；须呈现脱敏后的写内容原文供审批人拍板。
-- **TTL 按人审时延重估**（W6）：现值 300s 是机制口径。
+- **真实系统写**（W6-2/3）：真实 sql_readonly/openapi 执行器 + secret 解析。
+- **审批卡人类可读脱敏 payload**（W6-4）：现仅给摘要；须呈现脱敏后的写内容原文供审批人拍板。
+- **TTL 按人审时延重估 ✅**（W6-1）：授权过期窗口从硬编码 300s 变 **policy 可配**——包级
+  `default_ttl_seconds` + 每 action `ttl_seconds` 覆盖；缺省/非法一律 fail-closed 回落机制默认 300s
+  （绝不 fail-open 成无过期），公仓 osca-cli lint 校验字段形状（正有限数秒）。诚实标注：**真实人审
+  节奏仍由部署侧按 IM 实况设**——参考默认只是占位口径。
 - **挑战 + 挂起态持久化 ✅**（W5-D2b · L2）：挂起快照原子写盘（fd 锚定运行目录）+ 装载时重挂——
   活过**包重载**且活过 **Host 重启**（同一重挂路径；版本戳按源文件内容指纹，漂移即 fail-closed 丢弃）。
   诚实标注：approve 决定不活过重启（盘上挑战恒 pending，须重发）；跨崩溃 exactly-once「写重复侧」靠 W6

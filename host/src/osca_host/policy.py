@@ -41,6 +41,7 @@ from osca_cli.triggers import (  # 数量记法与预算键的单一真理源（
 )
 
 from osca_host.challenge import (  # W3 审批：绑定挑战替换旧无绑定 set[action]
+    DEFAULT_TTL_SECONDS,
     Challenge,
     ChallengeStore,
     payload_digest,
@@ -68,8 +69,14 @@ class PolicyInterceptor:
     ):
         self.package_id = package_id
         self.audit: list[dict] = []
-        # 审批门的绑定挑战存储（每包一台，随包卸载而消亡）。可注入（测试控时/共享）。
-        self._challenges = challenges if challenges is not None else ChallengeStore()
+        # 审批授权 TTL（W6-1）：包级默认 default_ttl_seconds（policy 顶层）+ 每 action 可选 ttl_seconds 覆盖。
+        # 缺省/非法一律 fail-closed 回落机制默认 300s——绝不 fail-open 成无过期（过期窗只会更短，绝不消失）。
+        self.default_ttl_seconds = self._parse_ttl(policy.get("default_ttl_seconds"), "default_ttl_seconds")
+        self.approval_ttls: dict[str, float] = {}  # action → 每动作 TTL 覆盖（合法才入表；非法回落包默认/300）
+        # 审批门的绑定挑战存储（每包一台，随包卸载而消亡）。可注入（测试控时/共享）；store 默认 TTL = 包级默认
+        # （缺省/非法 → DEFAULT_TTL_SECONDS）。per-action 覆盖在 require_approval 挂挑战时按调用传入。
+        store_ttl = self.default_ttl_seconds if self.default_ttl_seconds is not None else DEFAULT_TTL_SECONDS
+        self._challenges = challenges if challenges is not None else ChallengeStore(ttl_seconds=store_ttl)
 
         # ── 笼子自防：形状错误绝不静默改语义（如关闭脱敏）——留审计警告，lint 之外的第二道闸 ──
         def shape_warn(section: str, value, expected: str) -> None:
@@ -175,6 +182,10 @@ class PolicyInterceptor:
         for a in approvals_raw if isinstance(approvals_raw, list) else []:
             if isinstance(a, dict) and isinstance(a.get("action"), str) and isinstance(a.get("approver"), str):
                 self.approvals[a["action"]] = a["approver"]
+                # 每动作 TTL 覆盖（W6-1，可选）：非法值 _parse_ttl 记警告并回落包默认/300，不入表、不 broken 审批门
+                ttl = self._parse_ttl(a.get("ttl_seconds"), f"approvals[{a['action']}].ttl_seconds")
+                if ttl is not None:
+                    self.approval_ttls[a["action"]] = ttl
             else:
                 shape_warn("approvals", a, "含 action/approver 字符串的 mapping")
                 self._approvals_broken = True
@@ -194,6 +205,32 @@ class PolicyInterceptor:
         # kill 状态是账本与档案的可再评估信号，重启即重评；持久化停机名单归部署侧运维面（诚实标注）
         self.kill_tripped = state == "tripped"
         self.kill_reason = reason if self.kill_tripped else ""
+
+    # ── 审批授权 TTL 解析（W6-1：fail-closed 回落 300s，绝不 fail-open 无过期） ──────────
+
+    def _parse_ttl(self, raw: object, label: str) -> float | None:
+        """审批授权过期秒数解析。缺省 → None（调用方回落机制默认）；合法正有限数 → float；
+        非法（非数值 / bool / 非有限 / ≤0 / 巨值溢出 float）→ 记警告 + None——回落 DEFAULT_TTL_SECONDS。
+        绝不把非法 TTL 放大成 inf/无过期（float(巨整数) 溢出被拦）：过期窗只会更短，绝不消失。"""
+        if raw is None:
+            return None
+        value: float | None = None
+        if not isinstance(raw, bool) and isinstance(raw, (int, float)):
+            try:
+                f = float(raw)  # 巨整数 float() 溢出 OverflowError——拦掉，绝不让 now+inf 变成永不过期
+            except (OverflowError, ValueError):
+                f = math.nan
+            if math.isfinite(f) and f > 0:
+                value = f
+        if value is None:
+            self._record(
+                "warn",
+                label,
+                str(raw),
+                f"{label} 须为正有限数（授权过期秒数）——非法值不生效，回落机制默认 "
+                f"{DEFAULT_TTL_SECONDS:.0f}s（fail-closed：过期窗只会更短，绝不消失）",
+            )
+        return value
 
     # ── kill switch（公理 A10：账本健康度即安全信号） ──────────────────
 
@@ -418,6 +455,7 @@ class PolicyInterceptor:
             approver=approver,
             episode_id=episode_id or "",
             payload_digest=payload_digest(payload),
+            ttl_seconds=self.approval_ttls.get(action),  # 每动作 TTL 覆盖；None → store 包级默认（挂新挑战时用）
         )
         if ok:
             return self._allow(None, action, detail)

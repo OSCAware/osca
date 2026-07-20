@@ -522,3 +522,19 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   + secret 解析 + 审批卡人类可读脱敏 payload + TTL 按人审重估 = **W6**；真实写连接器样例 + 端到端演练收口 +
   tag v1.1 = **W7**。GPT 外审 4×P1 + 2×P2 收口（版本戳内容指纹防未提交漂移 / 删盘失败保挂起不假 running /
   真重启回归测试 / 文档同步）。
+
+## [Host M6-W6-1 · 审批授权 TTL 可配] - 2026-07-20
+真写「变真」块（W6）第一片 TTL 重估（配置面，强测试 + 自审；W6-D0 六决策全过红笔按推荐）：
+- **TTL 从硬编码变 policy 可配**：授权过期窗口不再固定 `DEFAULT_TTL_SECONDS=300`——policy.yaml 顶层
+  `default_ttl_seconds`（包级默认）+ 每 `approvals` 项 `ttl_seconds`（每动作覆盖）。装载时包级默认进
+  `ChallengeStore`，每动作覆盖在挂挑战时按调用传入（`consume_or_raise` 既有 per-call ttl）。
+- **fail-closed（不 fail-open 成无过期）**：缺省/非法（非数 / bool / 非有限 / ≤0 / 巨值溢出 float）一律
+  回落机制默认 300s 并记审计警告；非法每动作 TTL 只警告 + 回落包默认，**不** broken 审批门（与 approvals
+  项本身形状错区分）。`float(巨整数)` 溢出被拦——绝不让 `now + inf` 退化成永不过期。
+- **公仓 osca-cli lint 校验新字段**（决策⑥）：OSCA040 认 `default_ttl_seconds` 与每项 `ttl_seconds` 须正
+  有限数（秒），形状错误在装载前挡（policy 是笼子）；lint 合法判定与 host `policy._parse_ttl` 逐条一致。
+  样例包 `oper-diagnosis.osca` 增 TTL 配置示例（default 900s + 该动作 1800s）。
+- **诚实标注**：参考默认 300s 只是占位口径——**真实人审节奏仍由部署侧按 IM 实况设**。
+- 门禁全绿：host 261 passed + cli 146 passed，ruff check + format 双绿。红笔纠偏：`default_ttl_seconds`
+  **不能**塞进 approvals list（list 且 lint/host 要求每项含 action+approver，塞进去会触发审批门 fail-closed
+  全拒）——故包级默认另起顶层键。W6 余片：secret 解析（W6-2）/ 真实执行器（W6-3）/ 人类可读 payload（W6-4）。

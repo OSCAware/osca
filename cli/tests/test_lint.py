@@ -281,6 +281,31 @@ def test_osca040_judgment_signature_incomplete(make_pkg, base):
     assert "OSCA040" in rules_hit(lint_package(make_pkg(base)))
 
 
+# ── 审批授权 TTL（W6-1：default_ttl_seconds 顶层 + approvals 每项 ttl_seconds，须正有限数秒） ──
+
+
+def test_osca040_default_ttl_seconds_rejects_illegal(make_pkg, base):
+    """形状错误在装载前挡（policy 是笼子）——与 host policy._parse_ttl 的合法判定一致。"""
+    for bad in (-5, 0, "banana", float("inf"), float("nan"), True, 10**400):
+        base["policy.yaml"]["default_ttl_seconds"] = bad
+        assert "OSCA040" in rules_hit(lint_package(make_pkg(base))), f"未拒绝非法 default_ttl_seconds={bad!r}"
+
+
+def test_osca040_default_ttl_seconds_valid_passes(make_pkg, base):
+    base["policy.yaml"]["default_ttl_seconds"] = 900
+    assert "OSCA040" not in rules_hit(lint_package(make_pkg(base)))
+
+
+def test_osca040_approval_ttl_seconds_rejects_illegal(make_pkg, base):
+    base["policy.yaml"]["approvals"] = [{"action": "改价", "approver": "店长", "ttl_seconds": 0}]
+    assert "OSCA040" in rules_hit(lint_package(make_pkg(base)))
+
+
+def test_osca040_approval_ttl_seconds_valid_passes(make_pkg, base):
+    base["policy.yaml"]["approvals"] = [{"action": "改价", "approver": "店长", "ttl_seconds": 1800}]
+    assert "OSCA040" not in rules_hit(lint_package(make_pkg(base)))
+
+
 # ── 总函数纪律：任意 YAML 形状只报错、不崩溃 ──
 
 SHAPE_MUTATIONS = [

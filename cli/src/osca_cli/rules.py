@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections import defaultdict
 from collections.abc import Callable
@@ -578,6 +579,21 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
         m = policy.mapping
         if not m.get("policy_version"):
             findings.append(_err("OSCA040", "policy.yaml", "缺少必填字段 policy_version"))
+
+        def _bad_ttl(value: object) -> bool:
+            """审批授权 TTL（W6-1）：须为正有限数（秒）。非数/bool/非有限/≤0/巨值溢出 float 皆非法——
+            与 host policy._parse_ttl 的合法判定一致（形状错误在装载前挡，policy 是笼子）。"""
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return True
+            try:
+                f = float(value)
+            except (OverflowError, ValueError):
+                return True
+            return not math.isfinite(f) or f <= 0
+
+        dt = m.get("default_ttl_seconds")
+        if dt is not None and _bad_ttl(dt):
+            findings.append(_err("OSCA040", "policy.yaml", "default_ttl_seconds 必须是正数（审批授权过期秒数）"))
         # policy 是笼子：形状错误在装载前就要挡下——运行时构造器按这些形状取值
         for key in ("permissions", "approvals", "kill_switch"):
             v = m.get(key)
@@ -654,6 +670,10 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
             ):
                 findings.append(
                     _err("OSCA040", "policy.yaml", f"approvals 第 {i + 1} 项必须是含 action/approver 字符串的 mapping")
+                )
+            elif (ttl := a.get("ttl_seconds")) is not None and _bad_ttl(ttl):
+                findings.append(
+                    _err("OSCA040", "policy.yaml", f"approvals 第 {i + 1} 项 ttl_seconds 必须是正数（授权过期秒数）")
                 )
         kill_switch = m.get("kill_switch")
         for i, k in enumerate(kill_switch if isinstance(kill_switch, list) else []):
