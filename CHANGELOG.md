@@ -592,3 +592,23 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
 - **立身口径**：脱敏在 host 侧、桥接只呈现再叠显示安全；诚实标注。门禁全绿：host 299 passed + oscapipe 332 passed
   （+对抗审查回归：键注入中和/截断不断 span/键位 PII 脱敏）+ 两仓 ruff check/format 双绿。**W6 四片全收（TTL /
   secret / 真实执行器 / 人类可读 payload）；真实写连接器语义化样例 + 端到端演练 + tag v1.1 属 W7。**
+
+## [M6-W6 · GPT 外审收口（2 blocker + 6 major + 1 general 全修）] - 2026-07-20
+GPT 外审（范围 `e48c42c..a0a02f0`）判「暂不建议发布」，8 条全部真跑复现确认后逐条修 + 回归（host 308 + cli 149 绿）：
+- **[blocker] 写审批被 HTTP method 绕过**：读连接器（`write: forbidden`，无审批门）+ 接口 `method: POST/DELETE` →
+  openapi 执行器真写、绕审批门。修：执行器强制读路径只允 GET/HEAD（写 method fail-closed）+ cli lint 挡 forbidden
+  连接器的写 method。
+- **[blocker] egress 校验主机 ≠ 实连主机**：`openapi://allowed@evil/x` 正则校验 allowed、urllib 实连 evil、secret
+  送错家。修：endpoint authority 含 userinfo（`@`）一律拒（凭据走 secret_ref 不入 URL；egress 与实连主机一致）。
+- **[major] `mode=ro` 非完整只读沙箱**：单条 `VACUUM INTO` / `ATTACH DATABASE` 实测能建新文件。修：加 SQLite
+  **authorizer**，执行面收窄到 SELECT/READ/FUNCTION，ATTACH/VACUUM/写/PRAGMA 一律 DENY（授权器 + 连接模式双闸）。
+- **[major] 空 `secret_ref` 绕 fail-closed**：`secret_ref: "" / 0 / false` 按「无需凭据」放行。修：区分「键不存在=
+  无凭据」与「键存在但空/非法=误配→拒」。
+- **[major] 反射型 API 回显 secret 进回执/剧集**：远端回显 Authorization/token → secret 进 payload（PII 脱敏认不出）。
+  修：connector 层用**本次** secret 值抹回执（键与值同抹——自审补漏：secret 可被回显成 JSON 键）。
+- **[major] `openapi://` 明文发 Bearer**：修：携带 secret 走非 https 且非本地回环 → fail-closed（生产须 https）。
+- **[major] 脱敏后 dict 键碰撞静默丢字段**：两不同 PII 键脱成同一标记 → 塌成一个（读回执/审批展示丢字段）。修：
+  碰撞加稳定后缀，保序保全字段（此前 W6-4 曾「接受碰撞」，现按外审properly 修）。
+- **[general] 重复 action 残留上一条 TTL**：修：解析每项前先清旧 TTL 覆盖（非法/缺省回落包默认）+ cli lint 禁重复 action。
+- **诚实标注**：均测 fake 后端（本地 sqlite/http.server/桩），生产真系统验证仍归部署侧（1.1）。门禁全绿：host 308
+  passed + cli 149 passed（+8 条外审回归 + 授权器/method/userinfo/scrub 自审探测）+ 两仓 ruff check/format 双绿。

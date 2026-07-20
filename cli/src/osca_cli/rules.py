@@ -493,6 +493,18 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
             bad_shape(f, "permissions", perms, "mapping（write 权限声明）")
         elif (perms or {}).get("write") not in ("forbidden", "allowed_with_approval"):
             findings.append(_err("OSCA040", f.relpath, "permissions.write 必须是 forbidden 或 allowed_with_approval"))
+        # 读连接器（write: forbidden）接口不得声明写 method（GPT 外审：否则 method:POST 绕审批门真写）；运行时也拦
+        if isinstance(perms, dict) and perms.get("write") == "forbidden":
+            for i, itf in enumerate(itfs or []):
+                method = itf.get("method") if isinstance(itf, dict) else None
+                if isinstance(method, str) and method.upper() not in ("GET", "HEAD"):
+                    findings.append(
+                        _err(
+                            "OSCA040",
+                            f.relpath,
+                            f"接口第 {i + 1} 条：write: forbidden 连接器不得用写 method {method}（绕审批门）",
+                        )
+                    )
 
     for f in pkg.typed_files("aware"):
         if f.parse_error:
@@ -662,6 +674,7 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
                     )
                 )
         approvals = m.get("approvals")
+        seen_actions: set[str] = set()
         for i, a in enumerate(approvals if isinstance(approvals, list) else []):
             if (
                 not isinstance(a, dict)
@@ -671,10 +684,17 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
                 findings.append(
                     _err("OSCA040", "policy.yaml", f"approvals 第 {i + 1} 项必须是含 action/approver 字符串的 mapping")
                 )
-            elif (ttl := a.get("ttl_seconds")) is not None and _bad_ttl(ttl):
+                continue
+            if (ttl := a.get("ttl_seconds")) is not None and _bad_ttl(ttl):
                 findings.append(
                     _err("OSCA040", "policy.yaml", f"approvals 第 {i + 1} 项 ttl_seconds 必须是正数（授权过期秒数）")
                 )
+            # action 须唯一（GPT 外审）：重复 action 会致 approver/TTL 覆盖歧义（后一条覆盖前一条）
+            if a["action"] in seen_actions:
+                findings.append(
+                    _err("OSCA040", "policy.yaml", f"approvals 第 {i + 1} 项 action「{a['action']}」重复——须唯一")
+                )
+            seen_actions.add(a["action"])
         kill_switch = m.get("kill_switch")
         for i, k in enumerate(kill_switch if isinstance(kill_switch, list) else []):
             if not isinstance(k, dict) or not isinstance(k.get("when"), str) or not k.get("when").strip():

@@ -302,6 +302,28 @@ def test_approval_display_redacts_pii_in_dict_keys():
     assert dto["payload_digest"] == _digest(original)  # digest 仍绑原始键（未脱）
 
 
+def test_redact_key_collision_keeps_all_fields():
+    """GPT 外审：两个不同 PII 键脱成同一标记 → 不静默塌成一个（读回执/审批展示丢字段）→ 后缀消歧、保全全字段。"""
+    p = make()  # POLICY: data.redact=[身份证号,手机号]
+    out, _ = p.redact({"手机13800138000": "A", "手机13900139000": "B"})
+    assert len(out) == 2 and set(out.values()) == {"A", "B"}  # 两字段都在，未塌成一个
+
+
+def test_duplicate_action_does_not_inherit_prev_ttl():
+    """GPT 外审：重复 action 覆盖 approver 时**清旧 TTL 覆盖**——后一条非法/缺省 TTL 回落包默认，不继承前一条。"""
+    policy = {
+        **POLICY,
+        "default_ttl_seconds": 600,
+        "approvals": [
+            {"action": "终稿发送管理层", "approver": "甲", "ttl_seconds": 1800},
+            {"action": "终稿发送管理层", "approver": "乙", "ttl_seconds": "非法"},
+        ],
+    }
+    p = make(policy)
+    assert p.approvals["终稿发送管理层"] == "乙"  # 后一条 approver 生效
+    assert _pending_ttl(p) == pytest.approx(600.0)  # TTL 回落包默认 600，不继承前一条 1800
+
+
 def test_redaction():
     p = make()
     payload = {"rows": [{"经办": "张三 13812345678", "证件": "110101199001011234"}]}

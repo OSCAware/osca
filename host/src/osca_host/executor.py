@@ -56,12 +56,28 @@ class Executor(Protocol):
     ) -> tuple[object, str | None]: ...
 
 
+# 只读授权器（GPT 外审收口）：`mode=ro` 只护**主库**——VACUUM INTO / ATTACH DATABASE / 写 PRAGMA 仍能建新文件、
+# 改 schema（已实测）。授权器把执行面收窄到 SELECT / READ / FUNCTION，其余（ATTACH/写/PRAGMA/VACUUM…）一律 DENY——
+# 只读靠**授权器 + 连接模式双闸**，非关键字黑名单。授权器动作码走 sqlite3 常量（缺失回退稳定 ABI 整数）。
+_RO_ALLOWED = frozenset(
+    {
+        getattr(sqlite3, "SQLITE_SELECT", 21),
+        getattr(sqlite3, "SQLITE_READ", 20),
+        getattr(sqlite3, "SQLITE_FUNCTION", 31),
+    }
+)
+
+
+def _readonly_authorizer(action, _arg1, _arg2, _dbname, _source):
+    return sqlite3.SQLITE_OK if action in _RO_ALLOWED else sqlite3.SQLITE_DENY
+
+
 class SqlReadonlyExecutor:
-    """sql_readonly 参考适配器（sqlite）：只读连接（`mode=ro`）跑包内固化 impl SQL，params 作参数化命名绑定。
+    """sql_readonly 参考适配器（sqlite）：只读连接（`mode=ro` + 授权器）跑包内固化 impl SQL，params 参数化命名绑定。
 
     生产 postgres/mysql 只读角色驱动由部署侧按 `Executor` 协议注入（用 secret 建只读连接）。参考适配器读
-    本地 sqlite 文件（endpoint 的 path 部分），本地无鉴权、不用 secret。只读强制靠 `mode=ro` 连接——
-    任何写 SQL 被 sqlite 天然拒（不靠黑名单）。"""
+    本地 sqlite 文件（endpoint 的 path 部分），本地无鉴权、不用 secret。只读强制靠 **`mode=ro` 连接 + 授权器
+    双闸**——写 SQL / ATTACH / VACUUM / 写 PRAGMA 一律拒（mode=ro 单独只护主库，不够；不靠关键字黑名单）。"""
 
     def execute(self, *, endpoint, interface, params, secret, is_write, pack_root):
         if is_write:
@@ -84,7 +100,8 @@ class SqlReadonlyExecutor:
         bind = defaultdict(lambda: None, params) if isinstance(params, dict) else defaultdict(lambda: None)
         conn = None
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)  # 只读连接（连接模式强制，非关键字过滤）
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)  # 只读连接（连接模式，非关键字过滤）
+            conn.set_authorizer(_readonly_authorizer)  # 第二闸：拒 ATTACH/VACUUM/写 PRAGMA（mode=ro 只护主库不够）
             conn.row_factory = sqlite3.Row
             rows = [dict(r) for r in conn.execute(sql, bind).fetchall()]  # 参数化绑定（防注入）
             return rows, None
@@ -106,6 +123,16 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
+_READ_METHODS = frozenset({"GET", "HEAD"})  # 读路径只允许这些 HTTP method（其余属写，须过审批门）
+_LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})  # 本地回环——secret 走明文 http 仅限于此（参考适配器测试）
+
+
+def _host_only(netloc: str) -> str:
+    """netloc → host（去 port / IPv6 括号；userinfo 已在 connector 拒，此处无 @）。用于回环判定。"""
+    if netloc.startswith("["):  # IPv6：[::1] 或 [::1]:port
+        return netloc[1 : netloc.index("]")] if "]" in netloc else netloc
+    return netloc.rsplit(":", 1)[0] if ":" in netloc else netloc
+
 
 class OpenapiExecutor:
     """openapi 参考适配器（urllib，无三方依赖）：method + path + params 从接口 manifest 取，secret 作
@@ -117,8 +144,21 @@ class OpenapiExecutor:
         if not isinstance(method, str) or not method:
             method = "POST" if is_write else "GET"  # 未声明 method：写默认 POST，读默认 GET
         method = method.upper()
+        # method 与写权限一致性（GPT 外审 blocker 收口）：读连接器（is_write=False，无审批门）**不得**用写 method——
+        # 否则 `write: forbidden` + `method: POST/DELETE` 绕过审批门真实写。写须走写连接器 + 审批门（B.4）。
+        if not is_write and method not in _READ_METHODS:
+            return (
+                None,
+                f"读路径（write: forbidden）不得用写 method {method}——绕过审批门；写须走写连接器 + 审批门（B.4）",
+            )
         ep_scheme, netloc, _ = _split_endpoint(endpoint)
         scheme = "https" if ep_scheme == "https" else "http"  # openapi:// 参考适配器映射 http；https:// 直用
+        # 携带 secret 却非 https 且非本地回环（GPT 外审收口）→ fail-closed：明文外发凭据风险，生产用 https://。
+        if secret and scheme != "https" and _host_only(netloc) not in _LOOPBACK:
+            return (
+                None,
+                "openapi 携带 secret 却走非 https（且非本地回环）——fail-closed：凭据明文外发风险，生产须 https://",
+            )
         # path **强制以 / 开头**——否则 manifest path（如 ".evil.com/x" / "evil/x"）会向右延展 netloc、把真实连接
         # host 引到 egress 从未校验的主机、并把 secret Bearer 送过去（对抗审查 blocker）。锚定后 path 不注入 authority。
         raw_path = interface.get("path")

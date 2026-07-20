@@ -346,6 +346,55 @@ def test_real_sql_readonly_read_end_to_end(sample_pack, tmp_path):
     ]  # 只回 2026-07 的甲厂（命名参数过滤生效），乙厂 2026-06 被过滤
 
 
+def test_userinfo_in_endpoint_rejected(sample_pack):
+    """GPT 外审 blocker：endpoint authority 含 userinfo（@）→ 拒（egress 抽 allowed、urllib 实连 evil）。"""
+    resolver = _StaticResolver({"K": "v"})
+    proxy = _real_proxy(
+        sample_pack,
+        {"FINANCE_DB": {"endpoint": "openapi://allowed.example@evil.example/x", "secret_ref": "K"}},
+        resolver=resolver,
+        allow="allowed.example",
+    )
+    r = proxy.call("CON-001.拉取费用明细", step=None)
+    assert not r.ok and "userinfo" in r.error
+    assert resolver.asked == []  # 在 egress/secret 之前即拒——不解析凭据
+
+
+def test_empty_or_illegal_secret_ref_fails_closed(sample_pack):
+    """GPT 外审：binding 声明 secret_ref 但为空/非字符串（"" / 0 / false）→ fail-closed（区分「键不存在」）。"""
+    for bad in ("", 0, False, 123):
+        ex = _RecordingExecutor()
+        proxy = _real_proxy(
+            sample_pack, {"FINANCE_DB": {"endpoint": SQL_RO_EP, "secret_ref": bad}}, executors={"sql_readonly": ex}
+        )
+        r = proxy.call("CON-001.拉取费用明细", step=None)
+        assert not r.ok and "secret_ref" in r.error, repr(bad)
+        assert ex.received_secret == "UNSET"  # fail-closed，从未分派执行器
+
+
+def test_reflected_secret_scrubbed_from_receipt(sample_pack):
+    """GPT 外审：反射型 API 回显 secret（Bearer/token）→ connector 用**本次** secret 值抹掉，不进回执/剧集/审计。"""
+    sentinel = "TKN-reflected-secret-xyz"
+
+    class _ReflectExecutor:
+        def execute(self, *, secret, **kw):
+            # 远端回显凭据到值、嵌套、列表，甚至 JSON **键**
+            return {"echo_auth": f"Bearer {secret}", "nest": {"k": [f"x{secret}y"]}, secret: "in-key"}, None
+
+    resolver = _StaticResolver({"K": sentinel})
+    proxy = _real_proxy(
+        sample_pack,
+        {"FINANCE_DB": {"endpoint": SQL_RO_EP, "secret_ref": "K"}},
+        resolver=resolver,
+        executors={"sql_readonly": _ReflectExecutor()},
+    )
+    r = proxy.call("CON-001.拉取费用明细", step=None)
+    assert r.ok
+    blob = repr(r.__dict__) + repr(proxy.policy.audit)
+    assert sentinel not in blob  # 反射的 secret 被抹，不进回执/审计
+    assert "***secret已脱敏***" in repr(r.payload)  # 抹成标记（证明确实清洗了、非碰巧不含）
+
+
 def test_executor_exception_never_crashes_call_no_leak(sample_pack):
     """对抗审查捉·契约：执行器抛任意异常绝不炸穿 call()（恒回 Receipt）；异常内文（可能含连接串/secret）不外泄。
     覆盖 sqlite3.Warning（多语句）/ http.client 截断响应 / MemoryError / 可插拔生产驱动的意外异常。"""

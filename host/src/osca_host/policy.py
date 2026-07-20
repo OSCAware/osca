@@ -182,7 +182,9 @@ class PolicyInterceptor:
         for a in approvals_raw if isinstance(approvals_raw, list) else []:
             if isinstance(a, dict) and isinstance(a.get("action"), str) and isinstance(a.get("approver"), str):
                 self.approvals[a["action"]] = a["approver"]
-                # 每动作 TTL 覆盖（W6-1，可选）：非法值 _parse_ttl 记警告并回落包默认/300，不入表、不 broken 审批门
+                # 每动作 TTL 覆盖（W6-1，可选）：非法值 _parse_ttl 记警告并回落包默认/300，不入表、不 broken 审批门。
+                # 重复 action **先清旧覆盖**（GPT 外审收口）：后一条非法/缺省 TTL 不许继承前一条，回落包默认。
+                self.approval_ttls.pop(a["action"], None)
                 ttl = self._parse_ttl(a.get("ttl_seconds"), f"approvals[{a['action']}].ttl_seconds")
                 if ttl is not None:
                     self.approval_ttls[a["action"]] = ttl
@@ -573,7 +575,18 @@ class PolicyInterceptor:
                     hits += n
                 return node
             if isinstance(node, dict):
-                return {walk(k): walk(v) for k, v in node.items()}  # 键与值同脱（非 str 键 walk 原样返回）
+                # 键与值同脱（非 str 键 walk 原样返回）。脱敏后键**碰撞消歧**（GPT 外审收口）：两个不同 PII 键脱成
+                # 同一标记不许静默塌成一个（读回执/审批展示丢字段）——碰撞即加稳定后缀，保序保全字段。
+                out: dict = {}
+                for k, v in node.items():
+                    rk = walk(k)
+                    if rk in out and isinstance(rk, str):
+                        i = 2
+                        while f"{rk}#{i}" in out:
+                            i += 1
+                        rk = f"{rk}#{i}"
+                    out[rk] = walk(v)
+                return out
             if isinstance(node, list):
                 return [walk(v) for v in node]
             return node

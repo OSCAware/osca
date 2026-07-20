@@ -86,6 +86,20 @@ def test_sql_readonly_refuses_write_path(tmp_path):
     assert rows is None and "只读" in err
 
 
+def test_sql_readonly_authorizer_denies_attach_and_vacuum(tmp_path):
+    """GPT 外审：`mode=ro` 只护主库——单条 VACUUM INTO / ATTACH DATABASE 能建新文件。授权器一并拒、不建文件。"""
+    db = _make_fee_db(tmp_path)
+    for stmt, made in (
+        (f"VACUUM INTO '{tmp_path / 'v.db'}'", "v.db"),
+        (f"ATTACH DATABASE '{tmp_path / 'a.db'}' AS x", "a.db"),
+    ):
+        impl = tmp_path / "bad.sql"
+        impl.write_text(stmt, encoding="utf-8")
+        rows, err = _run_sql(db, "bad.sql", {}, pack_root=tmp_path)
+        assert rows is None and err is not None, stmt  # 被授权器拒
+        assert not (tmp_path / made).exists(), f"{stmt} 建成了文件（授权器未拦）"
+
+
 def test_sql_readonly_missing_impl_errors(tmp_path):
     rows, err = _run_sql(_make_fee_db(tmp_path), "sql/nope.sql", {})
     assert rows is None and "impl SQL 缺失" in err
@@ -190,6 +204,32 @@ def test_openapi_secret_becomes_bearer_header(http_addr):
 def test_openapi_no_secret_no_auth_header(http_addr):
     payload, err = _run_http(http_addr, {"method": "GET", "path": "/data"}, {}, secret=None)
     assert err is None and payload["auth"] is None
+
+
+def test_openapi_read_path_rejects_write_method(http_addr):
+    """GPT 外审 blocker：读路径（is_write=False）用写 method（POST/DELETE…）→ fail-closed，否则绕审批门真写。"""
+    for m in ("POST", "DELETE", "PUT", "PATCH"):
+        payload, err = _run_http(http_addr, {"method": m, "path": "/write"}, {"x": 1}, is_write=False)
+        assert payload is None and "绕过审批门" in err, m
+
+
+def test_openapi_secret_over_nonhttps_nonloopback_fails_closed():
+    """GPT 外审：携带 secret 走非 https 且非本地回环 → fail-closed（凭据明文外发风险），fail-closed 前不外呼。"""
+    payload, err = OpenapiExecutor().execute(
+        endpoint="openapi://api.example.com",
+        interface={"method": "GET", "path": "/x"},
+        params={},
+        secret="TKN",
+        is_write=False,
+        pack_root=Path("."),
+    )
+    assert payload is None and "https" in err
+
+
+def test_openapi_secret_over_http_loopback_allowed(http_addr):
+    """本地回环允许 http + secret（参考适配器本地测试面）。"""
+    payload, err = _run_http(http_addr, {"method": "GET", "path": "/data"}, {}, secret="TKN")
+    assert err is None and payload["auth"] == "Bearer TKN"
 
 
 def test_openapi_post_writes_body(http_addr):

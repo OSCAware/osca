@@ -31,6 +31,19 @@ from osca_host.secret_resolver import EnvVarSecretResolver, SecretResolver
 ENDPOINT_HOST = re.compile(r"^[a-z+_]+://([^/:@]+@)?([A-Za-z0-9.-]+)")
 
 
+def _scrub_secret(node: object, secret: str) -> object:
+    """递归把回执里出现的 secret 值抹成标记——防反射型 API（回显 Authorization/token）把凭据带进回执/剧集。
+    只在 connector 层（持有本次 secret 值）做；执行器不见回执注入前的脱敏面。"""
+    if isinstance(node, str):
+        return node.replace(secret, "***secret已脱敏***") if secret in node else node
+    if isinstance(node, dict):
+        # 键**与值同抹**（自审补漏）——反射型 API 可能把 secret 回显成 JSON 键，只抹值会漏
+        return {_scrub_secret(k, secret): _scrub_secret(v, secret) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_scrub_secret(v, secret) for v in node]
+    return node
+
+
 @dataclass
 class Receipt:
     """一次 Connector 调用的回执。"""
@@ -193,18 +206,29 @@ class ConnectorProxy:
 
         顺序即防御纵深：egress 拒则不解析凭据、不外呼；secret 取不到则不分派执行器。secret 值解析后
         **只传给执行器**（建连接/鉴权），绝不进回执/日志/剧集。"""
+        # authority 含 userinfo（@）即拒（GPT 外审 blocker 收口）：egress 正则抽 `allowed@evil` 得 allowed、urllib 实连
+        # evil——校验主机 ≠ 实连主机、secret 送错家。真实 endpoint 无 userinfo（凭据走 secret_ref 不入 URL）。
+        authority = endpoint.split("://", 1)[1].split("/", 1)[0] if "://" in endpoint else ""
+        if "@" in authority:
+            return (
+                None,
+                "endpoint authority 含 userinfo（@）——拒绝：egress 校验主机与实连主机不一致风险；凭据走 secret_ref",
+            )
         m = ENDPOINT_HOST.match(endpoint)
         host = m.group(2) if m else endpoint
         ok, reason = self.policy.authorize_egress(host)
         if not ok:
             return None, reason
-        # secret 前置（W6-2，三不：值不进包/日志/剧集）：binding 声明了 secret_ref → 必须解析出非空值，否则
-        # fail-closed（错误只带名、绝不带值）。值绑到局部、只往下传给执行器。
-        secret_ref = binding.get("secret_ref")
+        # secret 前置（W6-2，三不：值不进包/日志/剧集）：binding **声明了** secret_ref（键存在）→ 必须是合法非空字符串、
+        # 且解析出非空值，否则 fail-closed（错误只带名）。区分「键不存在=无需凭据」与「键存在但空/非法=误配→拒」
+        # （GPT 外审收口：旧 `if secret_ref` 让 secret_ref: "" / 0 / false 按无凭据放行）。值绑局部、只传给执行器。
         secret: str | None = None
-        if secret_ref:
+        if "secret_ref" in binding:
+            secret_ref = binding["secret_ref"]
+            if not isinstance(secret_ref, str) or not secret_ref:
+                return None, "binding 声明 secret_ref 但为空/非字符串——fail-closed（无凭据应删该字段，不留空/非法值）"
             try:
-                secret = self.secret_resolver.resolve(str(secret_ref))
+                secret = self.secret_resolver.resolve(secret_ref)
             except Exception:
                 # resolver 抛错（vault 超时/鉴权失败等）即 fail-closed（宁可拒不可炸，call() 恒回 Receipt）；错误串
                 # **绝不带异常内文**——异常消息/栈可能含连接串或 token，带进来即踩穿「值永不进日志」。
@@ -227,7 +251,7 @@ class ConnectorProxy:
         if executor is None:
             return None, f"不识别的 endpoint scheme「{scheme}」——fail-closed（无对应执行器；生产驱动由部署侧注入）"
         try:
-            return executor.execute(
+            payload, error = executor.execute(
                 endpoint=endpoint,
                 interface=itf,
                 params=params,
@@ -240,3 +264,8 @@ class ConnectorProxy:
             # sqlite3.Warning 多语句、http.client 截断响应、MemoryError 巨响应体）统一转 fail-closed 回执。
             # 错误串**绝不带异常内文**——异常消息/栈可能含连接串或 secret，带进来即踩穿「值永不进日志」。
             return None, f"「{scheme}」执行器执行异常——fail-closed（执行器不许炸穿；异常内文不外泄）"
+        # secret 反射清洗（GPT 外审收口）：反射型 API 回显 Authorization/token → secret 值进 payload → 进回执/剧集，
+        # 踩穿「值永不进剧集/回执」（脱敏只认 PII 正则、认不出 secret）。用**本次** secret 值把回执里的它抹掉。
+        if secret and payload is not None:
+            payload = _scrub_secret(payload, secret)
+        return payload, error

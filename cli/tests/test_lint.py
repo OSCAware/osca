@@ -306,6 +306,23 @@ def test_osca040_approval_ttl_seconds_valid_passes(make_pkg, base):
     assert "OSCA040" not in rules_hit(lint_package(make_pkg(base)))
 
 
+def test_osca040_duplicate_approval_action_rejected(make_pkg, base):
+    """GPT 外审：重复 action 致 approver/TTL 覆盖歧义——lint 挡下（运行时也清旧覆盖）。"""
+    base["policy.yaml"]["approvals"] = [{"action": "改价", "approver": "店长"}, {"action": "改价", "approver": "老板"}]
+    assert "OSCA040" in rules_hit(lint_package(make_pkg(base)))
+
+
+def test_osca040_forbidden_connector_rejects_write_method(make_pkg, base):
+    """GPT 外审 blocker：write: forbidden 连接器接口声明写 method（POST…）→ lint 挡（否则绕审批门真写）。"""
+    base["connectors/CON-001-数据源.yaml"]["interfaces"][0]["method"] = "POST"
+    assert "OSCA040" in rules_hit(lint_package(make_pkg(base)))
+
+
+def test_osca040_forbidden_connector_get_method_ok(make_pkg, base):
+    base["connectors/CON-001-数据源.yaml"]["interfaces"][0]["method"] = "GET"
+    assert "OSCA040" not in rules_hit(lint_package(make_pkg(base)))
+
+
 # ── 总函数纪律：任意 YAML 形状只报错、不崩溃 ──
 
 SHAPE_MUTATIONS = [
