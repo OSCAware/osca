@@ -32,15 +32,27 @@ ENDPOINT_HOST = re.compile(r"^[a-z+_]+://([^/:@]+@)?([A-Za-z0-9.-]+)")
 
 
 def _scrub_secret(node: object, secret: str) -> object:
-    """递归把回执里出现的 secret 值抹成标记——防反射型 API（回显 Authorization/token）把凭据带进回执/剧集。
-    只在 connector 层（持有本次 secret 值）做；执行器不见回执注入前的脱敏面。"""
+    """递归把 payload/error 里出现的 secret 值抹成标记——防反射型 API（回显 Authorization/token）把凭据带进
+    回执/剧集/日志。只在 connector 层（持有本次 secret 值）做。str/dict/list/tuple 全覆盖；键与值同抹。"""
     if isinstance(node, str):
         return node.replace(secret, "***secret已脱敏***") if secret in node else node
     if isinstance(node, dict):
-        # 键**与值同抹**（自审补漏）——反射型 API 可能把 secret 回显成 JSON 键，只抹值会漏
-        return {_scrub_secret(k, secret): _scrub_secret(v, secret) for k, v in node.items()}
+        # 键**与值同抹**（secret 可被回显成 JSON 键）；抹后键**碰撞消歧**（GPT 复审：`TOKEN` 与已存在的标记键塌成
+        # 一个会丢字段）——碰撞加稳定后缀，与 policy.redact 同口径，保序保全字段。
+        out: dict = {}
+        for k, v in node.items():
+            rk = _scrub_secret(k, secret)
+            if rk in out and isinstance(rk, str):
+                i = 2
+                while f"{rk}#{i}" in out:
+                    i += 1
+                rk = f"{rk}#{i}"
+            out[rk] = _scrub_secret(v, secret)
+        return out
     if isinstance(node, list):
         return [_scrub_secret(v, secret) for v in node]
+    if isinstance(node, tuple):  # 可插拔执行器可能回 tuple（GPT 复审：tuple 内 secret 原漏）
+        return tuple(_scrub_secret(v, secret) for v in node)
     return node
 
 
@@ -264,8 +276,10 @@ class ConnectorProxy:
             # sqlite3.Warning 多语句、http.client 截断响应、MemoryError 巨响应体）统一转 fail-closed 回执。
             # 错误串**绝不带异常内文**——异常消息/栈可能含连接串或 secret，带进来即踩穿「值永不进日志」。
             return None, f"「{scheme}」执行器执行异常——fail-closed（执行器不许炸穿；异常内文不外泄）"
-        # secret 反射清洗（GPT 外审收口）：反射型 API 回显 Authorization/token → secret 值进 payload → 进回执/剧集，
-        # 踩穿「值永不进剧集/回执」（脱敏只认 PII 正则、认不出 secret）。用**本次** secret 值把回执里的它抹掉。
-        if secret and payload is not None:
-            payload = _scrub_secret(payload, secret)
+        # secret 反射清洗（GPT 外审收口）：反射型 API 回显 Authorization/token → secret 值进 payload/error → 进回执/
+        # 剧集/日志，踩穿「值永不进剧集/回执」（脱敏只认 PII 正则、认不出 secret）。用**本次** secret 值抹掉。
+        # error 也抹（GPT 复审：可插拔执行器 error 串可能含凭据）——error 为 None 时 _scrub_secret 原样返回 None。
+        if secret:
+            payload = _scrub_secret(payload, secret) if payload is not None else payload
+            error = _scrub_secret(error, secret)
         return payload, error

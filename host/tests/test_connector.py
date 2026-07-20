@@ -378,8 +378,14 @@ def test_reflected_secret_scrubbed_from_receipt(sample_pack):
 
     class _ReflectExecutor:
         def execute(self, *, secret, **kw):
-            # 远端回显凭据到值、嵌套、列表，甚至 JSON **键**
-            return {"echo_auth": f"Bearer {secret}", "nest": {"k": [f"x{secret}y"]}, secret: "in-key"}, None
+            # 远端回显凭据到值、嵌套列表、JSON **键**、**tuple**，且键碰撞已存在的标记键（GPT 复审全覆盖）
+            return {
+                "echo_auth": f"Bearer {secret}",
+                "nest": {"k": [f"x{secret}y"]},
+                secret: "in-key",
+                "***secret已脱敏***": "pre-existing",  # 与 secret 键抹后碰撞
+                "tup": (f"t{secret}", 2),
+            }, None
 
     resolver = _StaticResolver({"K": sentinel})
     proxy = _real_proxy(
@@ -391,8 +397,29 @@ def test_reflected_secret_scrubbed_from_receipt(sample_pack):
     r = proxy.call("CON-001.拉取费用明细", step=None)
     assert r.ok
     blob = repr(r.__dict__) + repr(proxy.policy.audit)
-    assert sentinel not in blob  # 反射的 secret 被抹，不进回执/审计
-    assert "***secret已脱敏***" in repr(r.payload)  # 抹成标记（证明确实清洗了、非碰巧不含）
+    assert sentinel not in blob  # 反射的 secret（值/嵌套/键/tuple）全被抹，不进回执/审计
+    assert "***secret已脱敏***" in repr(r.payload)  # 抹成标记（证明确实清洗了）
+    assert len(r.payload) == 5  # 键碰撞未丢字段（后缀消歧）
+
+
+def test_reflected_secret_scrubbed_from_executor_error(sample_pack):
+    """GPT 复审：secret 也可能进 executor 的 error 串（可插拔驱动把连接串塞 error）——Receipt.error 须抹。"""
+    sentinel = "TKN-err-xyz"
+
+    class _ErrExecutor:
+        def execute(self, *, secret, **kw):
+            return None, f"driver connect failed: postgres://u:{secret}@h/db"
+
+    resolver = _StaticResolver({"K": sentinel})
+    proxy = _real_proxy(
+        sample_pack,
+        {"FINANCE_DB": {"endpoint": SQL_RO_EP, "secret_ref": "K"}},
+        resolver=resolver,
+        executors={"sql_readonly": _ErrExecutor()},
+    )
+    r = proxy.call("CON-001.拉取费用明细", step=None)
+    assert not r.ok and sentinel not in r.error  # error 串里的 secret 被抹
+    assert "***secret已脱敏***" in r.error
 
 
 def test_executor_exception_never_crashes_call_no_leak(sample_pack):

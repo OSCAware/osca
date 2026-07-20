@@ -593,6 +593,16 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
   （+对抗审查回归：键注入中和/截断不断 span/键位 PII 脱敏）+ 两仓 ruff check/format 双绿。**W6 四片全收（TTL /
   secret / 真实执行器 / 人类可读 payload）；真实写连接器语义化样例 + 端到端演练 + tag v1.1 属 W7。**
 
+## [M6-W6 · GPT 复审收口（原 8 条已闭合，补 3 残留）] - 2026-07-20
+GPT 复审确认原 8 条在内置执行器主路径已闭合，对抗复测捉 3 残留（均在上一轮我的修复里），真跑复现后修 + 回归（host 310 绿）：
+- **[major] secret 清洗漏 executor error 与 tuple payload**：`_execute_real` 只抹 payload——可插拔驱动回 `error=
+  "...TOKEN..."` 时 TOKEN 进 `Receipt.error`；payload 里的 tuple 也没递归。修：error 也抹 + `_scrub_secret` 支持 tuple。
+- **[general] secret 抹成键时再次碰撞丢字段**：`{"TOKEN":"A","***secret已脱敏***":"B"}` 抹后塌成一个。修：`_scrub_secret`
+  dict 分支加碰撞后缀消歧（与 `policy.redact` 同口径），保序保全字段。
+- **[general] SQLite 授权器误拒合法递归 CTE**：`WITH RECURSIVE … SELECT` 实测 DatabaseError（普通 SELECT/CTE/UNION/
+  子查询/窗口/聚合均通过）。修：授权器放行 `SQLITE_RECURSIVE`（只读、不开写；VACUUM/ATTACH/写仍拒，已回归复核）。
+- 门禁全绿：host 310 passed（+error 抹/tuple/键碰撞/递归 CTE 回归）+ ruff check/format 双绿。两 blocker 在默认执行链确认已关。
+
 ## [M6-W6 · GPT 外审收口（2 blocker + 6 major + 1 general 全修）] - 2026-07-20
 GPT 外审（范围 `e48c42c..a0a02f0`）判「暂不建议发布」，8 条全部真跑复现确认后逐条修 + 回归（host 308 + cli 149 绿）：
 - **[blocker] 写审批被 HTTP method 绕过**：读连接器（`write: forbidden`，无审批门）+ 接口 `method: POST/DELETE` →

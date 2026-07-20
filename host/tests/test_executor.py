@@ -86,6 +86,17 @@ def test_sql_readonly_refuses_write_path(tmp_path):
     assert rows is None and "只读" in err
 
 
+def test_sql_readonly_authorizer_allows_recursive_cte(tmp_path):
+    """GPT 复审：授权器须放行合法 WITH RECURSIVE CTE（SQLITE_RECURSIVE，只读、不开写）——别把普通读之外误拒。"""
+    db = _make_fee_db(tmp_path)
+    impl = tmp_path / "rec.sql"
+    impl.write_text(
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<3) SELECT n FROM c", encoding="utf-8"
+    )
+    rows, err = _run_sql(db, "rec.sql", {}, pack_root=tmp_path)
+    assert err is None and rows == [{"n": 1}, {"n": 2}, {"n": 3}]
+
+
 def test_sql_readonly_authorizer_denies_attach_and_vacuum(tmp_path):
     """GPT 外审：`mode=ro` 只护主库——单条 VACUUM INTO / ATTACH DATABASE 能建新文件。授权器一并拒、不建文件。"""
     db = _make_fee_db(tmp_path)

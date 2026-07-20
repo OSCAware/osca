@@ -64,6 +64,7 @@ _RO_ALLOWED = frozenset(
         getattr(sqlite3, "SQLITE_SELECT", 21),
         getattr(sqlite3, "SQLITE_READ", 20),
         getattr(sqlite3, "SQLITE_FUNCTION", 31),
+        getattr(sqlite3, "SQLITE_RECURSIVE", 33),  # 合法 WITH RECURSIVE CTE（只读，不开写；GPT 复审误拒收口）
     }
 )
 
