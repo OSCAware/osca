@@ -2,8 +2,8 @@
 
 模型只能按名调用，永不写 SQL、永不猜数。代理做三件事：
 1. manifest 契约校验：调用未声明的接口 = 接口漂移，当场爆炸（不猜、不兜底）；
-2. binding/secret 解析：binding 由部署环境注入（永不进包），secret 只解析名字、
-   值留在部署环境的 secret manager；
+2. binding/secret 解析：binding 由部署环境注入（永不进包）；secret 按 secret_ref 经可插拔
+   SecretResolver（默认 env-var）取值交执行器，值三不（不进包/日志/剧集）、取不到即 fail-closed；
 3. 调用与回执：每次调用产出一张回执（谁调的、走哪个 binding、结果如何），
    结果注入剧集前先过 Policy 脱敏。
 
@@ -23,8 +23,10 @@ import yaml
 
 from osca_host.loader import LoadedPackage
 from osca_host.policy import PolicyInterceptor
+from osca_host.secret_resolver import EnvVarSecretResolver, SecretResolver
 
-ENDPOINT_HOST = re.compile(r"^[a-z+]+://([^/:@]+@)?([A-Za-z0-9.-]+)")
+# scheme 允许 `_`（如 sql_readonly://）——否则含下划线的 scheme 主机名抽取落空、host=整串、egress 永远拒
+ENDPOINT_HOST = re.compile(r"^[a-z+_]+://([^/:@]+@)?([A-Za-z0-9.-]+)")
 
 
 @dataclass
@@ -45,10 +47,19 @@ class Receipt:
 
 
 class ConnectorProxy:
-    def __init__(self, loaded: LoadedPackage, bindings: dict, policy: PolicyInterceptor):
+    def __init__(
+        self,
+        loaded: LoadedPackage,
+        bindings: dict,
+        policy: PolicyInterceptor,
+        *,
+        secret_resolver: SecretResolver | None = None,
+    ):
         self.package_id = loaded.package_id
         self.bindings = bindings  # 部署环境注入的 binding 表（永不进包）
         self.policy = policy
+        # secret 解析器（W6-2）：默认 env-var 参考实现；部署侧可按 SecretResolver 协议注入 file/vault/callable。
+        self.secret_resolver = secret_resolver if secret_resolver is not None else EnvVarSecretResolver()
         # manifest 编译：接口按「CON-xxx.名字」扁平注册；漂移在这里当场暴露
         self.interfaces: dict[str, dict] = {}
         self.connectors: dict[str, dict] = {}
@@ -141,7 +152,7 @@ class ConnectorProxy:
                 else self._execute_mock(endpoint, interface_ref, itf)
             )
         else:
-            payload, error = self._execute_real(endpoint)
+            payload, error = self._execute_real(endpoint, binding)
         if error:
             return Receipt(ok=False, interface=interface_ref, binding_ref=binding_ref, error=error)
 
@@ -166,14 +177,33 @@ class ConnectorProxy:
     def _execute_mock_write(self, interface_ref: str, params: object) -> tuple[object, str | None]:
         """mock 写执行器（测试与全链路演练）：不落真实系统，回一张确定性 mock 写回执，回显被批准的
         被写内容（params）+ 落地标记。走通此路 = 审批闭环机制通，**非真实系统写验证**——真实
-        sql_readonly/openapi 写执行器属部署侧适配（W6/M6 对接约定，`_execute_real` 仍桩）。"""
+        sql_readonly/openapi 写执行器随 W6-3 接入（`_execute_real` 已过 egress + secret 前置，执行器分派仍桩）。"""
         return {"mock_write": interface_ref, "applied": params, "landed": True}, None
 
-    def _execute_real(self, endpoint: str) -> tuple[object, str | None]:
+    def _execute_real(self, endpoint: str, binding: dict) -> tuple[object, str | None]:
         m = ENDPOINT_HOST.match(endpoint)
         host = m.group(2) if m else endpoint
         ok, reason = self.policy.authorize_egress(host)
         if not ok:
             return None, reason
-        # secret 解析只到名字为止；真实执行器（sql_readonly/openapi/mcp）属部署侧适配（M6 对接约定）
-        return None, f"真实执行器未接入：endpoint 主机 {host} 已过 egress，执行适配随 M6 对接约定落地"
+        # secret 前置（W6-2，三不：值不进包/日志/剧集）：binding 声明了 secret_ref 却取不到值 → fail-closed，
+        # 错误只带名、绝不带值；resolver 返回值即用即弃（W6-3 执行器接入时才把值传入执行器建连接/带鉴权）。
+        secret_ref = binding.get("secret_ref")
+        if secret_ref:
+            try:
+                # 强制点自持 fail-closed，不信任 pluggable resolver 自律：None 或空串一律拒（契约 B.3「空串=没给凭据」
+                # 落在强制点，非只靠参考 resolver 的 `or None`）；`not` 用真值判定——真实凭据从不为空串。
+                if not self.secret_resolver.resolve(str(secret_ref)):
+                    return (
+                        None,
+                        f"secret「{secret_ref}」未在部署环境解析——fail-closed（凭据缺失即拒；值永不进包/日志/剧集）",
+                    )
+            except Exception:
+                # resolver 抛错（vault 超时/鉴权失败等）即 fail-closed（宁可拒不可炸，call() 恒回 Receipt）；错误串
+                # **绝不带异常内文**——异常消息/栈可能含连接串或 token，带进来即踩穿「值永不进日志」。
+                return (
+                    None,
+                    f"secret「{secret_ref}」解析出错——fail-closed（凭据取值失败即拒；值永不进包/日志/剧集）",
+                )
+        # 真实执行器（sql_readonly/openapi/mcp）随 W6-3 接入；此处仍桩（egress + secret 前置已生效、真跑）。
+        return None, f"真实执行器未接入：endpoint 主机 {host} 已过 egress + secret 前置，执行适配随 W6-3 落地"

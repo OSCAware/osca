@@ -142,7 +142,11 @@ W3 落地的是**机制**：绑定挑战状态机（approver / episode / payload
   sql_readonly/openapi 写执行器仍是桩（`_execute_real` 返回未接入），属部署侧适配（W6）。
 
 **仍待续（诚实标注）：**
-- **真实系统写**（W6-2/3）：真实 sql_readonly/openapi 执行器 + secret 解析。
+- **secret 解析 ✅**（W6-2）：可插拔 `SecretResolver`（默认 env-var，部署侧可注入 file/vault/callable）取值
+  交执行器，值**三不**（不进包/日志/剧集）；取不到 / 空串 / resolver 抛错一律 fail-closed（错误只带 secret_ref
+  名、绝不带值）；secret 前置在 egress **之后**（egress 拒则不解析凭据）。真系统 secret manager 取值归部署侧。
+- **真实系统写执行器**（W6-3）：真实 sql_readonly（只读强制）/ openapi（HTTP）执行器 + fake 后端测试；
+  现 `_execute_real` 已过 egress + secret 前置（真跑），执行器分派仍桩。
 - **审批卡人类可读脱敏 payload**（W6-4）：现仅给摘要；须呈现脱敏后的写内容原文供审批人拍板。
 - **TTL 按人审时延重估 ✅**（W6-1）：授权过期窗口从硬编码 300s 变 **policy 可配**——包级
   `default_ttl_seconds` + 每 action `ttl_seconds` 覆盖；缺省/非法一律 fail-closed 回落机制默认 300s

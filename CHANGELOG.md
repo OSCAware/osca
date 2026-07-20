@@ -538,3 +538,20 @@ Review M4-W0 复核三条新 P1 + 审批面暂闭 + 凭据协议收紧：
 - 门禁全绿：host 261 passed + cli 146 passed，ruff check + format 双绿。红笔纠偏：`default_ttl_seconds`
   **不能**塞进 approvals list（list 且 lint/host 要求每项含 action+approver，塞进去会触发审批门 fail-closed
   全拒）——故包级默认另起顶层键。W6 余片：secret 解析（W6-2）/ 真实执行器（W6-3）/ 人类可读 payload（W6-4）。
+
+## [Host M6-W6-2 · secret 解析（凭据面）] - 2026-07-20
+真写「变真」块（W6）第二片 secret 解析（高危凭据面，六 lens 对抗审查 → 逐条真跑核实 → 收口）：
+- **可插拔 SecretResolver**：新模块 `secret_resolver.py`——`SecretResolver` 协议 + 参考实现 `EnvVarSecretResolver`
+  （`secret_ref` 作环境变量名）；`ConnectorProxy` 构造可注入（默认 env-var，部署侧可换 file/vault/callable）。
+- **接线**：`_execute_real` 在 egress 之后做 secret 前置——binding 声明了 `secret_ref` 就必须解析出非空值，
+  否则 fail-closed；resolver 返回值即用即弃（真实执行器随 W6-3 接入才把值传入建连接）。修 `ENDPOINT_HOST`
+  正则 `[a-z+]→[a-z+_]`：否则 `sql_readonly://`（含下划线）主机名抽取落空、egress 永远拒、secret 前置不可达。
+- **三不（SPEC B.3）**：secret 值永不进包（binding 只有名字）/ 永不进日志（error/audit 只带 secret_ref 名）/
+  永不进剧集上下文·回执；哨兵值回归测试锁死「值不进回执/审计」。
+- **对抗审查捉 2 真缺陷（各由 2 个 lens 独立命中、真跑复现后修）**：① fail-closed 强制点原只判 `is None`，
+  但协议允许返回空串——注入型 resolver 返回 `""` 会绕过闸门（W6-3 拿空串建连接=fail-open）；改 `not resolve(...)`，
+  空串与 None 同 fail-closed，不信任 resolver 自律归一。② resolver 抛异常未捕获 → `call()` 崩溃（破坏「恒回
+  Receipt」），且异常内文可能含连接串被 host `log.exception` 写进日志（踩穿三不）；加 try/except → fail-closed，
+  错误串**绝不带异常内文**。另 3 lens（egress 顺序 / 正则安全 / 注入路径）真跑后无真问题。
+- **立身口径**：W6-2 建 resolver + 契约强制，测 fake（env 注入 / 桩 resolver）；真实 secret manager 取值连通
+  归部署侧（1.1/部署验收）。门禁全绿：host 273 passed（+2 对抗审查回归）+ ruff check/format 双绿。真实执行器（W6-3）。
