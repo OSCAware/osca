@@ -1,0 +1,13 @@
+object_id: OBJ-202
+name: 下发回执
+kind: artifact        # 写接口 returns：工单下发系统的受理回执
+version: 1
+
+definition: |
+  工单下发系统对一次下发的受理回执：受理状态 + 生成的工单号。
+  回执入剧集台账前经 Policy 脱敏；执行器对反射型 API 回显的凭据额外抹除（secret 三不）。
+
+schema:
+  受理状态: {type: enum, values: [accepted, rejected]}
+  工单号:   {type: string, desc: 受理后生成的工单编号}
+  受理时间: {type: string, format: "ISO-8601"}

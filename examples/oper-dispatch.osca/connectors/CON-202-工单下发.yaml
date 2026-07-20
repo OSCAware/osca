@@ -1,0 +1,23 @@
+connector_id: CON-202
+name: 工单下发系统
+kind: openapi                # 分派按 binding.endpoint 的 scheme（非 kind）；kind 是意图声明
+binding_ref: DISPATCH_API    # 写后端 binding（endpoint + secret_ref 由部署侧注入）
+
+# ── 为什么是写连接器（设计意图，给读包的人看）──
+rationale: |
+  下发处置工单是**高危写**：向工单下发系统建单会产生现实后果。
+  故声明 permissions.write: allowed_with_approval——运行时拦下模型自决的写，
+  向 policy 指定的处置审批人发一次性授权卡，批准后才真实下发（SPEC B.4）。
+  被写内容 = 上游取数算出的处置清单（params 穿透），审批卡呈脱敏人类可读原文供拍板。
+
+interfaces:
+
+  - name: 下发处置工单
+    method: POST               # 写 method；allowed_with_approval 连接器可合法声明（读连接器不得声明写 method）
+    path: /dispatch            # 执行器强制以 "/" 锚定；不声明 impl（impl 是 sql_readonly 固化查询用）
+    params: {ref: OBJ-201}     # 被写内容 schema（人类可读，喂 payload_display）
+    returns: {ref: OBJ-202}    # 下发回执（工单号 + 受理状态）
+
+permissions:
+  write: allowed_with_approval # 进写路径 + 审批门（一单一审批，一次性授权）
+  scope: 仅下发本集团处置工单，不触碰外部系统

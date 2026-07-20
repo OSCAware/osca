@@ -1,0 +1,33 @@
+# 笼子层：运行时强制执行，模型永不读取（设计公理 A5）。
+# 与 AGENT.md 的「劝告层」相对：模型被注入或被替换时，本文件仍然有效。
+policy_version: 1
+
+permissions:              # 按 pipeline 步骤的工具白名单（默认拒绝）
+  - step: 取数
+    allow: [CON-201.拉取待下发处置清单]
+  - step: 下发
+    allow: [CON-202.下发处置工单]     # 写步过工具白名单才触达写门（authorize_tool）
+
+egress:
+  # 默认全禁，白名单放行。写后端的**语义域**（占位；真实域由部署侧按实际网关定）。
+  # 演练打本地 fake http.server 时另在测试里注入 127.0.0.1（动态端口不进包）。
+  allow_domains: [dispatch.internal.example]
+
+data:
+  redact: [身份证号, 手机号]           # 注入剧集 / 审批卡显示前脱敏（payload_display 复用；digest 仍绑原文）
+  scope: 数据不出集团处置域
+
+default_ttl_seconds: 900              # 审批授权过期窗口默认 15 分钟——**占位口径**，部署侧按真实 IM 人审节奏重估
+approvals:
+  # ⚠️ action 必须**逐字等于写接口 interface_ref「CON-xxx.接口名」**——写审批按 ref 查 approver。
+  # 写成自由文本标签则写路径默认拒绝（静默死写路径）。lint OSCA025 兜此对应（W7 新加）。
+  - action: CON-202.下发处置工单
+    approver: 处置审批人                # 高危写审批挂管理层（架构 §7）
+    ttl_seconds: 1800                  # 该动作单独放宽到 30 分钟——占位口径，部署侧重估
+
+budgets:
+  per_episode: {max_tokens: 100k, max_tool_calls: 20}
+
+kill_switch:                          # 账本健康度即安全信号（设计公理 A10）
+  - when: 回放红灯率 > 20%
+    do: 挂起全部 watcher 并通知操作者

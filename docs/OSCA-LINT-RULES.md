@@ -29,6 +29,7 @@
 | OSCA022 | 警告 | osca.yaml requires.bindings 与各 connector 的 binding_ref 集合一致 | SPEC §1 |
 | OSCA023 | 警告 | policy 权限表的 step 名必须存在于 structure pipeline | SPEC §8 |
 | OSCA024 | 警告 | connector 接口声明的 impl 路径真实存在 | SPEC §6 层3 |
+| OSCA025 | 错误 | 写连接器（write: allowed_with_approval）的每个写接口 ref 必须在 policy.approvals 声明 approver（否则运行时写审批按 ref 查不到 approver，写路径静默死） | SPEC §6 / B.4 |
 
 ## 账本纪律
 

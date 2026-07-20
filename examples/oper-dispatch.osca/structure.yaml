@@ -1,0 +1,19 @@
+# 组合骨架 —— 刻意保持薄。
+# 纪律：流程只描述「什么喂给什么」，一切「怎么裁」留给判断层；此处无 if/else。
+# 本包聚焦写路径：取数（确定性算出待下发清单）→ 下发（写，经审批门）。
+
+structure_id: STR-201
+pipeline:
+
+  - step: 取数
+    performer: connector          # 确定性执行，模型不参与
+    uses: CON-201                 # 只读，固化查询算出待下发处置清单
+    produces: {ref: OBJ-201}
+
+  - step: 下发
+    performer: connector          # 写连接器：命中审批门 → 挂起等批 → approve 恢复消费落地
+    uses: CON-202.下发处置工单     # 写接口（method POST）；write: allowed_with_approval
+    input: {ref: OBJ-201}         # 被写内容 = 上游取数产物（params 穿透；摘要绑真实被写内容）
+    produces: {ref: OBJ-202}
+
+# 嵌套预留：若未来按业务线拆下发子流程，在此以 sub_agent 引用其独立 .osca 包，本文件不膨胀。

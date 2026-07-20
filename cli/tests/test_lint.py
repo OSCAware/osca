@@ -114,6 +114,21 @@ def test_osca024_impl_path_missing(make_pkg, base):
     assert "OSCA024" in rules_hit(lint_package(make_pkg(base)))
 
 
+def test_osca025_write_connector_without_approval(make_pkg, base):
+    # 写连接器（allowed_with_approval）但 policy.approvals 未声明写接口 ref → 运行时写路径静默死
+    base["connectors/CON-001-数据源.yaml"]["permissions"]["write"] = "allowed_with_approval"
+    assert "OSCA025" in rules_hit(lint_package(make_pkg(base)))
+
+
+def test_osca025_write_connector_with_matching_approval_passes(make_pkg, base):
+    # approvals[].action 逐字 == 写接口 ref「CON-001.取数」→ 写路径有名分，OSCA025 不报
+    base["connectors/CON-001-数据源.yaml"]["permissions"]["write"] = "allowed_with_approval"
+    base["policy.yaml"]["approvals"] = [{"action": "CON-001.取数", "approver": "审批人"}]
+    result = lint_package(make_pkg(base))
+    assert "OSCA025" not in rules_hit(result)
+    assert result.ok
+
+
 # ── 账本纪律 ──
 
 

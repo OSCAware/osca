@@ -1,0 +1,20 @@
+connector_id: CON-201
+name: 经营指标库（只读）
+kind: sql_readonly           # 确定性执行：模型只能调用，不能改写查询逻辑
+binding_ref: OPS_DB          # 指向部署环境 binding 的名字，不是值（SPEC §4 层2）
+
+# ── 为什么是确定性的 ──
+rationale: |
+  待下发的处置清单由固化规则算出（谁、做什么、何时完成），模型永不写 SQL、永不猜数。
+  取数只读——写操作一律走 CON-202 的审批门，只读执行器不开任何写口（SPEC B.3）。
+
+interfaces:
+
+  - name: 拉取待下发处置清单
+    returns: {ref: OBJ-201}     # 供「下发」步作被写内容
+    impl: sql/dispatch_worklist.sql   # 固化查询（param-less：本期全量清单，见 W7-D0 §3.4）
+    freshness: 每期诊断结论落定后可用
+
+permissions:
+  write: forbidden             # 只读取数，写走 CON-202 审批门
+  scope: 仅本集团处置域，不触碰外部系统

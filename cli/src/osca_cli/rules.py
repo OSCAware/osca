@@ -255,6 +255,44 @@ def osca024_impl_paths(pkg: OscaPackage) -> list[Finding]:
     return findings
 
 
+@rule
+def osca025_write_approval_binding(pkg: OscaPackage) -> list[Finding]:
+    """OSCA025 写连接器（allowed_with_approval）每个写接口须在 policy.approvals 声明 approver（SPEC §6/B.4）。
+
+    运行时写审批门 require_write_approval **按写接口 ref「CON-xxx.接口名」查 approver**（policy），不在
+    approvals 清单即默认拒绝——写路径会静默死，而其余规则全绿。lint 无此对应则「一等写样例」极易做成
+    lint 全绿、写却永远被拒的死包。本规则把「approvals[].action 逐字 == 写接口 ref」机器化（is_write 是
+    连接器级：allowed_with_approval 连接器的每个接口都是写接口，逐个都要有名分）。
+    """
+    findings = []
+    policy = pkg.yaml_files.get("policy.yaml")
+    approvals = policy.mapping.get("approvals") if policy and not policy.parse_error else None
+    actions = {a.get("action") for a in approvals if isinstance(a, dict)} if isinstance(approvals, list) else set()
+    for f in pkg.typed_files("connectors"):
+        if f.parse_error:
+            continue
+        perms = f.mapping.get("permissions")
+        if not (isinstance(perms, dict) and perms.get("write") == "allowed_with_approval"):
+            continue  # 只读连接器（forbidden）不进写门；形状非法由 OSCA040 报
+        cid = f.mapping.get("connector_id")
+        itfs = f.mapping.get("interfaces")
+        for itf in itfs if isinstance(itfs, list) else []:
+            name = itf.get("name") if isinstance(itf, dict) else None
+            if not (isinstance(cid, str) and isinstance(name, str)):
+                continue  # ID/接口名 形状缺陷由 OSCA011/040 报，这里不重复
+            ref = f"{cid}.{name}"
+            if ref not in actions:
+                findings.append(
+                    _err(
+                        "OSCA025",
+                        f.relpath,
+                        f"写接口「{ref}」（write: allowed_with_approval）未在 policy.approvals 声明 approver"
+                        "——运行时写审批按接口 ref 查 approver，缺失即默认拒绝（写路径静默死）",
+                    )
+                )
+    return findings
+
+
 # ───────────────────────── 账本纪律（SPEC §9 + 架构 §2） ─────────────────────────
 
 

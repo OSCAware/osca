@@ -1,0 +1,27 @@
+aware_id: AW-201
+name: 处置下发
+enabled: true
+
+# ── 触发原语：逐条编译注册进运行时触发表 ──
+triggers:
+  - id: T1
+    kind: schedule
+    schedule: {every: month, day: 12, time: "10:00"}   # 每期诊断结论落定后
+    note: day 超出当月天数时取当月最后一天（SPEC v0.4 §5）
+  - id: T2
+    kind: event
+    source: 人工触发（处置下发控制台按钮）
+
+# ── 闸门：trigger 命中 ≠ 唤醒；此处裁决。装载时做编译期校验 ──
+gate:
+  combine: any                        # any | all | sequence
+  precondition: "CON-201.拉取待下发处置清单 返回非空"
+  debounce: 24h                       # 同一账期先后命中，只跑一次
+  on_fail: 顺延重试，连续3次失败通知操作者
+
+then: STR-201
+budget: {max_steps: 10, max_minutes: 10, max_tokens: 100k}
+
+discretion: |
+  仅两种情况允许计划外唤醒：操作者手动触发（T2）；上期下发被驳回后处置审批人要求重下发。
+  除此之外不得自行唤醒——高危写的缰绳握在人手里。

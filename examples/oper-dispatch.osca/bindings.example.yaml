@@ -1,0 +1,9 @@
+# 部署绑定模板：真实 binding 由运维在部署环境注入，永不进包（SPEC §4 层2）。
+# 铁律：包内不得出现任何密钥、连接串、真实 URL——只放占位串 + secret_ref 名。
+OPS_DB:
+  endpoint: <经营指标只读连接串（占位）>       # 真实为只读库驱动；演练注入 sql_readonly://localhost/<fake.db>
+  secret_ref: OPS_DB_RO_KEY                   # 密钥名；值存放在部署环境的 secret manager
+
+DISPATCH_API:
+  endpoint: <工单下发系统写接口（占位）>        # 真实为 https://<网关>；演练注入 openapi://127.0.0.1:<port>
+  secret_ref: DISPATCH_API_KEY                # 写接口鉴权密钥名；值走 Bearer，绝不进包/日志/剧集
