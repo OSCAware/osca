@@ -5,7 +5,7 @@
 - **Whitepaper version:** 1.1 (document version, not a software release)
 - **Published:** 2026-07-12
 - **Specification baseline:** OSCA SPEC v0.4 finalized (2026-07-19; v0.3/v0.2 kept for history)
-- **Reference implementation status:** public Host reference implementation (M2 seven components + M4 control-channel security kernel / approval challenges); first-party feedback flywheel and interaction layer (M3–M5) mechanism-complete, private; software v1.0 is a mechanism-verifiable release; real-world validation not complete
+- **Reference implementation status:** public Host reference implementation (M2 seven components + M4 control-channel security kernel / approval challenges); first-party feedback flywheel and interaction layer (M3–M5) mechanism-complete, private; software v1.1 is a mechanism-verifiable release (real-write path wired end-to-end, tested against fake backends); real-world and production-write validation not complete
 
 **Languages:** **English** · [简体中文](OSCA-WHITEPAPER-v1.1.zh-CN.md) · [日本語](OSCA-WHITEPAPER-v1.1.ja.md)
 
@@ -542,9 +542,9 @@ Public readers cannot inspect the whole first-party flywheel. “M3 implemented�
 | P0 | P0-A ≥20 L1 and some L3/L4; P0-B separate | Incomplete; business value unvalidated |
 | M4 | Diff/Confirm, operations, approval interfaces | Mechanism complete; first-party private |
 | M5 | Creator interview assistant and editor | Mechanism complete; first-party private |
-| M6 | Real Connector conventions, full-link integration, software v1.0 release | Mechanism integration complete; connector conventions in SPEC v0.4 Appendix B; software v1.0 released as a mechanism-verifiable release |
+| M6 | Real Connector conventions, full-link integration, real-write path wired end-to-end, software v1.1 release | Mechanism integration complete; connector conventions in SPEC v0.4 Appendix B; real-write path (approval loop + real executors + recoverable episode) tested against fake backends; software v1.1 released as a mechanism-verifiable release |
 
-Software v1.0 has been released as a **mechanism-verifiable** release: it ships the finalized SPEC v0.4, the reference implementation, and replayable synthetic samples (`osca replay` lets you watch a judgment move output from before-edit toward after-edit). It contains **no business-effect proof**. The real-content bar originally attached to 1.0 moves wholesale to 1.x (not dropped): P0-A with at least 20 L1 real judgments plus some L3/L4 follow-up-usage evidence, a replayable controlled real sample ledger, and production integration — until then every metric is mechanism-level. Whitepaper 1.0 is only this document version; the real ledger remains subject to customer data rights and does not mean a published raw ledger.
+Software v1.1 has been released as a **mechanism-verifiable** release: it ships the finalized SPEC v0.4, the reference implementation, replayable synthetic samples (`osca replay` lets you watch a judgment move output from before-edit toward after-edit), and the real-write path wired end-to-end (approval loop + real sql_readonly/openapi executors + recoverable episode, tested against fake backends). It contains **no business-effect proof and no production-write validation** (those belong to 1.x / deployment). The real-content bar originally attached to 1.0 moves wholesale to 1.x (not dropped): P0-A with at least 20 L1 real judgments plus some L3/L4 follow-up-usage evidence, a replayable controlled real sample ledger, and production integration — until then every metric is mechanism-level. Whitepaper 1.1 is only this document version; the real ledger remains subject to customer data rights and does not mean a published raw ledger.
 
 The maintainers are separately exploring an internal R-line design for preserving raw observations that the
 current system cannot assimilate, together with long-term guardrails and controlled shadow comparisons. It is

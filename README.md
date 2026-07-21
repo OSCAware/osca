@@ -17,9 +17,10 @@ recorded in an attributable **contribution ledger**.
 [中文 PDF](docs/OSCA-WHITEPAPER-v1.1.zh-CN.pdf) ·
 [日本語 PDF](docs/OSCA-WHITEPAPER-v1.1.ja.pdf) — the design
 rationale, O/S/C/A/J model, Runtime, feedback flywheel, and how to begin implementing your own OSCA Agent.
-Whitepaper v1.1 is a document version. Software **v1.0** — the mechanism-verifiable release
-(spec v0.4 + reference Runtime + a replayable desensitized sample) — is tagged `v1.0`; real-world
-validation is the 1.x journey.
+Whitepaper v1.1 is a document version; the software is versioned independently and is now at **v1.1** —
+the mechanism-verifiable release (spec v0.4 + reference Runtime + a replayable desensitized sample), now
+with the real-write path wired end-to-end (approval loop + real sql_readonly/openapi executors, tested
+against fake backends) — tagged `v1.1`; real-world and production-write validation is the 1.x journey.
 
 ## OSCA and Oscaware
 
@@ -115,9 +116,11 @@ osca/
   Confirm, with some later reapplying and receiving support in independent batches. The monthly slow scenario
   is reported separately and never pooled. Public fixtures do not count; product interfaces, Creator, and
   production integration follow.
-- **Software v1.0 — mechanism-verifiable release (met)**: the specification (v0.4), a reference implementation
-  (Runtime + CLI), and a replayable desensitized sample ledger you can `osca replay` to watch a judgment move
-  the output from before-edit to after-edit. This is what the `v1.0` tag marks — **not** a claim of real-world efficacy.
+- **Software v1.1 — mechanism-verifiable release (met)**: the specification (v0.4), a reference implementation
+  (Runtime + CLI), a replayable desensitized sample ledger you can `osca replay` to watch a judgment move
+  the output from before-edit to after-edit, and the real-write path wired end-to-end (approval loop + real
+  sql_readonly/openapi executors + recoverable episode, tested against fake backends). This is what the `v1.1`
+  tag marks — **not** a claim of real-world efficacy or production-write validation (those belong to 1.x / deployment).
 - **1.x — product-maturity validation (ongoing)**: the real-content evidence above (≥20 expert-Confirmed
   Judgments in a real scenario, some independently reused), product interfaces, Creator, and production
   integration; the convergence curve belongs to the 1.x narrative. Customer raw ledgers need not be public.
