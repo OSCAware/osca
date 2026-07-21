@@ -383,3 +383,27 @@ def test_load_zip_ignores_smuggled_cache_members(make_pkg, base, tmp_path):
     assert not (root / "indexes" / "vectors.bin").exists()
     assert not (root / ".git").exists()
     assert (root / "indexes" / "judgments.index.yaml").is_file()  # 受支持缓存按已校验内容重建
+
+
+def test_pack_reads_each_file_once_no_toctou(make_pkg, base, tmp_path, monkeypatch):
+    """P2：checksum 与归档必须基于同一次读取的同一份字节——每个进包文件只读一次盘,
+    并发修改不可能产出「摘要是旧内容、归档是新内容」的自校验必败交付件。"""
+    from collections import Counter
+    from pathlib import Path as P
+
+    counts: Counter[str] = Counter()
+    real = P.read_bytes
+
+    def counting(self):
+        counts[str(self)] += 1
+        return real(self)
+
+    monkeypatch.setattr(P, "read_bytes", counting)
+    pkg = make_pkg(base)
+    result, zip_path = pack_package(pkg, tmp_path / "out.zip")
+    assert result.ok, result.render("pack")
+    in_pkg = {k: v for k, v in counts.items() if k.startswith(str(pkg))}
+    assert in_pkg and all(v == 1 for v in in_pkg.values()), in_pkg  # 逐文件恰读一次
+    # 自校验闭环：产出的交付件装载完整性必过
+    load_result, _ = load_osca(zip_path, dest=tmp_path / "deploy")
+    assert load_result.ok, load_result.render("load")
