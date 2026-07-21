@@ -640,14 +640,42 @@ class Host:
         task.add_done_callback(self._episode_tasks.discard)
 
     async def _resume_after_delete(self, episode_id: str, loaded, proxy, policy) -> None:
-        """恢复状态机：删盘（线程）→ CAS suspended→running（事件循环）→ 起写线程。崩溃安全序不变
-        （delete-before-write）：① 崩溃于「写已落地、终态未记」不会重挂重批重写（快照早没了，§2.4）；
-        ② 删盘失败（磁盘/权限）保留挂起态、不提交 running（假 running 永卡，GPT 外审 P1），待清扫重试；
-        ③ 删盘线程期间 unload/关停把剧集迁 stopped → CAS 失败放弃执行（快照已删、写不执行——与旧序
-        「CAS 后 unload、恢复被 revoked 拒绝」同为 fail-closed 丢写，审计可见）。"""
+        """恢复状态机：生命周期 CAS → 删盘（线程）→ **再** CAS → suspended→running（事件循环）→
+        内联 await 写执行。崩溃安全序不变（delete-before-write）：① 崩溃于「写已落地、终态未记」不会
+        重挂重批重写（快照早没了，§2.4）；② 删盘失败（磁盘/权限）保留挂起态、不提交 running（假
+        running 永卡，GPT 外审 P1），待清扫重试。
+
+        生命周期 CAS（GPT 四审 P1）：只查 episode.status 关不住 DRAINING——_shutdown 先等 _episode_tasks
+        再 _stop_suspended_episodes，删盘期间进入 DRAINING 时剧集仍 suspended，旧 CAS 会成功推进 running
+        并**派生逃出 shutdown 快照的子任务**（Host 已报 STOPPED 而写执行还活着）。故删盘前后都复核
+        HostState + loaded/proxy/policy 代际身份 + policy 未 revoke；失效即放弃、绝不起执行。写执行改
+        **内联 await**（不再 create_task）——本恢复任务自身在 _episode_tasks 里，shutdown 等到的就是
+        全程（无子任务逃逸面）。删盘后失效 = 快照已删、写不执行（fail-closed 丢写，审计可见——与旧序
+        「CAS 后 unload、恢复被 revoked 拒绝」同向）；删盘前失效 = 快照保留，重载后可重挂。"""
+
+        def lifecycle_stale() -> str | None:
+            if self.state is not HostState.RUNNING:
+                return f"Host 已 {self.state.name}（DRAINING 后不再启动新工作）"
+            episode = self.episodes.get(episode_id)
+            if episode is None:
+                return "剧集已不在台账"
+            pid = episode.package_id
+            if (
+                self.registry.packages.get(pid) is not loaded
+                or self.policies.get(pid) is not policy
+                or self.proxies.get(pid) is not proxy
+            ):
+                return "包已卸载/重载（跨代不恢复）"
+            if policy.revoked:
+                return f"包已停：{policy.revoked}"
+            return None
+
         try:
             episode = self.episodes.get(episode_id)
             if episode is None or episode.status != "suspended_pending_approval":
+                return
+            if why := lifecycle_stale():
+                log.info(f"剧集 {episode_id} 恢复放弃（删盘前）：{why}——快照保留，重载后可重挂")
                 return
             if self._suspension_store is not None:
                 try:
@@ -658,15 +686,16 @@ class Host:
             if episode.status != "suspended_pending_approval":  # 删盘线程期间 unload/关停已迁 stopped
                 log.warning(f"剧集 {episode_id} 恢复放弃：删盘期间已离开挂起态（{episode.status}）")
                 return
-            episode.status = "running"  # CAS：删盘成功后才提交内存状态（与 pop/起线程间无 await，循环上原子）
+            if why := lifecycle_stale():
+                log.warning(f"剧集 {episode_id} 恢复放弃（删盘后失效）：{why}——快照已删、写不执行（fail-closed）")
+                return
+            episode.status = "running"  # CAS：删盘成功且生命周期有效才提交（与 pop 间无 await，循环上原子）
             cid = episode.resume.get("challenge_id") if episode.resume else None
             if cid is not None:
                 self._suspensions.pop(cid, None)
         finally:
             self._resuming.discard(episode_id)
-        task = asyncio.create_task(self._execute_episode(episode, loaded, proxy, policy))
-        self._episode_tasks.add(task)
-        task.add_done_callback(self._episode_tasks.discard)
+        await self._execute_episode(episode, loaded, proxy, policy)
 
     async def _persist_suspension(self, episode: Episode, policy: PolicyInterceptor) -> None:
         """把挂起剧集快照原子写盘（L2）：{episode 全 dump + 关联挑战全字段 + per_episode 计数 + 版本戳}。
@@ -695,19 +724,19 @@ class Host:
             "tokens": tokens,
             "version_stamp": None,  # 线程内补算（全包指纹是磁盘重活）
         }
-        token = store.begin_persist(episode.operation_id)  # 事件循环侧取令牌——先于任何可能的 delete 观察点
+        ticket = store.begin_persist(episode.operation_id)  # 事件循环侧领票——先于任何可能的 delete 观察点
 
         def _stamp_and_persist() -> None:
             record["version_stamp"] = self._pack_stamp(loaded) if loaded is not None else None
-            store.persist(episode.operation_id, record, token=token)
+            store.persist(episode.operation_id, record, ticket=ticket)
 
         try:
             await asyncio.to_thread(_stamp_and_persist)
         except OSError as e:  # 磁盘满/权限/fd 已关等——真正退回 L1（对抗审查 minor-1：不炸成未处理 task 异常）
             log.warning(f"挂起快照落盘失败（该剧集退回 L1、不活过重载/重启）：{e}")
-            # 异常可能发生在 persist 之前（指纹计算）——归还 begin_persist 的在途凭据；persist 已跑过则
-            # 它自己已归还，abandon 的双释放有钳制（防 store 注册表泄漏，GPT 三审 P2 有界性）
-            store.abandon_persist(episode.operation_id)
+            # 异常可能发生在 persist 之前（指纹计算）——兜底归还在途凭据。凭据释放**幂等**（GPT 四审
+            # P2）：persist 已跑过则它自己已归还、本调用 no-op，绝不偷走并发 delete/新一代的票（ABA 已封）
+            store.abandon_persist(ticket)
 
     @staticmethod
     def _pack_stamp(loaded) -> str:
@@ -743,16 +772,23 @@ class Host:
         if store is None or loaded is None or policy is None:
             return
         records, current_stamp = await asyncio.to_thread(lambda: (store.load_all(), self._pack_stamp(loaded)))
-        if (
-            self.state is not HostState.RUNNING
-            or self.registry.packages.get(package_id) is not loaded
-            or self.policies.get(package_id) is not policy
-            or self._suspension_store is not store
-        ):
+
+        def lifecycle_stale() -> bool:
+            return (
+                self.state is not HostState.RUNNING
+                or self.registry.packages.get(package_id) is not loaded
+                or self.policies.get(package_id) is not policy
+                or self._suspension_store is not store
+            )
+
+        if lifecycle_stale():
             log.info(f"[{package_id}] 重挂放弃：读盘期间包已卸载/重载或 Host 关停（跨代不发布）")
             return
+        # 三段式（GPT 四审 P2）：① 事件循环上纯裁决（零文件操作）→ ② 丢弃项**线程批量删**
+        # （delete 可能等在途 persist 的 fsync，同步调会压住整条控制通道）→ ③ 删后再代际 CAS、发布重挂。
         now = time.time()
-        reattached = 0
+        to_delete: list[str] = []
+        keep: list[tuple[Episode, Challenge, int, int]] = []
         for record in records:
             if not isinstance(record, dict):
                 continue  # 合法 JSON 但非 mapping——坏文件跳过，不崩启动（major-1；load_all 已滤，双保险）
@@ -762,7 +798,7 @@ class Host:
             expires = ch_data.get("expires_at") if isinstance(ch_data, dict) else None
             stale = isinstance(expires, (int, float)) and not isinstance(expires, bool)
             if stale and now > expires + TERMINAL_RETENTION_SECONDS:
-                store.delete(opid)
+                to_delete.append(opid)
                 continue
             if record.get("package_id") != package_id:
                 continue
@@ -771,23 +807,31 @@ class Host:
                 challenge = Challenge(**record["challenge"])
             except (TypeError, KeyError) as e:
                 log.warning(f"挂起快照结构不符，丢弃：{opid}（{e}）")
-                store.delete(opid)
+                to_delete.append(opid)
                 continue
             if record.get("version_stamp") != current_stamp:
                 # 版本戳不符（含旧快照 None vs 现非 None）→ 包已改版 / 不可证同版 → fail-closed 丢弃（§2.4）
                 log.warning(f"挂起快照与当前包版本不符（包已改版），丢弃不重挂：{opid}")
-                store.delete(opid)
+                to_delete.append(opid)
                 continue
-            # 重编无冲突展示号（blocker）：EP 号只是展示、跨重启复用低号会与另一 operation_id 相撞（静默顶掉
-            # 活挂起写、错接挑战）。operation_id 才是真键。挑战仍 pending（未决），故按新号重绑其 episode_id——
-            # payload_digest 不变、恢复用新号消费仍命中；challenge_id 不变（审批人按它批）。
             raw_tc, raw_tk = record.get("tool_calls", 0), record.get("tokens", 0)
             if type(raw_tc) is not int or raw_tc < 0 or type(raw_tk) is not int or raw_tk < 0:
                 # 计数字段损坏（非非负整数）→ 快照不可信，与结构不符同口径丢弃（fail-closed：
                 # 按 0 回灌会把 INV-7 的硬顶在重挂边界洗掉，硬转 int 又会炸掉整个装载）
                 log.warning(f"挂起快照 per_episode 计数损坏，丢弃：{opid}")
-                store.delete(opid)
+                to_delete.append(opid)
                 continue
+            keep.append((episode, challenge, raw_tc, raw_tk))
+        if to_delete:
+            await asyncio.to_thread(lambda: [store.delete(o) for o in to_delete])
+            if lifecycle_stale():
+                # 丢弃清理已做（本就是废快照，删了不冤）；重挂发布整体放弃——保留项快照仍在盘，下次重挂再续
+                log.info(f"[{package_id}] 重挂放弃：清理期间包已卸载/重载或 Host 关停（跨代不发布）")
+                return
+        for episode, challenge, raw_tc, raw_tk in keep:
+            # 重编无冲突展示号（blocker）：EP 号只是展示、跨重启复用低号会与另一 operation_id 相撞（静默顶掉
+            # 活挂起写、错接挑战）。operation_id 才是真键。挑战仍 pending（未决），故按新号重绑其 episode_id——
+            # payload_digest 不变、恢复用新号消费仍命中；challenge_id 不变（审批人按它批）。
             self._episode_seq += 1
             new_id = f"EP-{self._episode_seq:04d}"
             episode.episode_id = new_id
@@ -797,9 +841,8 @@ class Host:
             episode.status = "suspended_pending_approval"  # 快照必为 pending 挑战——重挂即挂起态
             self.episodes[new_id] = episode
             self._suspensions[challenge.challenge_id] = new_id
-            reattached += 1
-        if reattached:
-            log.info(f"[{package_id}] 重挂 {reattached} 条挂起剧集（L2 活过重载/重启）")
+        if keep:
+            log.info(f"[{package_id}] 重挂 {len(keep)} 条挂起剧集（L2 活过重载/重启）")
             self._sweep_suspensions()  # 已决（含丢唤醒窗）/ 过期的立即恢复：兑现或回落
 
     def _maybe_resume_for_challenge(self, challenge_id: str, package_id: str) -> None:
@@ -882,12 +925,15 @@ class Host:
         if load_tasks:
             await asyncio.gather(*load_tasks, return_exceptions=True)
 
-        # 先等在跑剧集收尾（剧集短命，正常秒级；网关卡死时 60s 兜底放弃等待，线程随进程消亡）
-        if self._episode_tasks:
+        # 先等在跑剧集收尾（剧集短命，正常秒级；网关卡死时 60s 兜底放弃等待，线程随进程消亡）。
+        # **循环重拍快照直到集合为空**（GPT 四审 P1）：一次性快照会漏等等待期间新登记的任务
+        # （恢复状态机已内联 await 消除子任务派生，这里是第二道保险——迟到任务不逃出关停）
+        deadline = time.monotonic() + 60
+        while self._episode_tasks and time.monotonic() < deadline:
             log.info(f"关停前等待 {len(self._episode_tasks)} 个在跑剧集收尾")
-            _, pending = await asyncio.wait(list(self._episode_tasks), timeout=60)
-            if pending:
-                log.warning(f"{len(pending)} 个剧集未在 60s 内收尾，放弃等待")
+            await asyncio.wait(list(self._episode_tasks), timeout=max(0.1, deadline - time.monotonic()))
+        if self._episode_tasks:
+            log.warning(f"{len(self._episode_tasks)} 个剧集未在 60s 内收尾，放弃等待")
         # 挂起等批的剧集无 task（INV-1 不持线程）→ 不会被上面等到；显式迁 stopped（L1 不持久，重启不恢复）
         self._stop_suspended_episodes(None, "Host 关停，挂起等批未兑现（L1 不持久，重启不恢复）")
 

@@ -1193,3 +1193,86 @@ async def test_resume_delete_runs_off_event_loop(running_host, sample_pack, depl
     assert elapsed < 0.2, f"删盘仍在事件循环上同步执行（sweep 耗时 {elapsed:.3f}s）"
     await _await_status(episode, "completed")
     assert episode.status == "completed"  # 恢复照常兑现
+
+
+# ── GPT Review 四审：DRAINING 期间恢复不启动写执行 / 重挂清理删盘不压事件循环 ──────────
+
+
+async def test_resume_aborts_when_draining_during_delete(running_host, sample_pack, deploy_w5, monkeypatch):
+    """四审 P1：删盘线程期间进入 DRAINING → 删盘返回后生命周期 CAS 失效 → 不起写执行；
+    恢复任务内联 await（自身在 _episode_tasks）+ shutdown 循环重拍快照——STOPPED 时零存活剧集任务。"""
+    import threading as _threading
+
+    from osca_host.host import HostState
+    from osca_host.suspension import SuspensionStore
+
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+    await host._execute_episode(episode, loaded, proxy, policy)  # 挂起 + 落盘
+    [ch] = policy.pending_challenges()
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+
+    entered, release = _threading.Event(), _threading.Event()
+    original_delete = SuspensionStore.delete
+
+    def slow_delete(self, opid):
+        entered.set()
+        release.wait(timeout=10)
+        original_delete(self, opid)
+
+    monkeypatch.setattr(SuspensionStore, "delete", slow_delete)
+    host._sweep_suspensions()  # 恢复调度：删盘在线程挂起
+    assert await asyncio.to_thread(entered.wait, 10)
+    host._begin_draining()  # stop 到达（DRAINING）——「进入 DRAINING 后不再启动新工作」
+    release.set()
+    for _ in range(500):  # 等 fixture 的 run 任务走完 _shutdown
+        if host.state is HostState.STOPPED:
+            break
+        await asyncio.sleep(0.01)
+
+    assert host.state is HostState.STOPPED
+    assert host._episode_tasks == set()  # 无逃逸子任务（Host 报 STOPPED 时不许还有活执行）
+    assert episode.status == "stopped"  # 未推进 running（关停收尾迁 stopped）
+    assert not any(s.get("step") == "下发" for s in episode.steps)  # 零恢复执行、零写
+
+
+async def test_reattach_cleanup_delete_off_event_loop(running_host, sample_pack, deploy_w5, monkeypatch):
+    """四审 P2：重挂丢弃项（过期/损坏/版本失配）的删盘**线程批量**执行——慢 delete（与旧代在途
+    persist 争 fsync）期间事件循环心跳照常，status/stop/审批不再被压住。"""
+    import threading as _threading
+
+    from osca_host.suspension import SuspensionStore
+
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+    await host._execute_episode(episode, loaded, proxy, policy)  # 挂起 + 落盘
+    opid = episode.operation_id
+    pf = sample_pack / "policy.yaml"  # 未提交改动 → 内容指纹漂移 → 重挂走丢弃清理路径
+    pf.write_text(pf.read_text(encoding="utf-8") + "\n# drift\n", encoding="utf-8")
+    await _send({"cmd": "unload", "package_id": pid}, host)
+
+    entered, release = _threading.Event(), _threading.Event()
+    original_delete = SuspensionStore.delete
+
+    def slow_delete(self, o):
+        entered.set()
+        release.wait(timeout=10)
+        original_delete(self, o)
+
+    monkeypatch.setattr(SuspensionStore, "delete", slow_delete)
+    load_task = asyncio.create_task(_load_pack(host, sample_pack, deploy_w5))  # reload → 重挂 → 清理慢
+    assert await asyncio.to_thread(entered.wait, 10)  # 清理删盘已在线程中挂起
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    await asyncio.sleep(0.01)  # 心跳：慢 delete 不压事件循环（旧实现此处死锁/被压 350ms+）
+    assert loop.time() - t0 < 0.2
+    release.set()
+    await asyncio.wait_for(load_task, timeout=15)
+    assert [r for r in host._suspension_store.load_all() if r["operation_id"] == opid] == []  # 废快照已清
+    assert not any(
+        e.operation_id == opid and e.status == "suspended_pending_approval" for e in host.episodes.values()
+    )  # 失配快照未被重挂

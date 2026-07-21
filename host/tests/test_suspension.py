@@ -72,8 +72,8 @@ def test_op_registry_bounded_after_terminal_operations(store):
     s, _ = store
     for i in range(200):
         opid = f"EO-{i:04x}"
-        token = s.begin_persist(opid)
-        assert s.persist(opid, {"operation_id": opid}, token=token) is True
+        ticket = s.begin_persist(opid)
+        assert s.persist(opid, {"operation_id": opid}, ticket=ticket) is True
         s.delete(opid)
     assert s._ops == {}  # 全部回收
 
@@ -82,9 +82,9 @@ def test_delete_generation_survives_inflight_begin(store):
     """删除世代 tombstone 须活过在途 persist：begin 后 delete，迟到 persist 令牌失配弃写——
     即便中途无其他持票者，条目也不得被提前回收导致世代归零误放行。"""
     s, tmp = store
-    token = s.begin_persist("EO-race")
+    ticket = s.begin_persist("EO-race")
     s.delete("EO-race")  # begin 与 persist 之间作废
-    assert s.persist("EO-race", {"operation_id": "EO-race"}, token=token) is False  # 弃写
+    assert s.persist("EO-race", {"operation_id": "EO-race"}, ticket=ticket) is False  # 弃写
     assert not (tmp / "susp-EO-race.json").exists()
     assert s._ops == {}  # persist 归还凭据后回收
 
@@ -92,6 +92,49 @@ def test_delete_generation_survives_inflight_begin(store):
 def test_abandon_persist_releases_credit(store):
     """begin 后未走到 persist（如指纹计算失败）→ abandon 归还凭据，注册表不泄漏。"""
     s, _ = store
-    s.begin_persist("EO-abandon")
-    s.abandon_persist("EO-abandon")
+    ticket = s.begin_persist("EO-abandon")
+    s.abandon_persist(ticket)
+    assert s._ops == {}
+
+
+def test_double_release_cannot_steal_inflight_credit(store):
+    """GPT 四审 P2（ABA）：凭据释放幂等——abandon 双调 / persist 自归还后再 abandon，
+    绝不偷走并发在途者的票、不提前回收条目、不重置删除世代。"""
+    s, tmp = store
+    t1 = s.begin_persist("EO-aba")
+    s.abandon_persist(t1)
+    s.abandon_persist(t1)  # 双 abandon：第二次 no-op
+    t2 = s.begin_persist("EO-aba")  # 新在途凭据
+    assert s._ops  # t2 的条目还在——没被 t1 的双释放偷走
+    s.delete("EO-aba")  # 作废 t2 的令牌
+    assert s.persist("EO-aba", {"x": 1}, ticket=t2) is False  # 世代未被重置——迟到 persist 弃写
+    assert not (tmp / "susp-EO-aba.json").exists()
+    assert s._ops == {}
+
+
+def test_persist_oserror_then_abandon_does_not_reset_delete_generation(store, monkeypatch):
+    """GPT 四审 P2 复现反转：persist 内部 OSError（自归还）→ Host 兜底 abandon（分不清异常位置）→
+    并发 delete 持票 + 新一代 begin——旧票的第二次释放不得移除/修改新状态，迟到 persist 不得复活快照。"""
+    import osca_host.suspension as susp_mod
+
+    s, tmp = store
+    t1 = s.begin_persist("EO-x")
+    real_open = os.open
+
+    def boom(path, *args, **kwargs):
+        if isinstance(path, str) and path.startswith("susp-EO-x"):
+            raise OSError("disk full（测试注入）")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(susp_mod.os, "open", boom)
+    with pytest.raises(OSError):
+        s.persist("EO-x", {"a": 1}, ticket=t1)  # persist 内部炸——finally 已自归还
+    monkeypatch.undo()
+    s.abandon_persist(t1)  # Host 的兜底调用——幂等 no-op，不偷票
+
+    t2 = s.begin_persist("EO-x")  # 新一代在途凭据
+    assert s._ops  # 条目未被旧票双释放提前回收
+    s.delete("EO-x")  # delete 持票 + 世代 +1
+    assert s.persist("EO-x", {"a": 2}, ticket=t2) is False  # 世代未归零——迟到 persist 弃写，快照不复活
+    assert not (tmp / "susp-EO-x.json").exists()
     assert s._ops == {}

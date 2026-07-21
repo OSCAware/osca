@@ -45,6 +45,21 @@ class _OpState:
         self.pending = 0
 
 
+class PersistTicket:
+    """begin_persist 发的一次性在途凭据（GPT 四审 P2）：绑定**具体状态对象** + 当时删除世代，
+    释放幂等（exactly-once）。裸整数令牌 + 按 operation_id 释放会 ABA——persist 异常自归还后
+    调用方再 abandon，第二次释放偷走并发 delete 的票、提前回收条目，同 id 新状态世代归零，
+    迟到 persist 便能复活已作废快照。凭据绑状态身份 + 幂等标志后，双释放/跨代释放都不可达。"""
+
+    __slots__ = ("operation_id", "state", "token", "released")
+
+    def __init__(self, operation_id: str, state: _OpState, token: int):
+        self.operation_id = operation_id
+        self.state = state
+        self.token = token
+        self.released = False
+
+
 class SuspensionStore:
     """运行目录 fd 下的挂起快照存储。dir_fd 由 Host 从安全运行目录**借用**（不持有、不关闭——
     fd 归 ControlServer 的 RuntimeDirectory，随 Host 关停一并释放）。
@@ -68,42 +83,47 @@ class SuspensionStore:
     def _name(self, operation_id: str) -> str:
         return f"{PREFIX}{operation_id}{SUFFIX}"
 
-    def _acquire(self, operation_id: str) -> _OpState:
+    def _acquire_ticket(self, operation_id: str) -> PersistTicket:
         with self._registry:
             st = self._ops.setdefault(operation_id, _OpState())
             st.pending += 1
-            return st
+            return PersistTicket(operation_id, st, st.delete_gen)
 
-    def _release(self, operation_id: str) -> None:
+    def _release_ticket(self, ticket: PersistTicket) -> None:
+        """幂等释放：只释放**本票绑定的状态对象**的那一份计数——双释放/跨代释放不可达
+        （GPT 四审 P2：按 operation_id 裸释放 + 钳制会偷走并发 delete 的票、ABA 复活快照）。"""
         with self._registry:
-            st = self._ops.get(operation_id)
-            if st is None:
+            if ticket.released:
                 return
-            st.pending = max(0, st.pending - 1)  # 钳制：abandon 与 persist 自归还重叠时双释放无害
-            if st.pending == 0:
-                self._ops.pop(operation_id, None)  # tombstone 只须活过在途 persist——归零即回收（有界性）
+            ticket.released = True
+            st = self._ops.get(ticket.operation_id)
+            if st is not ticket.state:
+                return  # 条目已被替换（持票期间不可能；防御性：绝不动别代的状态）
+            st.pending -= 1
+            if st.pending <= 0:
+                self._ops.pop(ticket.operation_id, None)  # tombstone 只须活过在途凭据——归零即回收（有界性）
 
-    def begin_persist(self, operation_id: str) -> int:
-        """persist 发起时（事件循环侧、与挂起登记同临界区）取当前删除世代作令牌。**持一票在途凭据**——
-        对应的 persist() 在 finally 归还；若发起后未走到 persist（如指纹计算失败），调用方须
-        abandon_persist() 归还，否则该 operation 的状态条目不回收。"""
-        return self._acquire(operation_id).delete_gen
+    def begin_persist(self, operation_id: str) -> PersistTicket:
+        """persist 发起时（事件循环侧、与挂起登记同临界区）领一次性在途凭据（含当时删除世代）。
+        对应的 persist() 在 finally 归还；发起后未走到 persist（如指纹计算失败）由 abandon_persist
+        归还——释放幂等，调用方分不清异常发生在 persist 前后时也可安全兜底调用。"""
+        return self._acquire_ticket(operation_id)
 
-    def abandon_persist(self, operation_id: str) -> None:
-        """begin_persist 后未走到 persist 的归还口（persist 正常/异常路径都自归还，勿双调；
-        调用方分不清异常发生在 persist 前后时可安全调用——释放计数有钳制）。"""
-        self._release(operation_id)
+    def abandon_persist(self, ticket: PersistTicket) -> None:
+        """begin_persist 后未走到 persist 的归还口。幂等：persist 已自归还时本调用是 no-op，
+        绝不偷走其他在途者（并发 delete/新一代 begin）的票。"""
+        self._release_ticket(ticket)
 
-    def persist(self, operation_id: str, record: dict, token: int | None = None) -> bool:
+    def persist(self, operation_id: str, record: dict, ticket: PersistTicket | None = None) -> bool:
         """原子写盘（temp + fsync + rename，均相对 dir_fd）。非 JSON 可序列化 → 跳过并告警，返回 False
-        （该剧集退回 L1）；token 给定且与当前删除世代不符（落盘前已被 delete 作废）→ 不写、返回 False；
-        成功返回 True。文件名按 operation_id 键化。token 路径归还 begin_persist 的在途凭据；
-        无令牌直调（测试/工具路径）自持一票，保证操作期间状态条目与锁对象稳定。"""
-        if token is None:
-            st = self._acquire(operation_id)
-        else:
-            with self._registry:
-                st = self._ops.setdefault(operation_id, _OpState())  # begin 已建；防御性兜底
+        （该剧集退回 L1）；ticket 的删除世代与当前不符（落盘前已被 delete 作废）→ 不写、返回 False；
+        成功返回 True。文件名按 operation_id 键化。ticket 在 finally 幂等归还；无票直调
+        （测试/工具路径）自持一票，保证操作期间状态条目与锁对象稳定。"""
+        if ticket is None:
+            ticket = self._acquire_ticket(operation_id)
+        elif ticket.operation_id != operation_id:
+            raise ValueError(f"persist 凭据不属于 {operation_id}（属 {ticket.operation_id}）——拒绝错票落盘")
+        st = ticket.state
         try:
             try:
                 blob = json.dumps(record, ensure_ascii=False).encode("utf-8")
@@ -111,7 +131,9 @@ class SuspensionStore:
                 log.warning(f"挂起快照非 JSON 可序列化，跳过持久化（该剧集退回 L1、不活过重载/重启）：{e}")
                 return False
             with st.lock:
-                if token is not None and st.delete_gen != token:
+                with self._registry:
+                    invalidated = st.delete_gen != ticket.token
+                if invalidated:
                     log.info(f"挂起快照落盘前已被恢复作废（决定竞态），放弃写盘：{operation_id}")
                     return False
                 name = self._name(operation_id)
@@ -129,21 +151,23 @@ class SuspensionStore:
                     raise
             return True
         finally:
-            self._release(operation_id)
+            self._release_ticket(ticket)
 
     def delete(self, operation_id: str) -> None:
         """作废并删除快照：世代 +1（在途 persist 令牌失配即弃写）再 unlink。**本方法可能等一次 fsync**
-        （与在途 persist 争同一状态锁）——调用方须在线程里调（Host._resume_after_delete），不上事件循环。"""
+        （与在途 persist 争同一状态锁）——调用方须在线程里调（Host._resume_after_delete / 重挂批量清理），
+        不上事件循环。自持一票凭据护住文件操作期间的状态条目与锁对象。"""
         with self._registry:
             st = self._ops.setdefault(operation_id, _OpState())
             st.delete_gen += 1
-            st.pending += 1  # 借在途凭据护住文件操作期间的状态条目与锁对象
+            st.pending += 1
+        ticket = PersistTicket(operation_id, st, st.delete_gen)  # 仅作归还凭据（token 不参与判定）
         try:
             with st.lock:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(self._name(operation_id), dir_fd=self._fd)
         finally:
-            self._release(operation_id)
+            self._release_ticket(ticket)
 
     def load_all(self) -> list[dict]:
         """读运行目录下全部挂起快照（坏文件跳过留痕）。调用方按 package_id 过滤 + 版本戳/过期校验。"""
