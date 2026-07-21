@@ -88,6 +88,17 @@ class SuspensionStore:
         self._fd = dir_fd
         self._registry = threading.Lock()  # per-op 状态注册锁（粗粒度、纯内存，纳秒级）
         self._ops: dict[str, _OpState] = {}  # 仅在途 operation 有条目（凭据归零即回收）
+        # 显式存储故障态（复核 P2）：非 None 即持久层降级——「退回 L1」的承诺（快照不活过重启）
+        # 已无法兑现（收回失败=盘上留孤本 / 删除耐久性未知=崩溃后可复活）。降级后 persist 拒绝、
+        # load_all 拒绝重挂，要求运维修复存储后重启 Host（进程内一旦降级不自动恢复——诚实口径）。
+        self.storage_fault: str | None = None
+
+    def _enter_storage_fault(self, why: str) -> None:
+        if self.storage_fault is None:
+            self.storage_fault = why
+            log.error(
+                f"挂起持久层进入存储故障态（fail-closed 降级）：{why}——后续持久化与重挂全部停用，请修复存储后重启 Host"
+            )
 
     def _name(self, operation_id: str) -> str:
         return f"{PREFIX}{operation_id}{SUFFIX}"
@@ -149,6 +160,9 @@ class SuspensionStore:
             ticket.status = _CLAIMED
         st = ticket.state
         try:
+            if self.storage_fault:
+                log.warning(f"挂起持久层处于存储故障态，拒绝持久化（不再谎称退回 L1）：{operation_id}")
+                return False
             try:
                 blob = json.dumps(record, ensure_ascii=False).encode("utf-8")
             except (TypeError, ValueError) as e:
@@ -174,13 +188,20 @@ class SuspensionStore:
                         # 不存在（rename 丢失）。同步失败按 OSError 上抛——调用方按落盘失败退回 L1。
                         os.fsync(self._fd)
                     except OSError:
-                        # durability-unknown（存储故障，复核 P2）：rename 已成、耐久未证——若把已落名
-                        # 文件留在盘上，「退回 L1、不活过重启」就是谎话（load_all 之后仍会重挂）。
-                        # fail-closed：**收回**刚落名的快照（best-effort unlink + 目录同步），确保
-                        # 失败后不会在未来意外重挂；收回也失败（存储彻底坏）仍上抛原故障留痕。
-                        with contextlib.suppress(OSError):
+                        # durability-unknown（存储故障，复核 P2）：rename 已成、耐久未证——必须**收回**
+                        # 刚落名的快照，否则「退回 L1、不活过重启」是谎话（load_all 会读回）。
+                        # 收回自身失败 = 盘上留孤本 / 收回后的目录 fsync 失败 = 删除耐久性未知（崩溃
+                        # 可复活）——两者都不许再按 L1 继续运行：进入显式存储故障态（persist/重挂
+                        # 全停，要求运维修复），不是静默降级。
+                        try:
                             os.unlink(name, dir_fd=self._fd)
-                            os.fsync(self._fd)
+                        except OSError as unlink_error:
+                            self._enter_storage_fault(f"快照收回失败（{unlink_error}）——盘上留有不可承诺状态的孤本")
+                        else:
+                            try:
+                                os.fsync(self._fd)
+                            except OSError:
+                                self._enter_storage_fault("快照收回后的目录 fsync 失败——删除耐久性未知，崩溃后可复活")
                         raise
                 except BaseException:
                     with contextlib.suppress(OSError):
@@ -212,7 +233,14 @@ class SuspensionStore:
             self._release_ticket(ticket, allowed=_PENDING)
 
     def load_all(self) -> list[dict]:
-        """读运行目录下全部挂起快照（坏文件跳过留痕）。调用方按 package_id 过滤 + 版本戳/过期校验。"""
+        """读运行目录下全部挂起快照（坏文件跳过留痕）。调用方按 package_id 过滤 + 版本戳/过期校验。
+
+        存储故障态下**拒绝重挂**（复核 P2）：故障期间盘上内容不可信（收回失败的孤本/删除耐久性
+        未知的残影），读回重挂可能兑现本应作废的写——fail-closed 空表，要求运维修复。
+        """
+        if self.storage_fault:
+            log.error(f"挂起持久层存储故障态，拒绝重挂：{self.storage_fault}")
+            return []
         out: list[dict] = []
         try:
             names = os.listdir(self._fd)

@@ -254,8 +254,20 @@ class Host:
         （注册表 + 笼子 + 闸门 + 布防，纯状态变更，事件循环上原子）。
         """
 
+        def _abort() -> str | None:
+            """线程安全的装载作废令牌（复核 P1）：load worker 在守护线程里跑——被取消的 coroutine
+            拦不住线程继续执行,STOPPED/换代之后的迟到 worker 必须在磁盘写副作用（索引重建/dest
+            切换）之前自行止步。GIL 下读这两个字段是原子的;stop/unload 都先推进它们再走后续。"""
+            if self.state is not HostState.RUNNING:
+                return f"Host 已 {self.state.name}"
+            if self._deployment_generations.get(deployment_id) != generation:
+                return "load generation 已失效（unload/关停/新一代 load）"
+            return None
+
         def _build():
-            result, loaded = load_for_host(str(spec.get("path")), dest=spec.get("dest"), bindings=spec.get("bindings"))
+            result, loaded = load_for_host(
+                str(spec.get("path")), dest=spec.get("dest"), bindings=spec.get("bindings"), abort=_abort
+            )
             pkg_bindings: dict = {}
             replay_kill_unprovable = False
             if loaded is not None:

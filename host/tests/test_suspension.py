@@ -294,8 +294,8 @@ def test_persist_dir_fsync_failure_reclaims_renamed_snapshot(store, monkeypatch)
 
 
 def test_persist_persistent_storage_fault_still_no_resurrection(store, monkeypatch):
-    """收回路径自身也失败（存储彻底坏）：仍上抛留痕;本用例同时钉住既有行为——只要 unlink 成过,
-    load_all 不复活。"""
+    """收回 unlink 成功、但删除耐久性未知（收回后的目录 fsync 也失败）：崩溃后快照可复活——
+    进入显式存储故障态（三轮复核 P2）,不得按 L1 继续运行。"""
     s, tmp = store
     real_fsync = os.fsync
 
@@ -308,5 +308,36 @@ def test_persist_persistent_storage_fault_still_no_resurrection(store, monkeypat
     with pytest.raises(OSError):
         s.persist("EO-df", {"operation_id": "EO-df"})
     assert not (tmp / "susp-EO-df.json").exists()  # unlink 成功即收回（fsync 失败不阻止收回）
-    assert s.load_all() == []
+    assert s.storage_fault is not None and "耐久性未知" in s.storage_fault  # 显式降级,非静默 L1
+    monkeypatch.undo()
+    assert s.load_all() == []  # 故障态禁止重挂
     assert s._ops == {}
+
+
+def test_reclaim_unlink_failure_enters_storage_fault(store, monkeypatch):
+    """三轮复核 P2：目录 fsync 失败且收回 unlink 也失败——盘上留孤本,不得再宣称「退回 L1」：
+    进入显式存储故障态,persist/重挂全停（fail-closed,要求运维修复）。"""
+    s, tmp = store
+    real_fsync, real_unlink = os.fsync, os.unlink
+
+    def fail_dir_fsync(fd):
+        if fd == s._fd:
+            raise OSError("目录 fsync 失败")
+        return real_fsync(fd)
+
+    def fail_susp_unlink(name, *args, **kwargs):
+        if str(name).startswith("susp-") and str(name).endswith(".json"):
+            raise OSError("unlink 失败（收回不了）")
+        return real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", fail_dir_fsync)
+    monkeypatch.setattr(os, "unlink", fail_susp_unlink)
+    with pytest.raises(OSError):
+        s.persist("EO-sf", {"operation_id": "EO-sf"})
+    assert s.storage_fault is not None and "收回失败" in s.storage_fault  # 显式故障态
+    assert (tmp / "susp-EO-sf.json").exists()  # 孤本确实在盘上——正因如此必须降级
+    monkeypatch.undo()
+    assert s.load_all() == []  # 故障态禁止重挂:孤本不复活
+    assert s.persist("EO-next", {"operation_id": "EO-next"}) is False  # 故障态拒绝新持久化
+    assert not (tmp / "susp-EO-next.json").exists()
+    assert s._ops == {}  # 凭据仍 exactly-once 归还

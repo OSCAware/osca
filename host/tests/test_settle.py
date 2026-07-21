@@ -180,3 +180,37 @@ def test_partial_settlement_recorded_before_midway_exception(loaded, proxy, monk
     assert episode.settlements[0]["object"] == "OBJ-008" and episode.settlements[0]["settled"] is True
     case_path = loaded.root / "cases" / f"{episode.settlements[0]['case']}.yaml"
     assert case_path.is_file()  # 落盘与记账一致
+
+
+def test_no_case_published_when_revoke_races_ledger_lock(loaded, proxy, monkeypatch):
+    """三轮复核 P1：线程已通过 revoked 预检、阻塞于 ledger lock,期间 revoke——终局提交屏障
+    （commit_if_active 与 revoke 同一线性化锁）必须拦下,revoke 返回后零新 case。"""
+    import threading
+    from contextlib import contextmanager
+
+    import osca_host.settle as settle_mod
+
+    entered, release = threading.Event(), threading.Event()
+    real_lock = settle_mod.ledger_lock
+
+    @contextmanager
+    def gated_lock(root, **kwargs):
+        entered.set()  # 已通过 revoked 预检,正要进 ledger lock
+        release.wait(10)
+        with real_lock(root, **kwargs):
+            yield
+
+    monkeypatch.setattr(settle_mod, "ledger_lock", gated_lock)
+    episode = _episode({"OBJ-009": OBJECTIVE})
+    cases_before = sorted(p.name for p in (loaded.root / "cases").glob("*.yaml"))
+    box: dict = {}
+    worker = threading.Thread(target=lambda: box.update(r=settle_episode(loaded, proxy, episode)), daemon=True)
+    worker.start()
+    assert entered.wait(5)
+    proxy.policy.revoke("shutdown（测试注入,过检后 revoke）")
+    release.set()
+    worker.join(10)
+    assert not worker.is_alive()
+    (entry,) = box["r"]
+    assert entry["settled"] is False and "包已停" in entry["note"]
+    assert sorted(p.name for p in (loaded.root / "cases").glob("*.yaml")) == cases_before  # 零新 case

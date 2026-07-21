@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import inspect
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,19 +27,10 @@ from osca_host.executor import Executor, default_executors
 from osca_host.loader import LoadedPackage
 from osca_host.policy import PolicyInterceptor
 from osca_host.secret_resolver import EnvVarSecretResolver, SecretResolver
+from osca_host.timeouts import supports_keyword_timeout
 
 # scheme 允许 `_`（如 sql_readonly://）——否则含下划线的 scheme 主机名抽取落空、host=整串、egress 永远拒
 ENDPOINT_HOST = re.compile(r"^[a-z+_]+://([^/:@]+@)?([A-Za-z0-9.-]+)")
-
-
-def _executor_supports_timeout(executor: Executor) -> bool:
-    """执行器是否接收 timeout（剩余预算传导，复核 P2）。老驱动无参不传——不炸不改契约；
-    逐接口 deadline 仍由调用方（runner）强制，timeout 只是把在途单次外呼也收紧。"""
-    try:
-        params = inspect.signature(executor.execute).parameters
-    except (TypeError, ValueError):
-        return False
-    return "timeout" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _scrub_secret(node: object, secret: str) -> object:
@@ -293,8 +283,17 @@ class ConnectorProxy:
         if executor is None:
             return None, f"不识别的 endpoint scheme「{scheme}」——fail-closed（无对应执行器；生产驱动由部署侧注入）"
         kwargs = {}
-        if timeout is not None and _executor_supports_timeout(executor):
-            kwargs["timeout"] = timeout  # 剩余预算传导（复核 P2）；老驱动无参不传、不炸
+        if timeout is not None:
+            # deadline 强制契约（复核 P2，与 LLM 通道同口径）：剧集声明了 max_minutes（timeout 非 None）
+            # 而执行器无 timeout 有界执行契约 → fail-closed 拒绝发起——无界外呼会把硬预算做成
+            # fail-open（调用返回前预算无从强制）。老驱动只在未声明 max_minutes 的部署里保持兼容。
+            supported, why = supports_keyword_timeout(executor.execute)
+            if not supported:
+                return None, (
+                    f"「{scheme}」执行器无 timeout 有界执行契约（{why}），而剧集声明了 max_minutes 硬顶——"
+                    "fail-closed 拒绝发起（宁可拒绝，不可无界外呼）；未声明 max_minutes 的部署不受影响"
+                )
+            kwargs["timeout"] = timeout  # 剩余预算传导（复核 P2）
         try:
             payload, error = executor.execute(
                 endpoint=endpoint,

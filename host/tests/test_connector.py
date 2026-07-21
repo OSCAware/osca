@@ -458,9 +458,8 @@ def test_mock_fixture_symlink_loop_no_traceback(proxy, mock_dir):
     assert payload is None and err
 
 
-def test_remaining_timeout_forwarded_only_to_supporting_executor(sample_pack):
-    """复核 P2：proxy.call(timeout=…) 经签名探测转交执行器——新驱动收到剩余预算,老驱动（无
-    timeout 形参）不传也不炸（deadline 仍由调用方逐接口强制）。"""
+def test_remaining_timeout_forwarded_to_supporting_executor(sample_pack):
+    """复核 P2：proxy.call(timeout=…) 把剩余预算转交声明契约的执行器。"""
     _, loaded = load_for_host(sample_pack, require_bindings=False)
     policy = PolicyInterceptor(loaded.package_id, {"egress": {"allow_domains": ["fin.internal"]}}, {})
     seen: dict[str, object] = {}
@@ -470,18 +469,77 @@ def test_remaining_timeout_forwarded_only_to_supporting_executor(sample_pack):
             seen["timeout"] = timeout
             return {"rows": []}, None
 
-    class OldStyle:
-        def execute(self, *, endpoint, interface, params, secret, is_write, pack_root):
-            seen["old_called"] = True
-            return {"rows": []}, None
-
     bindings = {"FINANCE_DB": {"endpoint": "newproto://fin.internal/x"}}
     proxy = ConnectorProxy(loaded, bindings, policy, executors={"newproto": NewStyle()})
     receipt = proxy.call("CON-001.拉取费用明细", step=None, timeout=7.5)
     assert receipt.ok and seen["timeout"] == 7.5
 
-    proxy_old = ConnectorProxy(
+
+def test_executor_without_timeout_contract_fails_closed_under_max_minutes(sample_pack):
+    """三轮复核 P2：声明了 max_minutes（timeout 非 None）而执行器无 timeout 契约 → fail-closed
+    拒绝发起（无界外呼会把硬预算做成 fail-open）；未声明 max_minutes（timeout=None）保持兼容。"""
+    _, loaded = load_for_host(sample_pack, require_bindings=False)
+    policy = PolicyInterceptor(loaded.package_id, {"egress": {"allow_domains": ["fin.internal"]}}, {})
+    calls = {"n": 0}
+
+    class OldStyle:
+        def execute(self, *, endpoint, interface, params, secret, is_write, pack_root):
+            calls["n"] += 1
+            return {"rows": []}, None
+
+    proxy = ConnectorProxy(
         loaded, {"FINANCE_DB": {"endpoint": "oldproto://fin.internal/x"}}, policy, executors={"oldproto": OldStyle()}
     )
-    receipt = proxy_old.call("CON-001.拉取费用明细", step=None, timeout=7.5)
-    assert receipt.ok and seen.get("old_called") is True
+    receipt = proxy.call("CON-001.拉取费用明细", step=None, timeout=7.5)
+    assert not receipt.ok and "无 timeout 有界执行契约" in receipt.error
+    assert calls["n"] == 0  # fail-closed：一次都不发起
+
+    receipt = proxy.call("CON-001.拉取费用明细", step=None)  # 未声明 max_minutes：兼容
+    assert receipt.ok and calls["n"] == 1
+
+
+def test_positional_only_timeout_param_fails_closed_not_typeerror(sample_pack):
+    """三轮复核 P3：timeout 形参是 positional-only——按关键字传必 TypeError。签名判据须判
+    「不支持」并走 fail-closed 契约拒绝，不许穿成执行器异常回执。"""
+    _, loaded = load_for_host(sample_pack, require_bindings=False)
+    policy = PolicyInterceptor(loaded.package_id, {"egress": {"allow_domains": ["fin.internal"]}}, {})
+    calls = {"n": 0}
+
+    class PosOnly:
+        def execute(self, timeout=None, /, *, endpoint, interface, params, secret, is_write, pack_root):
+            calls["n"] += 1
+            return {"rows": []}, None
+
+    proxy = ConnectorProxy(
+        loaded, {"FINANCE_DB": {"endpoint": "posproto://fin.internal/x"}}, policy, executors={"posproto": PosOnly()}
+    )
+    receipt = proxy.call("CON-001.拉取费用明细", step=None, timeout=5.0)
+    assert not receipt.ok and "positional-only" in receipt.error  # 契约拒绝,非「执行器执行异常」
+    assert calls["n"] == 0
+
+
+def test_supports_keyword_timeout_judges_parameter_kinds():
+    """共用签名判据（osca_host.timeouts,LLM 与 Connector 单一真理源）的参数种类矩阵。"""
+    from osca_host.timeouts import supports_keyword_timeout
+
+    def keyword_or_positional(timeout=None):
+        pass
+
+    def keyword_only(*, timeout=None):
+        pass
+
+    def var_keyword(**kwargs):
+        pass
+
+    def positional_only(timeout=None, /):
+        pass
+
+    def no_timeout(x=None):
+        pass
+
+    assert supports_keyword_timeout(keyword_or_positional)[0] is True
+    assert supports_keyword_timeout(keyword_only)[0] is True
+    assert supports_keyword_timeout(var_keyword)[0] is True
+    supported, why = supports_keyword_timeout(positional_only)
+    assert supported is False and "positional-only" in why
+    assert supports_keyword_timeout(no_timeout)[0] is False

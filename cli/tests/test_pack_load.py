@@ -497,3 +497,72 @@ def test_swap_failure_restores_previous_deployment(make_pkg, base, tmp_path, mon
     assert any("发布切换失败" in line and "已恢复原位" in line for line in r.lines)
     monkeypatch.undo()
     assert _snapshot_tree(dest) == baseline  # 旧部署恢复原位、字节不变
+
+
+# ── 切换的跨进程互斥与并发占用恢复（三轮复核 P1） ──
+
+
+def test_swap_serialized_by_cross_process_flock(make_pkg, base, tmp_path):
+    """dest 切换受跨进程 flock 保护：他持锁期间本进程的切换必须等待,不并发动 dest。"""
+    import fcntl
+    import os as os_mod
+    import threading
+
+    zip1 = _packed(make_pkg, base, tmp_path)
+    dest = tmp_path / "deploy"
+    lock_path = tmp_path / f".{dest.name}.osca-swap.lock"
+    lock_path.touch()
+    fd = os_mod.open(lock_path, os_mod.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # 模拟另一部署进程持锁
+    box: dict = {}
+    worker = threading.Thread(target=lambda: box.update(r=load_osca(zip1, dest=dest)), daemon=True)
+    attempting = threading.Event()
+    real_flock = fcntl.flock
+
+    def spy(lfd, op):
+        if op == fcntl.LOCK_EX and lfd != fd:
+            attempting.set()
+        return real_flock(lfd, op)
+
+    fcntl.flock = spy
+    try:
+        worker.start()
+        assert attempting.wait(10)  # 已到锁点
+        assert not dest.exists()  # 持锁期间切换不得发生
+        fcntl.flock = real_flock
+        real_flock(fd, fcntl.LOCK_UN)
+        worker.join(10)
+    finally:
+        fcntl.flock = real_flock
+        os_mod.close(fd)
+    result, root = box["r"]
+    assert result.ok and dest.exists()  # 释放后切换完成
+
+
+def test_swap_failure_with_concurrent_root_quarantines_and_restores(make_pkg, base, tmp_path, monkeypatch):
+    """第二次 rename 失败 + root 被并发占用：闯入内容隔离到 quarantine、旧部署恢复原位——
+    不静默把错误内容留在 dest,也不丢旧部署。"""
+    import os as os_mod
+
+    zip1 = _packed(make_pkg, base, tmp_path)
+    dest = tmp_path / "deploy"
+    r1, _ = load_osca(zip1, dest=dest)
+    assert r1.ok
+    baseline = _snapshot_tree(dest)
+    real_rename = os_mod.rename
+
+    def failing_rename(src, dst, **kwargs):
+        if str(dst) == str(dest) and ".osca-tmp-" in str(src):
+            dest.mkdir()  # 模拟:失败瞬间并发进程抢占了 root
+            (dest / "闯入者.txt").write_text("并发内容", encoding="utf-8")
+            raise OSError("模拟第二次 rename 失败")
+        return real_rename(src, dst, **kwargs)
+
+    monkeypatch.setattr(packer.os, "rename", failing_rename)
+    r, root = load_osca(zip1, dest=dest)
+    monkeypatch.undo()
+    assert not r.ok and root is None
+    assert any("隔离" in line and "已恢复原位" in line for line in r.lines)
+    assert _snapshot_tree(dest) == baseline  # 旧部署归位、字节不变
+    (quarantined,) = list(tmp_path.glob(f".{dest.name}.osca-quarantine-*"))
+    assert (quarantined / "闯入者.txt").read_text(encoding="utf-8") == "并发内容"  # 闯入内容被隔离留证

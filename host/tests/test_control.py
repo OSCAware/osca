@@ -1615,3 +1615,55 @@ def test_process_exits_within_deadline_with_hung_worker(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "STOPPED" in proc.stdout
     assert time_mod.monotonic() - started < 15  # 进程限期退出（卡死线程随进程消亡）
+
+
+async def test_late_load_worker_never_mutates_dest_after_stopped(sock_path, sample_pack, tmp_path, monkeypatch):
+    """三轮复核 P1：load worker 卡在切换前,Host STOPPED 后才释放——作废令牌使其在磁盘写
+    副作用（索引/切换）之前止步,dest 必须完全不存在/不变。"""
+    import threading
+
+    from osca_cli import packer as packer_mod
+    from osca_cli.packer import pack_package
+
+    import osca_host.host as host_mod
+
+    _, zip_path = pack_package(sample_pack, tmp_path / "pack.osca.zip")
+    assert zip_path is not None
+    dest = tmp_path / "deploy-dest"
+    entered, release, worker_done = threading.Event(), threading.Event(), threading.Event()
+    real_rebuild = packer_mod.rebuild_index
+
+    def gated_rebuild(root, pkg=None):
+        entered.set()
+        release.wait(10)  # 卡在校验流水线末步（切换之前）
+        return real_rebuild(root, pkg)
+
+    real_lfh = host_mod.load_for_host
+
+    def tracked_lfh(*args, **kwargs):
+        try:
+            return real_lfh(*args, **kwargs)
+        finally:
+            worker_done.set()
+
+    monkeypatch.setattr(packer_mod, "rebuild_index", gated_rebuild)
+    monkeypatch.setattr(host_mod, "load_for_host", tracked_lfh)
+    host = Host(sock_path)
+    host.deployments["z"] = {"path": str(zip_path), "dest": str(dest), "bindings": _stub_bindings(sample_pack)}
+    run_task = asyncio.create_task(host.run())
+    for _ in range(100):
+        if host.control.socket_path.exists():
+            break
+        await asyncio.sleep(0.01)
+    load_task = asyncio.create_task(_send({"cmd": "load", "deployment_id": "z"}, host))
+    assert await asyncio.to_thread(entered.wait, 5)  # worker 已卡在切换前
+    host._stop.set()
+    assert await asyncio.wait_for(run_task, timeout=10) == 0
+    assert host.state.name == "STOPPED"
+    assert not dest.exists()  # STOPPED 时 dest 未被创建
+    release.set()  # STOPPED 之后 worker 才继续
+    assert await asyncio.to_thread(worker_done.wait, 10)
+    assert not dest.exists()  # 迟到 worker 被作废令牌止步:dest 完全不变
+    assert not list(tmp_path.glob(f".{dest.name}.osca-tmp-*"))  # 临时目录亦清理
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(load_task, timeout=5)

@@ -12,12 +12,15 @@ load 的四步：解压（或原地）→ 完整性校验（防篡改）→ lint
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import re
 import shutil
 import time
 import zipfile
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -363,27 +366,60 @@ def _dest_error(root: Path) -> str | None:
     return None
 
 
-def _swap_into_dest(tmp: Path, root: Path) -> str | None:
-    """**已通过全部校验**的临时目录原子上位（P1 升级安全）：旧目录先挪开、新目录 rename 上位、
-    成功后才删旧。任一步失败恢复旧目录并清理临时目录——升级失败绝不销毁上一版部署。"""
-    old: Path | None = None
-    moved_old = False
+@contextmanager
+def _swap_lock(root: Path):
+    """dest 的**跨进程**切换互斥（复核 P1）：flock 锁文件住 dest 旁——两个部署进程对同一 dest
+    的「挪旧/上位/删旧」序列串行化；进程内 asyncio 锁关不住跨进程并发。"""
+    lock_path = root.parent / f".{root.name}.osca-swap.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o644)
     try:
-        if root.exists():
-            old = root.parent / f".{root.name}.osca-old-{os.getpid()}-{time.monotonic_ns()}"
-            os.rename(root, old)
-            moved_old = True
-        os.rename(tmp, root)
-    except OSError as e:
-        restored = ""
-        if moved_old and not root.exists():
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _swap_into_dest(tmp: Path, root: Path) -> str | None:
+    """**已通过全部校验**的临时目录原子上位（P1 升级安全）：跨进程 flock 内挪旧 → 上位 → 删旧。
+
+    上位失败的恢复纪律（复核 P1）：若 root 已被锁外闯入者占用，先把未知内容**隔离**到
+    quarantine 再把旧部署归位——绝不静默把错误内容留在 dest、也绝不丢弃合法旧部署。
+    """
+    old: Path | None = None
+    try:
+        with _swap_lock(root):
+            # 锁内重查可接管性：_dest_error 首查与拿锁之间 dest 可能被并发换成用户内容——
+            # 锁内不过判据就放弃，绝不把来历不明的目录挪走再删掉
+            error = _dest_error(root)
+            if error:
+                shutil.rmtree(tmp, ignore_errors=True)
+                return f"{error}（切换前锁内复核）"
+            if root.exists():
+                old = root.parent / f".{root.name}.osca-old-{os.getpid()}-{time.monotonic_ns()}"
+                os.rename(root, old)
             try:
-                os.rename(old, root)
-                restored = "；旧部署已恢复原位"
-            except OSError:
-                restored = f"；旧部署恢复失败，暂存于 {old}（请人工归位）"
+                os.rename(tmp, root)
+            except OSError as e:
+                shutil.rmtree(tmp, ignore_errors=True)
+                if old is None:
+                    return f"发布切换失败：{e}"
+                notes = []
+                try:
+                    if root.exists() or root.is_symlink():
+                        quarantine = root.parent / f".{root.name}.osca-quarantine-{os.getpid()}-{time.monotonic_ns()}"
+                        os.rename(root, quarantine)
+                        notes.append(f"锁外并发占用内容已隔离到 {quarantine}")
+                    os.rename(old, root)
+                    notes.append("旧部署已恢复原位")
+                except OSError as restore_error:
+                    notes.append(f"恢复失败（旧部署暂存于 {old}，请人工归位）：{restore_error}")
+                return f"发布切换失败：{e}（{'；'.join(notes)}）"
+    except OSError as e:
         shutil.rmtree(tmp, ignore_errors=True)
-        return f"发布切换失败：{e}{restored}"
+        return f"发布切换失败（swap 跨进程锁）：{e}"
     if old is not None:
         shutil.rmtree(old, ignore_errors=True)
     return None
@@ -396,6 +432,7 @@ def _validate_package_root(
     from_zip: bool,
     bindings: str | Path | None,
     require_bindings: bool,
+    abort: Callable[[], str | None] | None = None,
 ) -> bool:
     """装载校验流水线（符号链接 → 完整性 → lint → binding 门禁 → 重建索引），全过才 True。
 
@@ -454,6 +491,12 @@ def _validate_package_root(
             f"部署时必须注入：{', '.join(sorted(required))}"
         )
 
+    # 装载作废令牌（复核 P1）：rebuild_index 是本流水线里**第一处磁盘写**（目录模式直接写真实
+    # 包目录）——被取消/关停/换代作废的迟到 load worker 在写之前复核，作废即止步零写入
+    if abort is not None and (why := abort()):
+        result.fail(f"装载已作废：{why}——校验止步，不写入索引（迟到 load 零磁盘副作用）")
+        return False
+
     # 重建索引（zip 模式建在临时目录里，随原子切换一并上位）
     index_path = rebuild_index(root)
     result.step(f"签名表已重建：{index_path.relative_to(root).as_posix()}")
@@ -466,12 +509,17 @@ def load_osca(
     bindings: str | Path | None = None,
     *,
     require_bindings: bool = False,
+    abort: Callable[[], str | None] | None = None,
 ) -> tuple[OpResult, Path | None]:
     """装载校验。require_bindings=True（Host 部署装载）：包声明了 required bindings 却未注入
     部署环境即失败——「无环境只校验包」是 CLI 的显式校验模式，不得称为部署装载成功。
 
     zip 模式**先验后切换**（P1 升级安全）：全部校验（符号链接/完整性/lint/binding/索引）在
     版本化临时目录完成，全过才原子切换 dest——失败的升级绝不销毁上一版部署。
+
+    abort（复核 P1 作废令牌）：调用方（Host）注入的线程安全检查，返回非 None 即装载已作废
+    （关停/换代）。在**每处磁盘写副作用之前**复核（目录模式的 rebuild_index、zip 模式的
+    dest 切换）——被取消的迟到 load worker 不许在 STOPPED 之后修改部署目录。
     """
     source = Path(archive)
     result = OpResult()
@@ -479,7 +527,7 @@ def load_osca(
     if source.is_dir():
         result.info(f"输入为目录，原地装载校验：{source}")
         ok = _validate_package_root(
-            source, result, from_zip=False, bindings=bindings, require_bindings=require_bindings
+            source, result, from_zip=False, bindings=bindings, require_bindings=require_bindings, abort=abort
         )
         return (result, source) if ok else (result, None)
 
@@ -503,8 +551,15 @@ def load_osca(
         result.fail(str(e) if isinstance(e, ValueError) else f"解压失败：{e}")
         return result, None
     result.step("已解压到临时目录（先验后切换：全部校验过关才动 dest）")
-    if not _validate_package_root(tmp, result, from_zip=True, bindings=bindings, require_bindings=require_bindings):
+    if not _validate_package_root(
+        tmp, result, from_zip=True, bindings=bindings, require_bindings=require_bindings, abort=abort
+    ):
         shutil.rmtree(tmp, ignore_errors=True)  # 校验失败：只清临时目录，dest 上的旧部署一字节不动
+        return result, None
+    # 切换前复核作废令牌（复核 P1）：STOPPED/换代后的迟到 worker 到此为止——dest 一字节不动
+    if abort is not None and (why := abort()):
+        shutil.rmtree(tmp, ignore_errors=True)
+        result.fail(f"装载已作废：{why}——切换取消，dest 未被触碰（迟到 load 零磁盘副作用）")
         return result, None
     error = _swap_into_dest(tmp, root)
     if error:

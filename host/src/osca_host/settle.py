@@ -64,9 +64,9 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
         if not receipt.ok:
             note({"object": object_id, "settled": False, "note": f"对账取数失败：{receipt.error}"})
             continue
-        # 落账前 revoked 门（复核 P1「STOPPED 后零迟到副作用」）：取数放行后包停/关停（关停=逐包
-        # revoke）——迟到的对账线程不得再往账本落 case。取数自身已被 authorize_tool 拦，此门封
-        # 「取数成功在前、revoke 在后、落账在最后」的窗。
+        # 落账前 revoked 快路径（复核 P1「STOPPED 后零迟到副作用」）：省一次 ledger lock。
+        # 竞态窗（过检后阻塞于 ledger lock、期间 revoke）由下方 commit_if_active 的**终局提交
+        # 屏障**关死——不可逆的 link 落名在 policy._gate 内执行，与 revoke 同一线性化边界。
         if proxy.policy.revoked:
             note(
                 {
@@ -108,13 +108,28 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
                 },
                 "distillation": {"status": "pending"},
             }
+            aborted: str | None = None
             while True:
                 case["case_id"] = case_id
                 payload = yaml.safe_dump(case, allow_unicode=True, sort_keys=False).encode("utf-8")
-                if publish_file_in_dir(cases_fd, f"{case_id}.yaml", payload, overwrite=False):
+                # 终局提交屏障（复核 P1）：不可逆的发布动作在 policy._gate 内执行——与 revoke()
+                # 同一线性化边界，revoke 返回后不可能再有新 case 可见（锁外预检关不住
+                # 「过检后阻塞于 ledger lock、期间 revoke、恢复后落账」的窗）
+                active, published = proxy.policy.commit_if_active(
+                    lambda name=f"{case_id}.yaml", data=payload: publish_file_in_dir(
+                        cases_fd, name, data, overwrite=False
+                    )
+                )
+                if not active:
+                    aborted = str(published)  # 拒绝原因
+                    break
+                if published:
                     break
                 n += 1  # 无覆盖发布：撞号顺移重试（编号随内容重写保持一致），绝不截断他人内容
                 case_id = f"C-{n:04d}"
+        if aborted is not None:
+            note({"object": object_id, "settled": False, "note": f"{aborted}——终局提交拒绝（迟到副作用零落账）"})
+            continue
         note(
             {
                 "object": object_id,

@@ -388,3 +388,72 @@ def test_openapi_executor_bounds_urlopen_timeout_by_deadline(monkeypatch):
             timeout=deadline,
         )
         assert seen["timeout"] == expected, (deadline, seen)
+
+
+def test_sql_readonly_progress_handler_enforces_absolute_deadline(tmp_path):
+    """三轮复核 P2：sqlite connect timeout 只限锁等待——长查询本身靠 progress handler 按绝对
+    deadline 中断（递归 CTE 亿级迭代在 ~0.05s 处被截停,fail-closed 错误回执）。"""
+    import time as time_mod
+
+    db = _make_fee_db(tmp_path)
+    (tmp_path / "sql").mkdir()
+    (tmp_path / "sql" / "slow.sql").write_text(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 100000000)\nSELECT count(*) FROM c",
+        encoding="utf-8",
+    )
+    started = time_mod.monotonic()
+    rows, err = SqlReadonlyExecutor().execute(
+        endpoint=f"sql_readonly://localhost{db}",
+        interface={"impl": "sql/slow.sql"},
+        params={},
+        secret=None,
+        is_write=False,
+        pack_root=tmp_path,
+        timeout=0.05,
+    )
+    elapsed = time_mod.monotonic() - started
+    assert rows is None and err is not None  # 长查询被中断,不是跑完亿级迭代
+    assert elapsed < 5.0  # 远小于查询自然完成时长
+
+
+def test_openapi_total_deadline_bounds_slow_dribble_response():
+    """三轮复核 P2：慢滴漏响应（每 50ms 一字节,单次 socket op 从不超时）——总 deadline 在
+    分块读之间截停,socket timeout 单独关不住的总时长由绝对 deadline 兜住。"""
+    import socket
+    import threading
+    import time as time_mod
+
+    def serve(sock):
+        conn, _ = sock.accept()
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: application/json\r\n\r\n")
+        try:
+            for _ in range(100):
+                conn.sendall(b"x")
+                time_mod.sleep(0.05)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(1)
+    threading.Thread(target=serve, args=(s,), daemon=True).start()
+    host, port = s.getsockname()
+    started = time_mod.monotonic()
+    try:
+        payload, err = OpenapiExecutor().execute(
+            endpoint=f"openapi://{host}:{port}",
+            interface={"method": "GET", "path": "/slow"},
+            params={},
+            secret=None,
+            is_write=False,
+            pack_root=Path("."),
+            timeout=0.4,
+        )
+    finally:
+        s.close()
+    elapsed = time_mod.monotonic() - started
+    assert payload is None and err is not None  # 总 deadline/超时截停
+    assert elapsed < 3.0  # 远小于滴漏完整发完所需的 ~5s

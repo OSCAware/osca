@@ -20,6 +20,7 @@ from __future__ import annotations
 import http.client
 import json
 import sqlite3
+import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
@@ -110,10 +111,15 @@ class SqlReadonlyExecutor:
         # 命名绑定：dict → 缺失的命名参数默认 None（可选参数省略即 NULL）；非 dict → 全 None（无注入面）
         bind = defaultdict(lambda: None, params) if isinstance(params, dict) else defaultdict(lambda: None)
         conn = None
-        # 剩余预算传导（复核 P2）：sqlite 的 timeout 是锁等待上限——收紧到剩余预算与默认 5s 的较小值
+        # 剩余预算传导（复核 P2）：sqlite 的 connect timeout 只是**锁等待**上限——长查询本身要靠
+        # progress handler 按**绝对 deadline** 中断（每 ~5000 条 VM 指令检查一次，超时回非零即中止,
+        # 触发 OperationalError → fail-closed 错误回执）。
         busy_timeout = 5.0 if timeout is None else max(0.001, min(5.0, timeout))
+        deadline = None if timeout is None else time.monotonic() + max(0.001, timeout)
         try:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=busy_timeout)  # 只读连接
+            if deadline is not None:
+                conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 5000)
             conn.set_authorizer(_readonly_authorizer)  # 第二闸：拒 ATTACH/VACUUM/写 PRAGMA（mode=ro 只护主库不够）
             conn.row_factory = sqlite3.Row
             rows = [dict(r) for r in conn.execute(sql, bind).fetchall()]  # 参数化绑定（防注入）
@@ -194,13 +200,27 @@ class OpenapiExecutor:
                 return None, f"openapi {method} 写 params 非 JSON 可序列化——fail-closed（不静默改写被批内容）"
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        # 剩余预算传导（复核 P2）：单次外呼上限 = min(默认 10s, 调用方剩余预算)——预算只剩数秒时不许再吊满 10s
-        effective = 10.0 if timeout is None else max(0.001, min(10.0, timeout))
+        # 总 deadline（复核 P2）：socket timeout 只钳**单次阻塞操作**——慢滴漏响应可把总时长拖到
+        # 任意长。故双闸：单次 op 上限 = min(默认 10s, 剩余预算)，且响应体按 read1 分块读、块间按
+        # **绝对 deadline** 复核（慢滴漏在 deadline 处被截停，fail-closed）。
+        per_op = 10.0 if timeout is None else max(0.001, min(10.0, timeout))
+        deadline = None if timeout is None else time.monotonic() + max(0.001, timeout)
         try:
-            with _OPENER.open(req, timeout=effective) as resp:
-                # read(size) 读上限：巨响应体不触发 OOM（DoS + call() 恒回 Receipt）。注意带 size 参数**不**会对截断响应
-                # 抛 IncompleteRead，故截断由下方 Content-Length 比对显式 fail-closed（不静默把半截数据当取数结果）。
-                raw, status, declared = resp.read(_MAX_BODY + 1), resp.status, resp.getheader("Content-Length")
+            with _OPENER.open(req, timeout=per_op) as resp:
+                status, declared = resp.status, resp.getheader("Content-Length")
+                # 分块读 + 读上限：巨响应体不触发 OOM（DoS + call() 恒回 Receipt）。截断不在此判——
+                # 由下方 Content-Length 比对显式 fail-closed（不静默把半截数据当取数结果）。
+                chunks: list[bytes] = []
+                got = 0
+                while got <= _MAX_BODY:
+                    if deadline is not None and time.monotonic() > deadline:
+                        return None, f"openapi {method} 总 deadline 用尽（响应读取中止）——fail-closed"
+                    chunk = resp.read1(min(65536, _MAX_BODY + 1 - got))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    got += len(chunk)
+                raw = b"".join(chunks)
         except urllib.error.HTTPError as e:
             return None, f"openapi {method} 非 2xx：HTTP {e.code}"  # 只带状态码，不带响应体（可能含数据）
         except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
