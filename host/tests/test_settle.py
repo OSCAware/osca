@@ -26,7 +26,7 @@ def loaded(sample_pack, tmp_path):
     """样例包的 tmp 副本——对账会往 cases/ 追加账本，不许写回仓库。"""
     work = tmp_path / "pack"
     shutil.copytree(sample_pack, work)
-    _, pkg = load_for_host(work)
+    _, pkg = load_for_host(work, require_bindings=False)
     return pkg
 
 

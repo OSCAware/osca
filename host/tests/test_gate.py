@@ -94,3 +94,20 @@ def test_precondition_evaluator_pass_and_unevaluable():
     gate2.precondition_eval = lambda text: (None, "不可求值，默认放行")
     woke, verdict = gate2.on_trigger("AW-001/T1")
     assert woke and "不可求值" in verdict
+
+
+def test_reset_progress_clears_all_and_sequence_state():
+    """P1（disable 边界）：组合闸门的部分推进状态清除——旧代命中不与新代命中拼成假唤醒。"""
+    gate = make_gate({"combine": "all"})
+    woke, _ = gate.on_trigger("AW-001/T1")
+    assert not woke and gate._seen == {"AW-001/T1"}
+    gate.reset_progress()
+    woke, verdict = gate.on_trigger("AW-001/T2")
+    assert not woke and "1/2" in verdict  # 半程已清:重新计数,不因旧代 T1 凑满
+
+    seq = make_gate({"combine": "sequence"})
+    woke, _ = seq.on_trigger("AW-001/T1")
+    assert not woke and seq._seq == 1
+    seq.reset_progress()
+    woke, _ = seq.on_trigger("AW-001/T2")
+    assert not woke and seq._seq == 0  # 指针已清:T2 是乱序,不算推进完成

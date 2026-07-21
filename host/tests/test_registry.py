@@ -11,7 +11,7 @@ from osca_host.registry import Registry, RegistryError
 @pytest.fixture
 def registry_with_pack(sample_pack):
     registry = Registry()
-    _, loaded = load_for_host(sample_pack)
+    _, loaded = load_for_host(sample_pack, require_bindings=False)
     registry.register(loaded)
     return registry, loaded
 
@@ -25,7 +25,7 @@ def test_register_creates_watcher_slots(registry_with_pack):
 
 def test_duplicate_register_rejected(registry_with_pack, sample_pack):
     registry, _ = registry_with_pack
-    _, again = load_for_host(sample_pack)
+    _, again = load_for_host(sample_pack, require_bindings=False)
     with pytest.raises(RegistryError, match="已注册"):
         registry.register(again)
 

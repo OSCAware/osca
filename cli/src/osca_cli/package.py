@@ -15,6 +15,23 @@ import yaml
 # ID 语法：类型前缀 + 包内自增（SPEC §2）
 ID_TOKEN = re.compile(r"\b(?:OBJ|STR|CON|AW|J|C)-\d{3,4}\b")
 
+# YAML alias 炸弹防护（P1）：共享 alias 图对任何 naive 递归都是指数放大面。
+# 正常包远小于这些数——超限一律稳定拒绝，不许把解析/遍历烧成 CPU 黑洞。
+MAX_YAML_ALIASES = 1000
+_MAX_WALK_NODES = 1_000_000
+
+
+class BoundedSafeLoader(yaml.SafeLoader):
+    """SafeLoader + alias 总数上限——解析层就掐掉 alias 炸弹，不指望每个下游遍历都自防。"""
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.events.AliasEvent):
+            self._alias_count = getattr(self, "_alias_count", 0) + 1
+            if self._alias_count > MAX_YAML_ALIASES:
+                raise yaml.YAMLError(f"YAML alias 数超上限 {MAX_YAML_ALIASES}——拒绝解析（alias 炸弹防护）")
+        return super().compose_node(parent, index)
+
+
 # 目录 → 该目录下文件应有的 ID 前缀与 ID 字段名
 TYPED_DIRS: dict[str, tuple[str, str]] = {
     "objects": ("OBJ", "object_id"),
@@ -83,15 +100,32 @@ class OscaPackage:
 
 
 def _iter_strings(node: object):
-    """递归遍历 YAML 数据里的全部字符串值（键不遍历——键是字段名，不是引用）。"""
-    if isinstance(node, str):
-        yield node
-    elif isinstance(node, dict):
-        for v in node.values():
-            yield from _iter_strings(v)
-    elif isinstance(node, list):
-        for v in node:
-            yield from _iter_strings(v)
+    """遍历 YAML 数据里的全部字符串值（键不遍历——键是字段名，不是引用）。
+
+    容器按对象 identity 去重 + 总节点预算（P1 alias 炸弹防护）：共享 alias 子图只走一次
+    （调用方只收集集合，重复遍历无语义），递归 alias（自引用结构）不死循环；预算超限抛
+    ValueError（lint run_all 兜底转规则 ERROR）。显式栈迭代——超深结构不炸递归栈。
+    """
+    seen: set[int] = set()
+    budget = _MAX_WALK_NODES
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        budget -= 1
+        if budget < 0:
+            raise ValueError(f"YAML 数据遍历超预算（>{_MAX_WALK_NODES} 节点）——拒绝继续（alias 炸弹防护）")
+        if isinstance(cur, str):
+            yield cur
+        elif isinstance(cur, dict):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            stack.extend(cur)
 
 
 def referenced_ids(f: YamlFile) -> set[str]:
@@ -110,10 +144,14 @@ def load_package(root: Path) -> OscaPackage:
         if rel.split("/", 1)[0] in SKIP_DIRS:
             continue
         try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            data = yaml.load(path.read_text(encoding="utf-8"), Loader=BoundedSafeLoader)
             pkg.yaml_files[rel] = YamlFile(relpath=rel, data=data)
         except yaml.YAMLError as e:
             pkg.yaml_files[rel] = YamlFile(relpath=rel, data=None, parse_error=str(e))
+        except RecursionError:
+            # 超深嵌套在解析层炸递归栈——转稳定 parse_error（OSCA003 报告并拒绝），不许 traceback 穿透
+            error = "YAML 嵌套过深（RecursionError）——拒绝解析"
+            pkg.yaml_files[rel] = YamlFile(relpath=rel, data=None, parse_error=error)
         except (UnicodeDecodeError, OSError) as e:
             # 二进制伪装 .yaml（如 PNG 改名）/ 读取失败：不许 traceback 穿透 lint/pack/load——
             # 一律转 parse_error，由 OSCA003 稳定报告并拒绝（GPT Review P2）

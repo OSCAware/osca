@@ -5,6 +5,7 @@
 - watch：轮询器，按 every 经 poller（Connector 代理）取数，emit_when 命中才发射；
   数据绑定在包上，去重共享只在包内（不同包的 CON-001 可能是不同系统）；
   无 emit_when 时按「状态变化」发射；emit_when 不可求值或取数失败只计 tick 留痕；
+  state_key 声明时按该键提取目标状态（缓存/比较/emit_when 求值域都只看它），字段缺失 fail-closed 不发射；
 - event：登记不布防，由控制通道人工发射（对应样例 T3「操作者控制台按钮」）。
 去重：相同 (kind, spec[, 包域]) 只建一个 watcher，多个订阅共享（引用计数 = 订阅数）。
 """
@@ -176,6 +177,7 @@ class TriggerTable:
             return
         uses = str(watcher.spec.get("uses"))
         emit_when = watcher.spec.get("emit_when")
+        state_key = watcher.spec.get("state_key")
         while True:
             await asyncio.sleep(every.total_seconds())
             watcher.ticks += 1
@@ -188,11 +190,31 @@ class TriggerTable:
                 log.info(f"轮询 tick {watcher.key}（{uses}）：poller 未注入，只计 tick（第 {watcher.ticks} 次）")
                 continue
             # 取数下线程（GPT Review P1）：poll 经 Connector 代理可能做真实网络取数（urllib timeout 10s）——
-            # 在事件循环上同步调它会压住控制通道（status/stop/审批）整整一次外呼的时长
-            new_state = await asyncio.to_thread(poll, uses)
+            # 在事件循环上同步调它会压住控制通道（status/stop/审批）整整一次外呼的时长。
+            # 逐轮异常边界（P1）：一次瞬时异常（网络抖动/代理内部错）不许永久杀死共享 watcher 的循环
+            # 任务（watcher 显示存在、实际已死）——记录后继续下一轮；CancelledError（撤防/关停）照常传播。
+            try:
+                new_state = await asyncio.to_thread(poll, uses)
+            except Exception:
+                log.exception(f"轮询 {watcher.key}（{uses}）本轮异常，跳过继续（第 {watcher.ticks} 次；watcher 存活）")
+                continue
             if new_state is None:
                 log.warning(f"轮询 {watcher.key}（{uses}）取数失败，本轮不发射（第 {watcher.ticks} 次）")
                 continue
+            if state_key is not None:
+                # state_key（P1）：按声明键提取目标状态——缓存与比较（含 emit_when 求值域）只看目标
+                # 字段，无关字段变化不再误唤醒。键非法/负载非 mapping/字段缺失 → fail-closed 留痕、
+                # 不发射、基线不动（不许拿缺字段的负载把状态洗掉）。
+                if not isinstance(state_key, str) or not state_key:
+                    log.warning(f"轮询 {watcher.key} state_key 非法（{state_key!r}，须非空字符串）——fail-closed 不发射")
+                    continue
+                if not isinstance(new_state, dict) or state_key not in new_state:
+                    log.warning(
+                        f"轮询 {watcher.key}（{uses}）state_key「{state_key}」在负载中缺失——"
+                        f"fail-closed 不发射（第 {watcher.ticks} 次）"
+                    )
+                    continue
+                new_state = {state_key: new_state[state_key]}
             old_state, watcher.state = watcher.state, new_state
             if old_state is None:
                 log.info(f"轮询 {watcher.key}（{uses}）首轮建立基线，不发射")

@@ -167,15 +167,24 @@ class ConnectorProxy:
 
         binding_ref = connector.get("binding_ref")
         binding = self.bindings.get(binding_ref) if binding_ref else None
-        if binding is None:
+        if not isinstance(binding, dict):
+            # 装载门禁（deployment_binding_errors）应已拦下缺失/非 mapping——此处是运行时 fail-closed
+            # 第二道闸（不猜、不兜底），绝不对着 list/scalar/null binding 继续取 endpoint
             return Receipt(
                 ok=False,
                 interface=interface_ref,
                 binding_ref=binding_ref,
-                error=f"部署环境未注入 binding {binding_ref}（binding 永不进包，缺失即报错）",
+                error=f"部署环境未注入 binding {binding_ref} 或形状非法（须为 mapping；binding 永不进包，缺失即报错）",
             )
 
-        endpoint = str(binding.get("endpoint", ""))
+        endpoint = binding.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            return Receipt(
+                ok=False,
+                interface=interface_ref,
+                binding_ref=binding_ref,
+                error=f"binding {binding_ref} 缺非空 endpoint——装载门禁判据同源，运行时 fail-closed",
+            )
         if endpoint.startswith("mock://"):
             # 写接口走 mock 写执行器（落地被批准的 params）；读接口走 mock 固件执行器
             payload, error = (

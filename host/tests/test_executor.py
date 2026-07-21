@@ -348,3 +348,18 @@ def test_sql_readonly_impl_symlink_loop_no_traceback(tmp_path):
     loop.symlink_to(loop.name)  # 自指链接环
     rows, err = _run_sql(db, "sql/loop.sql", {}, pack_root=pack)
     assert rows is None and err  # 越界或缺失（按解释器版本收敛），恒不 traceback
+
+
+def test_openapi_write_body_equals_approved_payload_for_all_json_types(http_addr):
+    """P1：审批过什么就发什么——str/数字/bool/null/list/mapping 的 wire body 必须与被批 params
+    完全一致（修复前标量被静默改写成 {}，击穿「审批展示、摘要、落地内容一致」）。"""
+    for params in ("字符串内容", 42, 3.14, True, False, None, [1, "a", {"n": 2}], {"改价": 4.5}):
+        payload, err = _run_http(http_addr, {"method": "POST", "path": "/write"}, params, is_write=True)
+        assert err is None, (params, err)
+        assert json.loads(payload["body"]) == params, params
+
+
+def test_openapi_write_non_serializable_params_refused_not_rewritten(http_addr):
+    """非 JSON 可序列化的 params：显式拒绝（fail-closed），绝不静默改写后落地。"""
+    payload, err = _run_http(http_addr, {"method": "POST", "path": "/write"}, object(), is_write=True)
+    assert payload is None and "非 JSON 可序列化" in err

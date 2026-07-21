@@ -6,7 +6,7 @@ from osca_host.loader import load_for_host
 
 
 def test_load_sample_pack(sample_pack):
-    result, loaded = load_for_host(sample_pack)
+    result, loaded = load_for_host(sample_pack, require_bindings=False)
     assert result.ok
     assert loaded is not None
     assert loaded.package_id == "demo-group-oper-diagnosis"
@@ -15,7 +15,7 @@ def test_load_sample_pack(sample_pack):
 
 
 def test_awares_parsed(sample_pack):
-    _, loaded = load_for_host(sample_pack)
+    _, loaded = load_for_host(sample_pack, require_bindings=False)
     aware = next(a for a in loaded.awares if a.aware_id == "AW-001")
     assert aware.enabled
     assert aware.then == "STR-001"
@@ -28,7 +28,7 @@ def test_awares_parsed(sample_pack):
 
 def test_reject_invalid_pack(tmp_path):
     (tmp_path / "osca.yaml").write_text("format: osca\n", encoding="utf-8")
-    result, loaded = load_for_host(tmp_path)
+    result, loaded = load_for_host(tmp_path, require_bindings=False)
     assert not result.ok
     assert loaded is None
 
@@ -52,26 +52,33 @@ def _pack_with_manifest(sample_pack, tmp_path, **overrides):
 
 def test_reject_unsupported_format_version(sample_pack, tmp_path):
     root = _pack_with_manifest(sample_pack, tmp_path, format_version="0.2")
-    result, loaded = load_for_host(root)
+    result, loaded = load_for_host(root, require_bindings=False)
     assert loaded is None
     assert any("format_version 0.2 不受支持" in line for line in result.lines)
 
 
 def test_reject_unmet_runtime_requirement(sample_pack, tmp_path):
     root = _pack_with_manifest(sample_pack, tmp_path, requires={"runtime": ">=9.9", "bindings": ["FINANCE_DB"]})
-    result, loaded = load_for_host(root)
+    result, loaded = load_for_host(root, require_bindings=False)
     assert loaded is None
     assert any("requires.runtime" in line or "包要求 runtime" in line for line in result.lines)
 
 
 def test_reject_unparseable_runtime_requirement(sample_pack, tmp_path):
     root = _pack_with_manifest(sample_pack, tmp_path, requires={"runtime": "latest", "bindings": ["FINANCE_DB"]})
-    result, loaded = load_for_host(root)
+    result, loaded = load_for_host(root, require_bindings=False)
     assert loaded is None
     assert any("不可解析" in line for line in result.lines)
 
 
 def test_sample_pack_runtime_requirement_satisfied(sample_pack):
-    result, loaded = load_for_host(sample_pack)
+    result, loaded = load_for_host(sample_pack, require_bindings=False)
     assert loaded is not None
     assert any("runtime 契约校验通过" in line for line in result.lines)
+
+
+def test_load_for_host_requires_bindings_by_default(sample_pack):
+    """P1 装载门禁：Host 生产路径默认 require_bindings=True——包声明 required bindings 未注入即拒。"""
+    result, loaded = load_for_host(sample_pack)
+    assert loaded is None
+    assert any("部署装载必须注入 bindings" in line for line in result.lines)

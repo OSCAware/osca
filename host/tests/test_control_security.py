@@ -41,6 +41,13 @@ async def running_host(sock_path):
     await asyncio.wait_for(task, timeout=5)
 
 
+def _spec(pack_path) -> dict:
+    """部署 spec + stub bindings：P1 装载门禁后 required bindings 必须注入（mock stub 即可）。"""
+    bindings = Path(pack_path).parent / f"{Path(pack_path).name}-stub-bindings.yaml"
+    bindings.write_text(yaml.safe_dump({"FINANCE_DB": {"endpoint": "mock:///nonexistent"}}), encoding="utf-8")
+    return {"path": str(pack_path), "bindings": str(bindings)}
+
+
 async def _send(request, host, token=None):
     return await asyncio.to_thread(send_command, request, host.control.socket_path, 30.0, token)
 
@@ -607,7 +614,7 @@ async def test_slow_load_does_not_block_status(running_host, sample_pack, monkey
         return real(*args, **kwargs)
 
     monkeypatch.setattr(host_mod, "load_for_host", slow)
-    host.deployments["slow"] = {"path": str(sample_pack)}
+    host.deployments["slow"] = _spec(sample_pack)
     load_task = asyncio.create_task(_send({"cmd": "load", "deployment_id": "slow"}, host))
     assert await asyncio.to_thread(entered.wait, 5)  # 确认慢准备分支已经进入
     started = time.monotonic()
@@ -690,7 +697,7 @@ async def test_same_deployment_concurrent_loads_share_one_preparation(running_ho
     import osca_host.host as host_mod
 
     host = running_host
-    host.deployments["same"] = {"path": str(sample_pack)}
+    host.deployments["same"] = _spec(sample_pack)
     real = host_mod.load_for_host
     entered, release = threading.Event(), threading.Event()
     guard = threading.Lock()
@@ -730,7 +737,7 @@ async def test_different_deployments_prepare_in_parallel(running_host, sample_pa
         encoding="utf-8",
     )
     host = running_host
-    host.deployments.update({"one": {"path": str(sample_pack)}, "two": {"path": str(second_pack)}})
+    host.deployments.update({"one": _spec(sample_pack), "two": _spec(second_pack)})
     real = host_mod.load_for_host
     both_entered, release = threading.Event(), threading.Event()
     guard = threading.Lock()
@@ -763,7 +770,7 @@ async def test_unload_tombstone_beats_old_load_generation(running_host, sample_p
     host = running_host
     did = "generation"
     pid = "demo-group-oper-diagnosis"
-    host.deployments[did] = {"path": str(sample_pack)}
+    host.deployments[did] = _spec(sample_pack)
 
     real = host_mod.load_for_host
     old_entered, release_old, new_entered = threading.Event(), threading.Event(), threading.Event()

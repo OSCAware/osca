@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -30,6 +31,19 @@ ENV_MODEL = "OSCA_LLM_MODEL"
 ENV_KEY = "OSCA_LLM_API_KEY"
 
 TIMEOUT_SECONDS = 120
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}  # API key 走明文 http 仅限本地回环（开发面）
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不跟随重定向——Authorization 头绝不许被 3xx 带去别的 origin。网关地址是显式部署配置，
+    重定向即异常；3xx 按 HTTPError 走统一失败路径。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 class LLMError(Exception):
@@ -70,11 +84,19 @@ class OpenAICompatLLM:
         ).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
+            # API key 强制 HTTPS（P1）：明文 http 会把 Bearer 凭据裸奔外发——仅本地回环豁免（开发面）。
+            split = urllib.parse.urlsplit(self.base_url)
+            host = (split.hostname or "").lower()
+            if split.scheme != "https" and host not in _LOOPBACK_HOSTS:
+                raise LLMError(
+                    f"LLM 网关携带 API key 却走非 https（{split.scheme or '无 scheme'}://{host or '?'}）——"
+                    f"拒绝发起：凭据明文外发风险；本地开发仅允许回环地址走 http（{tag}）"
+                )
             headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(f"{self.base_url}/chat/completions", data=body, headers=headers)
         effective = TIMEOUT_SECONDS if timeout is None else min(TIMEOUT_SECONDS, max(0.001, timeout))
         try:
-            with urllib.request.urlopen(request, timeout=effective) as resp:  # noqa: S310 —— 网关地址来自部署环境
+            with _OPENER.open(request, timeout=effective) as resp:  # noqa: S310 —— 网关地址来自部署环境；不跟随重定向
                 payload = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
             raise LLMError(f"LLM 网关调用失败（{tag}）：{e}") from e

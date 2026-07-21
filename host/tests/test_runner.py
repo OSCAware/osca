@@ -17,7 +17,7 @@ from osca_host.runner import _run_optimizer, _step_user_prompt, render_system_pr
 
 @pytest.fixture
 def loaded(sample_pack):
-    _, pkg = load_for_host(sample_pack)
+    _, pkg = load_for_host(sample_pack, require_bindings=False)
     return pkg
 
 

@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import signal
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import asdict, replace
@@ -26,7 +27,7 @@ import yaml
 from osca_cli.findings import Severity
 from osca_cli.ledger import LedgerLockBusy, ledger_lock, ledger_stamp
 from osca_cli.package import load_package
-from osca_cli.packer import rebuild_index
+from osca_cli.packer import deployment_binding_errors, rebuild_index, required_bindings
 from osca_cli.rules import run_all
 
 from osca_host import __version__
@@ -90,6 +91,9 @@ class Host:
         self._deliver_locks: dict[str, asyncio.Lock] = {}
         self._stop = asyncio.Event()
         self.state = HostState.STARTING
+        # Aware 代际（P1）：disable 递增——停用前已进入慢投递（账本刷新/闸门裁决在线程）的旧代
+        # 投递，跨越「停用→重新启用」边界返回时按代际失配永久失效，不再创建剧集
+        self._aware_generations: dict[tuple[str, str], int] = {}
         self._deployment_generations: dict[str, int] = {}
         self._deployment_locks: dict[str, asyncio.Lock] = {}
         self._load_slots: dict[str, tuple[int, int, asyncio.Task]] = {}
@@ -98,6 +102,7 @@ class Host:
         self._operation_seq = 0
         self._last_unload_operation = 0
         self._control_tasks: set[asyncio.Task] = set()
+        self._episode_shutdown_timeout = 60.0  # 关停等在跑剧集的上限（秒）；测试可注入缩短
 
     # ── 控制命令（schema 与授权已在 ControlServer 裁决后才进到这里） ──────
 
@@ -254,9 +259,16 @@ class Host:
             pkg_bindings: dict = {}
             replay_kill_unprovable = False
             if loaded is not None:
-                # binding 按包隔离：本次注入只归本包——同名 binding 不跨包串线、卸载即清理
+                # binding 按包隔离：本次注入只归本包——同名 binding 不跨包串线、卸载即清理。
+                # 重读后再过一遍装载门禁（P1）：load_osca 校验与此处重读是两次 I/O，文件在其间被
+                # 换成非法形状不得静默带病发布（与 CLI 同一判据，单一真理源）
                 if spec.get("bindings"):
                     pkg_bindings = yaml.safe_load(Path(str(spec["bindings"])).read_text(encoding="utf-8")) or {}
+                    errors = deployment_binding_errors(pkg_bindings, required_bindings(loaded.root))
+                    if errors:
+                        for line in errors:
+                            result.fail(line)
+                        return result, None, {}, False
                 policy_file = loaded.pack.yaml_files.get("policy.yaml")
                 kill_entries = (policy_file.mapping.get("kill_switch") if policy_file else None) or []
                 has_replay_condition = any(
@@ -404,6 +416,11 @@ class Host:
             detail = f"触发器启：{aware_id} 重新布防 {len(aware.triggers)} 条"
         else:
             gate.enabled = False
+            # disable 边界（P1）：代际递增使所有旧代在途投递永久失效（撑过 disable→enable 也不发布）；
+            # 组合闸门的部分推进状态（all 已见/sequence 指针）一并清除——半程状态不跨启停边界
+            key = (package_id, aware_id)
+            self._aware_generations[key] = self._aware_generations.get(key, 0) + 1
+            gate.reset_progress()
             removed = self.table.unsubscribe(package_id, aware_id)
             detail = f"触发器停：{aware_id} 撤防 {len(removed)} 条（三级停之二）"
         self._sync_slots(package_id)
@@ -432,6 +449,9 @@ class Host:
                 gate = self.gates.get((package_id, aware_id))
                 policy = self.policies.get(package_id)
                 loaded = self.registry.packages.get(package_id)
+                # Aware 代际快照（P1）：投递开始取当时代际，每个 await 返回后复核——disable 递增代际，
+                # 旧代投递即便撑过 disable→enable（gate/policy/loaded 对象身份全不变）也永久失效
+                aware_generation = self._aware_generations.get((package_id, aware_id), 0)
                 if gate is None:
                     return f"{package_id}/{aware_id} 未布防或已卸载——投递不发布"
 
@@ -444,6 +464,8 @@ class Host:
                         or self.registry.packages.get(package_id) is not loaded
                     ):
                         return "包已卸载/重载——跨代投递不发布"
+                    if self._aware_generations.get((package_id, aware_id), 0) != aware_generation:
+                        return "Aware 已停用（disable）——旧代投递永久失效，不发布"
                     return None
 
                 if why := stale():  # 进锁即查：fire 短锁状态检查与投递之间的 stop/unload TOCTOU
@@ -564,9 +586,34 @@ class Host:
         self._episode_tasks.add(task)
         task.add_done_callback(self._episode_tasks.discard)
 
+    async def _run_in_daemon_thread(self, fn, *args):
+        """认知平面重活（run_episode）跑在**守护线程**（P1 关停语义）：asyncio.to_thread 的默认执行器
+        线程不可取消，且 asyncio.run 收尾时会无限等它——「60s 兜底」成空话：网关/写连接器卡死时
+        Host 已报 STOPPED、socket 已删，而进程永不退出、卡死的写还活着。守护线程随进程消亡，
+        关停上限对**进程退出**真实有界；结果经 call_soon_threadsafe 回事件循环（循环已关即丢弃）。"""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+
+        def _deliver(setter, value) -> None:
+            if not future.done():
+                setter(value)
+
+        def _runner() -> None:
+            try:
+                result = fn(*args)
+            except BaseException as e:  # noqa: BLE001 —— 异常原样回传给 await 方
+                with contextlib.suppress(RuntimeError):  # 循环已关：进程正在退出，结果无处交付
+                    loop.call_soon_threadsafe(_deliver, future.set_exception, e)
+            else:
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_deliver, future.set_result, result)
+
+        threading.Thread(target=_runner, name="osca-episode", daemon=True).start()
+        return await future
+
     async def _execute_episode(self, episode: Episode, loaded, proxy, policy) -> None:
         try:
-            await asyncio.to_thread(run_episode, episode, loaded, proxy, policy)
+            await self._run_in_daemon_thread(run_episode, episode, loaded, proxy, policy)
         except Exception:
             # 执行器内部错误不许让剧集永远停在 running——终态入台账，异常进日志
             episode.status = "failed"
@@ -823,7 +870,13 @@ class Host:
                 continue
             keep.append((episode, challenge, raw_tc, raw_tk))
         if to_delete:
-            await asyncio.to_thread(lambda: [store.delete(o) for o in to_delete])
+            try:
+                await asyncio.to_thread(lambda: [store.delete(o) for o in to_delete])
+            except OSError as e:
+                # delete 现在含目录 fsync（P1）：存储故障时批量清理可失败——放弃本次重挂（快照仍在盘，
+                # 下次装载再试），绝不带着「删没删成不确定」发布重挂
+                log.warning(f"[{package_id}] 废弃挂起快照清理失败，本次重挂放弃（下次装载重试）：{e}")
+                return
             if lifecycle_stale():
                 # 丢弃清理已做（本就是废快照，删了不冤）；重挂发布整体放弃——保留项快照仍在盘，下次重挂再续
                 log.info(f"[{package_id}] 重挂放弃：清理期间包已卸载/重载或 Host 关停（跨代不发布）")
@@ -925,15 +978,21 @@ class Host:
         if load_tasks:
             await asyncio.gather(*load_tasks, return_exceptions=True)
 
-        # 先等在跑剧集收尾（剧集短命，正常秒级；网关卡死时 60s 兜底放弃等待，线程随进程消亡）。
+        # 先等在跑剧集收尾（剧集短命，正常秒级；卡死时按上限放弃等待）。
         # **循环重拍快照直到集合为空**（GPT 四审 P1）：一次性快照会漏等等待期间新登记的任务
         # （恢复状态机已内联 await 消除子任务派生，这里是第二道保险——迟到任务不逃出关停）
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + self._episode_shutdown_timeout
         while self._episode_tasks and time.monotonic() < deadline:
             log.info(f"关停前等待 {len(self._episode_tasks)} 个在跑剧集收尾")
             await asyncio.wait(list(self._episode_tasks), timeout=max(0.1, deadline - time.monotonic()))
         if self._episode_tasks:
-            log.warning(f"{len(self._episode_tasks)} 个剧集未在 60s 内收尾，放弃等待")
+            # 超时诚实口径（P1）：剧集线程是守护线程，随本次进程退出被终止——STOPPED 报出后进程
+            # **真的**会退出（asyncio.run 不再被不可取消线程卡住），不存在「socket 已删、进程仍活、
+            # 卡死写还在跑」的假关停。残余半写属硬件半写同类，归写幂等键界定（W6 §8-5）。
+            log.warning(
+                f"{len(self._episode_tasks)} 个剧集未在 {self._episode_shutdown_timeout:.0f}s 内收尾——"
+                "放弃等待；其守护线程随进程退出终止，不阻塞关停"
+            )
         # 挂起等批的剧集无 task（INV-1 不持线程）→ 不会被上面等到；显式迁 stopped（L1 不持久，重启不恢复）
         self._stop_suspended_episodes(None, "Host 关停，挂起等批未兑现（L1 不持久，重启不恢复）")
 

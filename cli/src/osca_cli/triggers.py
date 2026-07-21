@@ -170,6 +170,8 @@ def validate_trigger(t: dict) -> list[str]:
             errors.append(f"[{tid}] watch 触发缺少 uses（CON-xxx.接口名）")
         if parse_duration(t.get("every")) is None:
             errors.append(f"[{tid}] watch.every={t.get('every')} 须为时长语法 <整数><s|m|h|d>（如 24h）")
+        if "state_key" in t and (not isinstance(t.get("state_key"), str) or not t.get("state_key")):
+            errors.append(f"[{tid}] watch.state_key 须为非空字符串（状态比对键）——运行时按它提取目标状态")
     elif kind == "event":
         if not t.get("source"):
             errors.append(f"[{tid}] event 触发缺少 source（触发来源说明）")

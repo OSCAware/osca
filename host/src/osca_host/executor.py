@@ -179,8 +179,13 @@ class OpenapiExecutor:
             if isinstance(params, dict) and params:
                 url = f"{url}?{urlencode(params)}"
         else:
-            body = params if isinstance(params, dict | list) else {}
-            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            # 审批过什么就发什么（P1）：原始 JSON 值原样上 wire——标量（str/num/bool/null）不得静默
+            # 改写成 {}，否则「审批展示、摘要、实际落地内容一致」被击穿。非 JSON 可序列化在审批门已
+            # fail-closed 挡下；此处兜底显式拒绝，绝不静默改写被批内容。
+            try:
+                data = json.dumps(params, ensure_ascii=False).encode("utf-8")
+            except (TypeError, ValueError):
+                return None, f"openapi {method} 写 params 非 JSON 可序列化——fail-closed（不静默改写被批内容）"
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:

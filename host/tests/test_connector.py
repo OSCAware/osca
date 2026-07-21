@@ -28,7 +28,7 @@ def mock_dir(tmp_path):
 
 @pytest.fixture
 def proxy(sample_pack, mock_dir):
-    _, loaded = load_for_host(sample_pack)
+    _, loaded = load_for_host(sample_pack, require_bindings=False)
     policy_file = loaded.pack.yaml_files["policy.yaml"]
     policy = PolicyInterceptor(loaded.package_id, policy_file.mapping, ledger_stats(loaded.pack))
     bindings = {"FINANCE_DB": {"endpoint": f"mock://{mock_dir}", "secret_ref": "FINANCE_DB_RO_KEY"}}
@@ -55,7 +55,7 @@ def test_step_whitelist_enforced_via_proxy(proxy):
 
 
 def test_missing_binding(sample_pack, mock_dir):
-    _, loaded = load_for_host(sample_pack)
+    _, loaded = load_for_host(sample_pack, require_bindings=False)
     policy = PolicyInterceptor(loaded.package_id, {}, {"confirmed": 0, "overruled": 0})
     proxy = ConnectorProxy(loaded, {}, policy)  # 部署环境没注入 FINANCE_DB
     receipt = proxy.call("CON-001.拉取费用明细", step=None)
@@ -63,7 +63,7 @@ def test_missing_binding(sample_pack, mock_dir):
 
 
 def test_egress_default_deny_for_real_endpoint(sample_pack):
-    _, loaded = load_for_host(sample_pack)
+    _, loaded = load_for_host(sample_pack, require_bindings=False)
     policy_file = loaded.pack.yaml_files["policy.yaml"]
     policy = PolicyInterceptor(loaded.package_id, policy_file.mapping, ledger_stats(loaded.pack))
     bindings = {"FINANCE_DB": {"endpoint": "mysql://db.internal.example:3306/finance"}}
@@ -188,7 +188,7 @@ class _RecordingExecutor:
 
 def _real_proxy(sample_pack, bindings, *, resolver=None, allow="db.internal.example", executors=None):
     """egress 放行 allow 的真实执行器代理（非 mock endpoint）——secret 前置由此可达。"""
-    _, loaded = load_for_host(sample_pack)
+    _, loaded = load_for_host(sample_pack, require_bindings=False)
     policy = PolicyInterceptor(
         loaded.package_id, {"policy_version": 1, "egress": {"allow_domains": [allow]}}, ledger_stats(loaded.pack)
     )

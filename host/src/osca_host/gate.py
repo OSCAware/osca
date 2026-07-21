@@ -35,6 +35,12 @@ class Gate:
         self._seen: set[str] = set()  # combine=all 的已命中集合
         self._seq = 0  # combine=sequence 的推进指针
 
+    def reset_progress(self) -> None:
+        """清除组合闸门的部分推进状态（all 已见集合 / sequence 指针）——触发器停（disable）边界调用：
+        半程状态不得跨越「停用→重新启用」残留，否则旧代命中 + 新代命中会拼成一次假唤醒（P1）。"""
+        self._seen.clear()
+        self._seq = 0
+
     def on_trigger(self, trigger_id: str) -> tuple[bool, str]:
         """触发命中 → (是否唤醒, 人可读裁决说明)。"""
         if not self.enabled:

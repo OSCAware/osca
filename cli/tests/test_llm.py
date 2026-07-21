@@ -57,6 +57,16 @@ class _FakeResponse:
         return False
 
 
+def _opener(fn):
+    """把 (request, timeout) 形状的 fake 包装成 opener——生产代码经 _OPENER.open 发请求（不跟随重定向）。"""
+
+    class _O:
+        def open(self, request, timeout=None):
+            return fn(request, timeout)
+
+    return _O()
+
+
 def test_openai_compat_request_and_parse(monkeypatch):
     seen = {}
 
@@ -68,7 +78,7 @@ def test_openai_compat_request_and_parse(monkeypatch):
             {"choices": [{"message": {"content": "回答"}}], "usage": {"total_tokens": 42}, "model": "gw-model"}
         )
 
-    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(llm_mod, "_OPENER", _opener(fake_urlopen))
     client = OpenAICompatLLM("https://gateway.example/v1", "some-model", "secret")
     reply = client.complete("你是谁", "你好", tag="t")
 
@@ -80,7 +90,7 @@ def test_openai_compat_request_and_parse(monkeypatch):
 
 
 def test_openai_compat_bad_shape(monkeypatch):
-    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", lambda r, timeout: _FakeResponse({"error": "x"}))
+    monkeypatch.setattr(llm_mod, "_OPENER", _opener(lambda r, timeout: _FakeResponse({"error": "x"})))
     with pytest.raises(LLMError, match="不是 chat/completions 形状"):
         OpenAICompatLLM("https://g/v1", "m").complete("s", "u", tag="t")
 
@@ -98,11 +108,11 @@ def test_openai_compat_illegal_usage_report_falls_back_to_estimate(monkeypatch):
         ["usage 形状错乱"],
         None,
     ):
-        monkeypatch.setattr(
-            llm_mod.urllib.request,
-            "urlopen",
-            lambda r, timeout, u=bad_usage: _FakeResponse({"choices": [{"message": {"content": "回答"}}], "usage": u}),
-        )
+
+        def fake(r, timeout, u=bad_usage):
+            return _FakeResponse({"choices": [{"message": {"content": "回答"}}], "usage": u})
+
+        monkeypatch.setattr(llm_mod, "_OPENER", _opener(fake))
         reply = OpenAICompatLLM("https://g/v1", "m").complete("s", "u", tag="t")
         assert isinstance(reply.tokens, int) and reply.tokens > 0  # 非法上报不进记账，估算兜底
 
@@ -126,7 +136,7 @@ def test_openai_compat_deadline_bounds_urlopen_timeout(monkeypatch):
         seen["timeout"] = timeout
         return _FakeResponse({"choices": [{"message": {"content": "回答"}}], "usage": {"total_tokens": 7}})
 
-    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(llm_mod, "_OPENER", _opener(fake_urlopen))
     client = OpenAICompatLLM("https://g/v1", "m")
     client.complete("s", "u", tag="t", timeout=3.0)
     assert seen["timeout"] == 3.0  # 剩余预算生效
@@ -145,3 +155,65 @@ def test_mock_symlink_loop_raises_llm_error_not_runtime(tmp_path):
     loop.symlink_to(loop.name)  # 自指链接环
     with pytest.raises(LLMError):
         MockLLM(fixture_dir).complete("s", "u", tag="loop")
+
+
+# ── API key 传输安全（P1）：明文 http 拒发、重定向不跟随 ──
+
+
+def test_api_key_over_plain_http_refused():
+    """携带 API key 却走非 https 非回环 → 发起前拒绝（凭据明文外发风险）,不产生任何网络流量。"""
+    client = OpenAICompatLLM("http://gateway.example/v1", "m", api_key="TOP-SECRET")
+    with pytest.raises(LLMError, match="非 https"):
+        client.complete("s", "u", tag="t")
+
+
+def test_api_key_over_https_and_loopback_http_allowed(monkeypatch):
+    """https 正常放行;本地回环显式豁免（开发面）——两者都应走到网络层（用 fake opener 断言到达）。"""
+    sent = []
+
+    class _Opener:
+        def open(self, request, timeout=None):
+            sent.append(request)
+            return _FakeResponse({"choices": [{"message": {"content": "ok"}}], "usage": {"total_tokens": 3}})
+
+    monkeypatch.setattr(llm_mod, "_OPENER", _Opener())
+    for url in ("https://gateway.example/v1", "http://127.0.0.1:8080/v1", "http://localhost:8080/v1"):
+        reply = OpenAICompatLLM(url, "m", api_key="KEY").complete("s", "u", tag="t")
+        assert reply.text == "ok"
+    assert len(sent) == 3
+    assert all(req.get_header("Authorization") == "Bearer KEY" for req in sent)
+
+
+def test_redirect_not_followed_with_authorization():
+    """网关 302 → 不跟随（Authorization 绝不被带去别的 origin）:重定向按调用失败报错,目标端点零请求。"""
+    import http.server
+    import threading
+
+    hits = {"redirect": 0, "target": 0}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            if self.path.startswith("/target"):
+                hits["target"] += 1
+                self.send_response(200)
+                self.end_headers()
+                return
+            hits["redirect"] += 1
+            self.send_response(302)
+            self.send_header("Location", "/target/chat/completions")
+            self.end_headers()
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    host, port = srv.server_address
+    try:
+        client = OpenAICompatLLM(f"http://{host}:{port}", "m", api_key="KEY")  # 回环:允许发起
+        with pytest.raises(LLMError, match="调用失败"):
+            client.complete("s", "u", tag="t")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert hits["redirect"] == 1 and hits["target"] == 0  # 重定向未被跟随,授权头未到第二个 origin

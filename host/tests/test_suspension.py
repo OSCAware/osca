@@ -204,3 +204,68 @@ def test_abandon_is_noop_on_claimed_ticket(store, monkeypatch):
     assert s.persist("EO-claimed", {"a": 2}, ticket=t) is False  # 终态票不可再用
     assert not (tmp / "susp-EO-claimed.json").exists()
     assert s._ops == {}
+
+
+# ── 目录 fsync（P1）：rename/unlink 后同步目录,断电不回滚落名/删除 ──
+
+
+def test_persist_fsyncs_directory_after_rename(store, monkeypatch):
+    s, _ = store
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        synced.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    assert s.persist("EO-dsync", {"operation_id": "EO-dsync"}) is True
+    assert s._fd in synced  # rename 后目录已 fsync（否则断电 rename 可丢失）
+
+
+def test_delete_fsyncs_directory_after_unlink(store, monkeypatch):
+    s, _ = store
+    s.persist("EO-del", {"operation_id": "EO-del"})
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        synced.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    s.delete("EO-del")
+    assert s._fd in synced  # unlink 后目录已 fsync（否则断电删除回滚 → 旧快照复活重批重复写）
+
+
+def test_persist_dir_fsync_failure_raises_and_releases_ticket(store, monkeypatch):
+    """目录 fsync 失败 → OSError 上抛（调用方按落盘失败退回 L1,不假报持久）;凭据须归还、注册表回收。"""
+    s, _ = store
+    real_fsync = os.fsync
+
+    def fail_on_dir(fd):
+        if fd == s._fd:
+            raise OSError("模拟目录 fsync 失败")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_on_dir)
+    with pytest.raises(OSError):
+        s.persist("EO-fsf", {"operation_id": "EO-fsf"})
+    assert s._ops == {}  # finally 已归还凭据,无泄漏条目
+
+
+def test_delete_dir_fsync_failure_raises_and_releases_ticket(store, monkeypatch):
+    """delete 的目录 fsync 失败 → OSError 上抛——调用方保留挂起态待重试,不带着「删没删成不确定」推进真写。"""
+    s, _ = store
+    s.persist("EO-dff", {"operation_id": "EO-dff"})
+    real_fsync = os.fsync
+
+    def fail_on_dir(fd):
+        if fd == s._fd:
+            raise OSError("模拟盘故障")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_on_dir)
+    with pytest.raises(OSError):
+        s.delete("EO-dff")
+    assert s._ops == {}

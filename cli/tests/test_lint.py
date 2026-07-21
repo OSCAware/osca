@@ -780,3 +780,93 @@ def test_osca024_symlink_loop_no_traceback(make_pkg, base):
 
     result = lint_package(root)  # 此前 RuntimeError traceback 穿透
     assert "OSCA024" in rules_hit(result)
+
+
+# ── OSCA050 端点形式补漏（P1）：大写协议、IP:端口、IPv6、userinfo 连接串 ──
+
+
+def _osca050_messages(make_pkg, base, text: str) -> list[str]:
+    pkg = make_pkg(base)
+    (pkg / "README.md").write_text(text, encoding="utf-8")
+    result = lint_package(pkg)
+    return [f.message for f in result.findings if f.rule == "OSCA050"]
+
+
+def test_osca050_uppercase_connection_scheme(make_pkg, base):
+    msgs = _osca050_messages(make_pkg, base, "连接示例 POSTGRES://db.internal/x\n")
+    assert any("连接串" in m for m in msgs), msgs
+
+
+def test_osca050_uppercase_http(make_pkg, base):
+    msgs = _osca050_messages(make_pkg, base, "见 HTTP://example.com/doc\n")
+    assert any("明文 http" in m for m in msgs), msgs
+
+
+def test_osca050_bare_ip_port_endpoint(make_pkg, base):
+    msgs = _osca050_messages(make_pkg, base, "数据库在 10.0.0.8:5432\n")
+    assert any("IP:端口" in m for m in msgs), msgs
+
+
+def test_osca050_ipv6_endpoint(make_pkg, base):
+    msgs = _osca050_messages(make_pkg, base, "缓存 [2001:db8::1]:6379\n")
+    assert any("IPv6" in m for m in msgs), msgs
+
+
+def test_osca050_userinfo_connection_string(make_pkg, base):
+    msgs = _osca050_messages(make_pkg, base, "weird://alice:secret@db.internal/x\n")
+    assert any("userinfo" in m for m in msgs), msgs
+
+
+# ── YAML alias / 深度防护（P1）：alias DAG、递归 alias、超深嵌套须快速稳定拒绝或线性通过 ──
+
+
+def test_alias_dag_traversal_is_linear_not_exponential(make_pkg, base):
+    """约 430 字节的共享 alias DAG 修复前 lint 要烧 ~5.8s（每层 ×10）——修复后须瞬时完成。"""
+    import time
+
+    pkg = make_pkg(base)
+    lines = ["case_id: C-0002", "captured_at: x", "capture_source: x", "input:", "  当时生效判断集: []"]
+    lines += ["l0: &l0 [x, y]"]
+    lines += [f"l{i}: &l{i} [*l{i - 1}, *l{i - 1}, *l{i - 1}, *l{i - 1}]" for i in range(1, 17)]
+    (pkg / "cases" / "C-0002.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    started = time.monotonic()
+    lint_package(pkg)  # 4^16 leaf 展开在修复前不可能 2s 内跑完；identity 去重后是线性
+    assert time.monotonic() - started < 2.0
+
+
+def test_recursive_alias_terminates(make_pkg, base):
+    """递归 alias（自引用结构）——遍历必须终止,不死循环、不炸栈。"""
+    pkg = make_pkg(base)
+    (pkg / "cases" / "C-0003.yaml").write_text(
+        "case_id: C-0003\ncaptured_at: x\ncapture_source: x\ninput:\n  当时生效判断集: []\nself: &s\n  loop: *s\n",
+        encoding="utf-8",
+    )
+    result = lint_package(pkg)  # 只要终止即通过；结果 ok 与否不作断言
+    assert result is not None
+
+
+def test_alias_count_over_cap_rejected(make_pkg, base):
+    """alias 总数超上限 → 解析层稳定拒绝（OSCA003）,不进任何下游遍历。"""
+    pkg = make_pkg(base)
+    body = "a: &a 1\nb: [" + ", ".join("*a" for _ in range(1100)) + "]\n"
+    (pkg / "cases" / "C-0004.yaml").write_text(
+        "case_id: C-0004\ncaptured_at: x\ncapture_source: x\ninput:\n  当时生效判断集: []\n" + body,
+        encoding="utf-8",
+    )
+    result = lint_package(pkg)
+    assert not result.ok
+    assert any(f.rule == "OSCA003" and "alias" in f.message for f in result.findings)
+
+
+def test_deeply_nested_yaml_rejected_stably(make_pkg, base):
+    """超深嵌套 YAML → RecursionError 转稳定 parse_error（OSCA003）,不许 traceback 穿透 lint。"""
+    import time
+
+    pkg = make_pkg(base)
+    depth = 20000
+    (pkg / "cases" / "C-0005.yaml").write_text("[" * depth + "]" * depth + "\n", encoding="utf-8")
+    started = time.monotonic()
+    result = lint_package(pkg)
+    assert time.monotonic() - started < 5.0
+    assert not result.ok
+    assert any(f.rule == "OSCA003" for f in result.findings)

@@ -10,7 +10,7 @@ from osca_host.loader import load_for_host
 
 @pytest.fixture
 def loaded(sample_pack):
-    _, pkg = load_for_host(sample_pack)  # 装载五步含签名表重建
+    _, pkg = load_for_host(sample_pack, require_bindings=False)  # 装载五步含签名表重建
     return pkg
 
 

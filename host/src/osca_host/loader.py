@@ -122,12 +122,16 @@ def load_for_host(
     source: str | Path,
     dest: str | Path | None = None,
     bindings: str | Path | None = None,
+    *,
+    require_bindings: bool = True,
 ) -> tuple[OpResult, LoadedPackage | None]:
     """装载一个包（开发态目录或交付态 zip）为运行时结构。
 
     校验不过 → (失败的 OpResult, None)；Host 拒绝注册不合规资产。
+    require_bindings 默认 True（P1 装载门禁）：包声明了 required bindings 却未注入部署环境即拒——
+    「装载成功、首次调用才炸」是 fail-open。测试/校验场景显式传 False（非部署装载）。
     """
-    result, root = load_osca(source, dest=dest, bindings=bindings)
+    result, root = load_osca(source, dest=dest, bindings=bindings, require_bindings=require_bindings)
     if not result.ok or root is None:
         return result, None
 

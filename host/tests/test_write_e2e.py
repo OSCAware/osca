@@ -81,7 +81,7 @@ def dispatch_api():
 
 
 def _load_dispatch(dispatch_pack, ops_db, api_addr):
-    result, loaded = load_for_host(dispatch_pack)
+    result, loaded = load_for_host(dispatch_pack, require_bindings=False)
     assert result.ok, result.lines
     policy_file = loaded.pack.yaml_files["policy.yaml"]
     policy = PolicyInterceptor(loaded.package_id, policy_file.mapping, ledger_stats(loaded.pack))

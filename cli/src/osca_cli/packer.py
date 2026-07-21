@@ -13,6 +13,9 @@ load 的四步：解压（或原地）→ 完整性校验（防篡改）→ lint
 from __future__ import annotations
 
 import hashlib
+import os
+import shutil
+import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +23,7 @@ from pathlib import Path
 import yaml
 
 from osca_cli import __version__
+from osca_cli.ledger import open_ledger_dir, publish_file_in_dir
 from osca_cli.lint import lint_package
 from osca_cli.package import load_package
 
@@ -92,6 +96,24 @@ def symlink_entries(root: Path) -> list[str]:
         if rel.split("/", 1)[0] not in EXCLUDE_TOP_DIRS:
             links.append(rel)
     return links
+
+
+def load_symlink_entries(root: Path) -> list[str]:
+    """装载门禁的符号链接清单：包内**全部**符号链接（含 indexes/，仅豁免 .git 版本库内部）。
+
+    与 pack 侧 symlink_entries 的差别：load 连排除目录也不放过——`indexes` 被换成包外目录
+    链接时 rebuild_index 会把索引写出包根；`AGENT.md`/YAML 是链接时包外文件会被读进
+    Episode/LLM 上下文。os.walk 不跟随目录链接：链接本身按条目拒绝，不进入其目标扫描。
+    """
+    links: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if Path(dirpath) == root and ".git" in dirnames:
+            dirnames.remove(".git")
+        for name in (*dirnames, *filenames):
+            p = Path(dirpath, name)
+            if p.is_symlink():
+                links.append(p.relative_to(root).as_posix())
+    return sorted(links)
 
 
 def checksums_text(root: Path, rels: list[str]) -> str:
@@ -243,10 +265,39 @@ def rebuild_index(root: Path, pkg=None) -> Path:
         "note": "机器生成的缓存，人不手写；坏了删掉重建（公理 A4）",
         "judgments": signature_entries(pkg),
     }
-    index_path = root / "indexes" / "judgments.index.yaml"
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    index_path.write_text(yaml.safe_dump(index, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    return index_path
+    data = yaml.safe_dump(index, allow_unicode=True, sort_keys=False).encode("utf-8")
+    # 安全目录发布（与 settle 落账同一机制）：fd 锚定包根 + O_NOFOLLOW 打开 indexes/——
+    # indexes 或索引文件被预置成符号链接时在此拒绝，索引写入永远出不了包根
+    with open_ledger_dir(root, "indexes") as fd:
+        publish_file_in_dir(fd, "judgments.index.yaml", data, overwrite=True)
+    return root / "indexes" / "judgments.index.yaml"
+
+
+def deployment_binding_errors(env: object, required: set[str]) -> list[str]:
+    """部署 bindings 的装载门禁判据（CLI load 与 Host 装载共用，单一真理源）：
+    顶层必须是 mapping[str, mapping]；required binding 必须存在且带非空字符串 endpoint；
+    secret_ref 键存在时必须是非空字符串。任何一条不过都不得称为部署装载成功。"""
+    if not isinstance(env, dict):
+        return [f"bindings 顶层必须是 mapping[str, mapping]（现为 {type(env).__name__}）——拒绝装载"]
+    errors: list[str] = []
+    for key, value in env.items():
+        if not isinstance(key, str):
+            errors.append(f"binding 键必须是字符串（现为 {type(key).__name__}: {key!r}）")
+        elif not isinstance(value, dict):
+            errors.append(f"binding「{key}」的值必须是 mapping（endpoint[, secret_ref]），现为 {type(value).__name__}")
+    missing = sorted(required - {k for k in env if isinstance(k, str)})
+    if missing:
+        errors.append(f"部署环境缺少 binding：{', '.join(missing)}（loader 装载时缺失即报错）")
+    for ref in sorted(required):
+        value = env.get(ref)
+        if not isinstance(value, dict):
+            continue  # 缺失/形状错误已在上面报
+        endpoint = value.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            errors.append(f"required binding「{ref}」缺非空 endpoint——装载门禁，首次调用才炸是 fail-open")
+        if "secret_ref" in value and (not isinstance(value["secret_ref"], str) or not value["secret_ref"]):
+            errors.append(f"binding「{ref}」的 secret_ref 须为非空字符串（无凭据应删该字段，不留空/非法值）")
+    return sorted(errors)
 
 
 def required_bindings(root: Path) -> set[str]:
@@ -264,11 +315,49 @@ def required_bindings(root: Path) -> set[str]:
     return required
 
 
+def _extract_to_dest(source: Path, root: Path) -> str | None:
+    """zip → 目标目录：版本化临时目录解压 + 原子切换（同一 dest 可重启 Host / unload+load 重复装载）。
+
+    目标已存在且非空时只接管**既往 osca 交付解压目录**（osca.yaml + indexes/checksums.txt 痕迹）——
+    绝不清理来历不明的用户目录；切换失败回滚旧目录。返回错误串或 None（成功）。
+    """
+    if root.is_symlink():
+        return f"解压目标是符号链接：{root}——拒绝（解压不得跟随链接写出目标外）"
+    if root.exists():
+        if not root.is_dir():
+            return f"解压目标已存在且不是目录：{root}"
+        if any(root.iterdir()) and not ((root / "osca.yaml").is_file() and (root / CHECKSUMS_REL).is_file()):
+            return f"目标目录非空且不是既往 osca 交付解压目录：{root}——拒绝清理未知目录（用 --dest 指定其他目录）"
+    tmp = root.parent / f".{root.name}.osca-tmp-{os.getpid()}-{time.monotonic_ns()}"
+    old: Path | None = None
+    try:
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.mkdir(exist_ok=False)
+        with zipfile.ZipFile(source) as zf:
+            _safe_extract(zf, tmp)
+        if root.exists():
+            old = root.parent / f".{root.name}.osca-old-{os.getpid()}-{time.monotonic_ns()}"
+            os.rename(root, old)
+        os.rename(tmp, root)
+    except (OSError, ValueError) as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if old is not None and old.exists() and not root.exists():
+            os.rename(old, root)  # 回滚：旧交付目录归位，装载失败不留半切换状态
+        return str(e) if isinstance(e, ValueError) else f"解压/切换失败：{e}"
+    if old is not None:
+        shutil.rmtree(old, ignore_errors=True)
+    return None
+
+
 def load_osca(
     archive: str | Path,
     dest: str | Path | None = None,
     bindings: str | Path | None = None,
+    *,
+    require_bindings: bool = False,
 ) -> tuple[OpResult, Path | None]:
+    """装载校验。require_bindings=True（Host 部署装载）：包声明了 required bindings 却未注入
+    部署环境即失败——「无环境只校验包」是 CLI 的显式校验模式，不得称为部署装载成功。"""
     source = Path(archive)
     result = OpResult()
 
@@ -279,20 +368,22 @@ def load_osca(
         result.info(f"输入为目录，原地装载校验：{root}")
     elif source.is_file() and zipfile.is_zipfile(source):
         root = Path(dest) if dest else Path.cwd() / source.name.removesuffix(".zip")
-        if root.exists() and any(root.iterdir()):
-            result.fail(f"目标目录已存在且非空：{root}（用 --dest 指定其他目录）")
-            return result, None
-        root.mkdir(parents=True, exist_ok=True)
-        try:
-            with zipfile.ZipFile(source) as zf:
-                _safe_extract(zf, root)
-        except ValueError as e:
-            result.fail(str(e))
+        error = _extract_to_dest(source, root)
+        if error:
+            result.fail(error)
             return result, None
         from_zip = True
-        result.step(f"已解压到 {root}")
+        result.step(f"已解压到 {root}（版本化临时目录 + 原子切换，同 dest 可重启/重载）")
     else:
         result.fail(f"输入既不是目录也不是 zip：{archive}")
+        return result, None
+
+    # 1.5 符号链接门禁（读取/lint 之前）：链接可把包外文件读进 Episode/LLM 上下文（AGENT.md/YAML），
+    # 或把 indexes 写引出包根（rebuild_index 覆盖包外文件）。zip 解压不产生链接，此检查两态统一兜底。
+    links = load_symlink_entries(root)
+    if links:
+        shown = "、".join(links[:3]) + ("…" if len(links) > 3 else "")
+        result.fail(f"包内检测到符号链接：{shown}——装载拒绝（链接可读写包外文件；交付件不收符号链接）")
         return result, None
 
     # 2. 完整性校验（交付件必须带清单；开发态目录可豁免）
@@ -314,17 +405,31 @@ def load_osca(
         return result, None
     result.step(f"lint 通过（{lint_result.warnings} 警告）")
 
-    # 4. binding 与部署环境比对（SPEC §4 层2；缺失即报错）
+    # 4. binding 与部署环境比对（SPEC §4 层2；缺失/形状非法即报错——装载门禁，不留到首次调用才炸）
     required = required_bindings(root)
     if bindings is not None:
-        env = yaml.safe_load(Path(bindings).read_text(encoding="utf-8")) or {}
-        missing = sorted(required - set(env))
-        if missing:
-            result.fail(f"部署环境缺少 binding：{', '.join(missing)}（loader 装载时缺失即报错）")
+        try:
+            env = yaml.safe_load(Path(bindings).read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as e:
+            result.fail(f"bindings 文件读取/解析失败：{e}")
             return result, None
-        result.step(f"binding 比对通过（{len(required)} 个均已在部署环境注入）")
+        errors = deployment_binding_errors({} if env is None else env, required)
+        if errors:
+            for error in errors:
+                result.fail(error)
+            return result, None
+        result.step(f"binding 门禁通过（required {len(required)} 个均已注入且形状合法）")
+    elif required and require_bindings:
+        result.fail(
+            f"部署装载必须注入 bindings：本包 required binding {', '.join(sorted(required))} 缺失"
+            "（装载门禁 fail-closed；「无环境只校验包」请走 CLI 校验模式）"
+        )
+        return result, None
     elif required:
-        result.info(f"未提供 --bindings，跳过环境比对；本包部署时需要注入：{', '.join(sorted(required))}")
+        result.info(
+            f"未提供 --bindings：仅完成包校验（**非部署装载**，binding 门禁未执行）；"
+            f"部署时必须注入：{', '.join(sorted(required))}"
+        )
 
     # 5. 重建索引
     index_path = rebuild_index(root)

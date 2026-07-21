@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 
 import pytest
@@ -34,9 +35,21 @@ async def _send(request, host, token=None):
     return await asyncio.to_thread(send_command, request, host.control.socket_path, 30.0, token)
 
 
+def _stub_bindings(path) -> str:
+    """装载门禁（P1）后 Host 路径必须注入 required bindings——无真实部署环境的测试给 mock stub。"""
+    import yaml as _yaml
+
+    target = path.parent / f"{path.name}-stub-bindings.yaml"
+    target.write_text(
+        _yaml.safe_dump({"FINANCE_DB": {"endpoint": "mock:///nonexistent-fixtures"}}),
+        encoding="utf-8",
+    )
+    return str(target)
+
+
 async def _load_pack(host, path, bindings=None, did="t-pack"):
     """装载走部署 ID（M4-W0）：路径类参数只住服务端部署清单，控制通道只收 ID。"""
-    host.deployments[did] = {"path": str(path), "bindings": str(bindings) if bindings else None}
+    host.deployments[did] = {"path": str(path), "bindings": str(bindings) if bindings else _stub_bindings(path)}
     return await _send({"cmd": "load", "deployment_id": did}, host)
 
 
@@ -1276,3 +1289,122 @@ async def test_reattach_cleanup_delete_off_event_loop(running_host, sample_pack,
     assert not any(
         e.operation_id == opid and e.status == "suspended_pending_approval" for e in host.episodes.values()
     )  # 失配快照未被重挂
+
+
+# ── P1：Aware disable→enable 代际隔离 / binding 装载门禁 / 关停有界退出 ──
+
+
+async def test_disable_enable_kills_stale_delivery(running_host, sample_pack, deploy, monkeypatch):
+    """旧触发进入慢账本刷新后 disable→enable：旧投递返回时必须永久失效,不创建新 Episode（P1）。"""
+    import threading
+
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    loop = asyncio.get_running_loop()
+    entered, release = asyncio.Event(), threading.Event()
+    real_refresh = host._refresh_ledger
+
+    def slow_refresh(loaded, policy):
+        loop.call_soon_threadsafe(entered.set)
+        release.wait(10)
+        return real_refresh(loaded, policy)
+
+    monkeypatch.setattr(host, "_refresh_ledger", slow_refresh)
+    deliver = host._make_deliver(pid, "AW-001")
+    task = asyncio.create_task(deliver("AW-001/T3"))
+    await asyncio.wait_for(entered.wait(), timeout=5)  # 旧投递已卡在慢刷新（线程）
+    host._set_aware(pid, "AW-001", False)
+    host._set_aware(pid, "AW-001", True)  # gate/policy/loaded 对象身份全不变——旧 CAS 关不住
+    release.set()
+    why = await asyncio.wait_for(task, timeout=5)
+    assert why is not None and "停用" in why  # 旧代投递按代际失效放弃
+    assert host.episodes == {}  # 未创建任何剧集
+
+
+async def test_disable_clears_partial_gate_progress(running_host, sample_pack, deploy):
+    """disable 边界清除 all/sequence 半程状态（P1）——旧代命中不残留到重新启用之后。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    gate = host.gates[(pid, "AW-001")]
+    gate._seen.add("AW-001/T3")
+    gate._seq = 1
+    host._set_aware(pid, "AW-001", False)
+    assert gate._seen == set() and gate._seq == 0
+
+
+async def test_load_without_required_bindings_rejected(running_host, sample_pack):
+    """Host 部署装载：包声明 required bindings 却未注入 → 装载失败（P1 装载门禁,不留到首次调用才炸）。"""
+    host = running_host
+    host.deployments["no-bindings"] = {"path": str(sample_pack), "bindings": None}
+    response = await _send({"cmd": "load", "deployment_id": "no-bindings"}, host)
+    assert not response["ok"]
+    assert any("部署装载必须注入 bindings" in line for line in response["detail"])
+    assert host.registry.packages == {}
+
+
+async def test_load_with_malformed_bindings_rejected(running_host, sample_pack, tmp_path):
+    """bindings 顶层非 mapping / 值非 mapping / 缺 endpoint——装载门禁一律拒绝（P1）。"""
+    host = running_host
+    cases = [
+        ("- 1\n- 2\n", "顶层必须是 mapping"),
+        ("FINANCE_DB: 一条连接串\n", "值必须是 mapping"),
+        ("FINANCE_DB:\n  secret_ref: KEY\n", "缺非空 endpoint"),
+    ]
+    for i, (content, expect) in enumerate(cases):
+        bad = tmp_path / f"bad-bindings-{i}.yaml"
+        bad.write_text(content, encoding="utf-8")
+        response = await _load_pack(host, sample_pack, bad, did=f"bad-{i}")
+        assert not response["ok"], content
+        assert any(expect in line for line in response["detail"]), (content, response["detail"])
+    assert host.registry.packages == {}
+
+
+async def test_run_in_daemon_thread_daemon_flag_and_result(sock_path):
+    """P1 关停语义：剧集执行线程必须是守护线程（随进程消亡）,结果/异常原样回传。"""
+    import threading
+
+    host = Host(sock_path)
+    seen: dict[str, bool] = {}
+
+    def probe():
+        seen["daemon"] = threading.current_thread().daemon
+        return 42
+
+    assert await host._run_in_daemon_thread(probe) == 42
+    assert seen["daemon"] is True
+
+    def boom():
+        raise RuntimeError("剧集内部错")
+
+    with pytest.raises(RuntimeError, match="剧集内部错"):
+        await host._run_in_daemon_thread(boom)
+
+
+async def test_shutdown_bounded_with_hung_episode_thread(sock_path, caplog):
+    """P1：剧集线程卡死时关停仍有界完成——守护线程不阻塞进程退出,STOPPED 不再是假报。"""
+    import threading
+    import time as time_mod
+
+    host = Host(sock_path)
+    host._episode_shutdown_timeout = 0.3
+    task = asyncio.create_task(host.run())
+    for _ in range(100):
+        if host.control.socket_path.exists():
+            break
+        await asyncio.sleep(0.01)
+    release = threading.Event()
+    hung = asyncio.create_task(host._run_in_daemon_thread(release.wait, 30))
+    host._episode_tasks.add(hung)
+    hung.add_done_callback(host._episode_tasks.discard)
+    await asyncio.sleep(0)  # 让 hung 任务起线程
+    started = time_mod.monotonic()
+    host._stop.set()
+    await asyncio.wait_for(task, timeout=10)
+    assert host.state.name == "STOPPED"
+    assert time_mod.monotonic() - started < 5  # 上限 0.3s + 收尾,远小于挂死线程的 30s
+    assert "守护线程随进程退出终止" in caplog.text  # 诚实口径:超时留痕
+    release.set()  # 释放线程,测试进程干净退出
+    with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+        await asyncio.wait_for(hung, timeout=5)

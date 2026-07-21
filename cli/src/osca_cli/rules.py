@@ -835,14 +835,19 @@ def osca041_trigger_gate_syntax(pkg: OscaPackage) -> list[Finding]:
 
 # ───────────────────────── 安全（铁律，SPEC v0.3 §13） ─────────────────────────
 
+# 协议/连接串正则一律大小写不敏感（P1：`POSTGRES://` / `HTTP://` 大写变体曾漏检）；
+# 端点形式按 SPEC §13 补全：裸 IP:端口、IPv6:端口、带 userinfo 的连接串同属禁止。
 SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\b(?:ssh|ftp|redis|amqp|mongodb(?:\+srv)?|mysql|postgres(?:ql)?)://"), "连接串"),
-    (re.compile(r"\bjdbc:"), "JDBC 连接串"),
+    (re.compile(r"\b(?:ssh|ftp|redis|amqp|mongodb(?:\+srv)?|mysql|postgres(?:ql)?)://", re.IGNORECASE), "连接串"),
+    (re.compile(r"\bjdbc:", re.IGNORECASE), "JDBC 连接串"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS AccessKey"),
     (re.compile(r"\bLTAI[A-Za-z0-9]{12,24}\b"), "阿里云 AccessKey"),
     (re.compile(r"\bghp_[A-Za-z0-9]{36}\b"), "GitHub token"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), "API key"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "私钥"),
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}\b"), "IP:端口 端点"),
+    (re.compile(r"\[[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*\]:\d{1,5}"), "IPv6 端点"),
+    (re.compile(r"://[^/\s@]{1,128}@"), "带 userinfo 的连接串"),
 ]
 
 # 有限允许：指向公开文档的 https 链接（SPEC v0.3 §13）。白名单之外一律报错。
@@ -856,7 +861,7 @@ ALLOWED_LINK_DOMAINS = {
     "github.com",
 }
 
-HTTP_URL = re.compile(r"\b(https?)://([A-Za-z0-9.-]+)")
+HTTP_URL = re.compile(r"\b(https?)://([A-Za-z0-9.-]+)", re.IGNORECASE)
 SCAN_SKIP_DIRS = {"indexes", ".git"}
 SCAN_SKIP_NAMES = {".DS_Store"}
 
@@ -881,7 +886,8 @@ def osca050_secrets(pkg: OscaPackage) -> list[Finding]:
                 if pattern.search(line):
                     findings.append(_err("OSCA050", rel, f"第 {lineno} 行疑似{label}（铁律：连接串与密钥绝对禁止）"))
             for scheme, host in HTTP_URL.findall(line):
-                if scheme == "http":
+                host = host.lower()  # 域名比对大小写不敏感（HTTP:// / Github.Com 变体不许漏）
+                if scheme.lower() == "http":
                     findings.append(_err("OSCA050", rel, f"第 {lineno} 行含明文 http 链接（{host}）——一律禁止"))
                 elif not _domain_allowed(host):
                     findings.append(

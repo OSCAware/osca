@@ -169,9 +169,13 @@ class SuspensionStore:
                         f.flush()
                         os.fsync(f.fileno())
                     os.rename(tmp, name, src_dir_fd=self._fd, dst_dir_fd=self._fd)  # 原子替换
+                    # rename 后同步目录（P1）：只 fsync 文件不 fsync 目录，断电可把已落名快照回滚成
+                    # 不存在（rename 丢失）。同步失败按 OSError 上抛——调用方按落盘失败退回 L1，不假报持久。
+                    os.fsync(self._fd)
                 except BaseException:
                     with contextlib.suppress(OSError):
                         os.unlink(tmp, dir_fd=self._fd)
+                        os.fsync(self._fd)  # 临时名清理同样耐久（best-effort，不掩盖原异常）
                     raise
             return True
         finally:
@@ -190,6 +194,10 @@ class SuspensionStore:
             with st.lock:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(self._name(operation_id), dir_fd=self._fd)
+                # unlink 后同步目录（P1）：断电可把删除回滚——已兑现写入的旧快照复活会被重挂重批
+                # **重复写**。同步失败 OSError 上抛：调用方保留挂起态待清扫重试，绝不带着「删没删成
+                # 不确定」推进真写。
+                os.fsync(self._fd)
         finally:
             self._release_ticket(ticket, allowed=_PENDING)
 
