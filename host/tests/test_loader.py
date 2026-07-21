@@ -82,3 +82,18 @@ def test_load_for_host_requires_bindings_by_default(sample_pack):
     result, loaded = load_for_host(sample_pack)
     assert loaded is None
     assert any("部署装载必须注入 bindings" in line for line in result.lines)
+
+
+def test_v03_singular_trigger_normalized_and_armed(sample_pack):
+    """P2：v0.3 单数 trigger 归一化——lint 放行的单数写法在 Host 不再「启用却零触发器」。"""
+    import yaml as _yaml
+
+    aware_path = next((sample_pack / "aware").glob("*.yaml"))
+    data = _yaml.safe_load(aware_path.read_text(encoding="utf-8"))
+    triggers = data.pop("triggers")
+    data["trigger"] = triggers[0]  # v0.3 单数写法
+    aware_path.write_text(_yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    result, loaded = load_for_host(sample_pack, require_bindings=False)
+    assert loaded is not None, result.render("load")
+    (aware,) = loaded.awares
+    assert len(aware.triggers) == 1 and aware.triggers[0].kind == triggers[0]["kind"]

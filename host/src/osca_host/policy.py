@@ -599,6 +599,8 @@ class PolicyInterceptor:
                 return out
             if isinstance(node, list):
                 return [walk(v) for v in node]
+            if isinstance(node, tuple):  # 可插拔执行器/上游产物可回 tuple——tuple 内 PII 不许漏进审批展示/快照
+                return tuple(walk(v) for v in node)
             return node
 
         return walk(value), hits

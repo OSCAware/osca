@@ -1408,3 +1408,26 @@ async def test_shutdown_bounded_with_hung_episode_thread(sock_path, caplog):
     release.set()  # 释放线程,测试进程干净退出
     with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
         await asyncio.wait_for(hung, timeout=5)
+
+
+async def test_enable_disable_status_not_self_contradictory(running_host, sample_pack, deploy):
+    """P2：disable/enable 后 status 三处一致——Gate 运行态、AwareDecl.enabled、watcher 槽位不许互相矛盾。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+
+    await _send({"cmd": "disable", "package_id": pid, "aware_id": "AW-001"}, host)
+    response = await _send({"cmd": "status"}, host)
+    (pkg,) = response["packages"]
+    (aware,) = pkg["awares"]
+    (gate,) = pkg["gates"]
+    assert aware["enabled"] is False and gate["enabled"] is False
+    assert [w["state"] for w in pkg["watchers"]] == ["disabled"] * 3
+
+    await _send({"cmd": "enable", "package_id": pid, "aware_id": "AW-001"}, host)
+    response = await _send({"cmd": "status"}, host)
+    (pkg,) = response["packages"]
+    (aware,) = pkg["awares"]
+    (gate,) = pkg["gates"]
+    assert aware["enabled"] is True and gate["enabled"] is True
+    assert [w["state"] for w in pkg["watchers"]] == ["armed"] * 3

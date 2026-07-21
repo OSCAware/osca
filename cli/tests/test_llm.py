@@ -47,8 +47,8 @@ class _FakeResponse:
     def __init__(self, payload: dict):
         self._body = json.dumps(payload).encode("utf-8")
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, n: int | None = None) -> bytes:
+        return self._body if n is None else self._body[:n]
 
     def __enter__(self):
         return self
@@ -217,3 +217,54 @@ def test_redirect_not_followed_with_authorization():
         srv.shutdown()
         srv.server_close()
     assert hits["redirect"] == 1 and hits["target"] == 0  # 重定向未被跟随,授权头未到第二个 origin
+
+
+# ── LLM 响应边界（P2）：非法 URL / 非 UTF-8 / 非字符串 content / 响应体上限 / 不回显 payload ──
+
+
+class _RawResponse:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self, n: int | None = None) -> bytes:
+        return self._body if n is None else self._body[:n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_invalid_url_is_llm_error_not_traceback():
+    with pytest.raises(LLMError, match="调用失败"):
+        OpenAICompatLLM("not-a-url", "m").complete("s", "u", tag="t")
+
+
+def test_non_utf8_response_is_llm_error(monkeypatch):
+    monkeypatch.setattr(llm_mod, "_OPENER", _opener(lambda r, timeout: _RawResponse(b"\xff\xfe\x00binary")))
+    with pytest.raises(LLMError, match="非 UTF-8"):
+        OpenAICompatLLM("https://g/v1", "m").complete("s", "u", tag="t")
+
+
+def test_non_string_content_is_llm_error(monkeypatch):
+    payload = {"choices": [{"message": {"content": {"嵌套": "对象"}}}]}
+    monkeypatch.setattr(llm_mod, "_OPENER", _opener(lambda r, timeout: _FakeResponse(payload)))
+    with pytest.raises(LLMError, match="content 非字符串"):
+        OpenAICompatLLM("https://g/v1", "m").complete("s", "u", tag="t")
+
+
+def test_response_body_over_cap_is_llm_error(monkeypatch):
+    monkeypatch.setattr(llm_mod, "MAX_RESPONSE_BYTES", 8)
+    monkeypatch.setattr(llm_mod, "_OPENER", _opener(lambda r, timeout: _RawResponse(b'{"choices": "far-too-long"}')))
+    with pytest.raises(LLMError, match="超限"):
+        OpenAICompatLLM("https://g/v1", "m").complete("s", "u", tag="t")
+
+
+def test_shape_error_does_not_echo_payload(monkeypatch):
+    payload = {"leaked_secret_field": "XYZZY-SENTINEL"}
+    monkeypatch.setattr(llm_mod, "_OPENER", _opener(lambda r, timeout: _FakeResponse(payload)))
+    with pytest.raises(LLMError) as exc:
+        OpenAICompatLLM("https://g/v1", "m").complete("s", "u", tag="t")
+    assert "XYZZY-SENTINEL" not in str(exc.value)  # 错误信息只带形状摘要,不回显响应值
+    assert "payload 不回显" in str(exc.value)

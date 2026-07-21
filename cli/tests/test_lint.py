@@ -870,3 +870,44 @@ def test_deeply_nested_yaml_rejected_stably(make_pkg, base):
     assert time.monotonic() - started < 5.0
     assert not result.ok
     assert any(f.rule == "OSCA003" for f in result.findings)
+
+
+# ── P2：OSCA036 判断集形状 / OSCA041 单数 trigger / OSCA004 entry 越界 ──
+
+
+def test_osca036_effective_set_must_be_string_list(make_pkg, base):
+    base["cases/C-0001.yaml"]["input"]["当时生效判断集"] = "J-0001"
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA036" and "字符串列表" in f.message for f in result.findings)
+
+
+def test_osca036_effective_set_rejects_non_string_items(make_pkg, base):
+    base["cases/C-0001.yaml"]["input"]["当时生效判断集"] = [1, 2]
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA036" and "字符串列表" in f.message for f in result.findings)
+
+
+def test_osca041_validates_v03_singular_trigger(make_pkg, base):
+    aware = base["aware/AW-001-定时.yaml"]
+    del aware["triggers"]
+    aware["trigger"] = {"id": "T1", "kind": "schedule", "schedule": {"every": "month"}}  # 缺 day/time
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA041" for f in result.findings)  # 单数写法不再绕过语法校验
+
+
+def test_v03_singular_trigger_valid_passes(make_pkg, base):
+    aware = base["aware/AW-001-定时.yaml"]
+    single = aware.pop("triggers")[0]
+    aware["trigger"] = single
+    result = lint_package(make_pkg(base))
+    assert result.ok, [f.format() for f in result.findings]
+
+
+def test_osca004_entry_escaping_package_root_rejected(make_pkg, base, tmp_path):
+    outside = tmp_path / "outside.md"
+    outside.write_text("包外文件", encoding="utf-8")
+    for entry in (str(outside), "../outside.md"):
+        pkg_files = dict(base)
+        pkg_files["osca.yaml"] = dict(base["osca.yaml"], entry=entry)
+        result = lint_package(make_pkg(pkg_files))
+        assert any(f.rule == "OSCA004" and "越出包根" in f.message for f in result.findings), entry

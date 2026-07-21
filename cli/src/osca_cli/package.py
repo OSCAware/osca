@@ -6,6 +6,7 @@ indexes/ 是机器生成的缓存（设计公理 A4），装载时跳过。
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -79,6 +80,9 @@ class OscaPackage:
     root: Path
     yaml_files: dict[str, YamlFile] = field(default_factory=dict)  # relpath → YamlFile
     declared_ids: dict[str, str] = field(default_factory=dict)  # ID → 首个声明它的 relpath
+    # AGENT.md 快照（P2）：与 yaml_files 同一次装载读入——消费方（Episode 装配/回放）不再实时
+    # 读盘，已校验 YAML 快照与 AGENT 内容永远同代（账本刷新在锁内整体替换 pack，不混代）
+    agent_text: str = ""
 
     def exists(self, relpath: str) -> bool:
         return (self.root / relpath).is_file()
@@ -157,6 +161,15 @@ def load_package(root: Path) -> OscaPackage:
             # 一律转 parse_error，由 OSCA003 稳定报告并拒绝（GPT Review P2）
             error = f"文件读取/解码失败（{type(e).__name__}）"
             pkg.yaml_files[rel] = YamlFile(relpath=rel, data=None, parse_error=error)
+
+    # AGENT.md 与 YAML 同一次装载读入（P2 同代快照）。O_NOFOLLOW：装载门禁已拒链接，这里是
+    # 运行中被换成链接（账本刷新路径）的第二道闸——读不到按缺失处理（OSCA001 报缺失）
+    try:
+        fd = os.open(root / "AGENT.md", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            pkg.agent_text = fh.read()
+    except (OSError, UnicodeDecodeError, ValueError):
+        pkg.agent_text = ""
 
     # 收集声明的 ID（文件内 ID 字段优先；用于引用解析与唯一性检查）
     for rel, f in pkg.yaml_files.items():

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from osca_cli.package import OscaPackage, load_package
 from osca_cli.packer import OpResult, load_osca
+from osca_cli.triggers import declared_triggers
 
 from osca_host import __version__
 
@@ -63,7 +64,9 @@ def _parse_awares(pkg: OscaPackage) -> list[AwareDecl]:
     for f in pkg.typed_files("aware"):
         aware_id = f.mapping.get("aware_id") or f.relpath
         triggers = []
-        for t in f.mapping.get("triggers") or []:
+        # declared_triggers（P2 单一真理源）：v0.3 单数 trigger 归一化——lint 放行的包不得在
+        # Host 变成「启用却零触发器」
+        for t in declared_triggers(f.mapping):
             if not isinstance(t, dict):
                 continue
             local_id = str(t.get("id", f"T{len(triggers) + 1}"))

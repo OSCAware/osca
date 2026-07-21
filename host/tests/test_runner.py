@@ -500,3 +500,45 @@ def test_no_max_minutes_no_timeout_requirement(episode, loaded, proxy, policy):
     episode.budget = {k: v for k, v in episode.budget.items() if k != "max_minutes"}
     run_episode(episode, loaded, proxy, policy, llm=NoTimeoutLLM())
     assert episode.status == "completed"
+
+
+def test_max_minutes_enforced_after_slow_last_connector_step(loaded, policy, proxy, monkeypatch):
+    """P2：max_minutes 只在步前查——慢连接器作为末步超时后仍标 completed。fake clock 复现：
+    连接器调用吃掉 2 分钟（预算 1 分钟）→ 剧集必须 stopped，不许「超时的完成」进对账。"""
+    import osca_host.runner as runner_mod
+    from osca_host.episode import Episode
+
+    class FakeTime:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    fake = FakeTime()
+    monkeypatch.setattr(runner_mod, "time", fake)
+    real_call = proxy.call
+
+    def slow_call(*args, **kwargs):
+        fake.now += 120.0  # 慢连接器：一次调用走掉 2 分钟墙钟
+        return real_call(*args, **kwargs)
+
+    monkeypatch.setattr(proxy, "call", slow_call)
+    episode = Episode(
+        episode_id="EP-0042",
+        package_id=loaded.package_id,
+        aware_id="AW-001",
+        fired_trigger="AW-001/T3",
+        assembled_at="2026-07-21T09:00:00+08:00",
+        then="STR-001",
+        budget={"max_minutes": 1},
+        context={
+            "structure": {"pipeline": [{"step": "取数", "performer": "connector", "uses": "CON-001.拉取费用明细"}]},
+            "objects": {},
+            "judgments": [],
+        },
+    )
+    result = run_episode(episode, loaded, proxy, policy)
+    assert result.status == "stopped", result.stop_reason
+    assert "max_minutes" in result.stop_reason
+    assert episode.steps and episode.steps[-1]["status"] == "done"  # 步已执行留痕，只是不算 completed

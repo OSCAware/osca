@@ -465,4 +465,8 @@ def run_episode(
         _record(episode, step_name, performer, "failed", detail)
         return _finish(episode, "failed", detail)
 
+    # 收尾复检（P2）：max_minutes 只在步前查——最后一步是慢连接器时会超时后仍标 completed。
+    # 硬顶是硬顶：超时的剧集按 stopped 收束（已执行步与回执留痕），不许「超时的完成」混进对账。
+    if max_minutes is not None and time.monotonic() - started > max_minutes * 60:
+        return _finish(episode, "stopped", f"预算硬顶：max_minutes {max_minutes} 用满（末步超时，剧集停）")
     return _finish(episode, "completed")

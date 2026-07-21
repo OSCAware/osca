@@ -73,8 +73,7 @@ def _find_by_id(pkg: OscaPackage, dirname: str, id_field: str, wanted: str) -> d
 
 
 def _system_prompt(pkg: OscaPackage, active_judgments: list[dict]) -> str:
-    agent_md = pkg.root / "AGENT.md"
-    parts = [agent_md.read_text(encoding="utf-8").strip() if agent_md.is_file() else ""]
+    parts = [pkg.agent_text.strip()]  # AGENT 取装载快照（与 YAML 同代，P2）
     objects = [f.mapping for f in pkg.typed_files("objects") if f.mapping]
     if objects:
         parts.append("## 对象定义（objects）\n\n```yaml\n" + _yaml(objects) + "\n```")
@@ -147,8 +146,14 @@ def replay_judgment(package: str | Path, judgment_id: str, llm=None) -> ReplayRe
             verdict.detail = f"{case_id} 缺 input / agent_draft / expert_final——非 diff 物种证据，不可 A/B 回放"
             continue
 
-        # 复现采集时的判断集；两臂唯一差异 = 本判断在不在场
-        base_ids = [str(i) for i in case_input.get("当时生效判断集") or [] if str(i) != judgment_id]
+        # 复现采集时的判断集；两臂唯一差异 = 本判断在不在场。
+        # 形状门禁（P2）：非字符串列表（如整串字符串）会被逐字符遍历——历史判断集静默丢失、
+        # 回放地基塌掉。fail-closed 拒绝回放该断言（OSCA036 同判据）。
+        raw_effective = case_input.get("当时生效判断集") or []
+        if not (isinstance(raw_effective, list) and all(isinstance(x, str) for x in raw_effective)):
+            verdict.detail = f"{case_id} 的「当时生效判断集」须为字符串列表——历史判断集不可信，拒绝回放（OSCA036）"
+            continue
+        base_ids = [i for i in raw_effective if i != judgment_id]
         base = [b for i in base_ids if (b := _find_by_id(pkg, "judgments", "judgment_id", i)) is not None]
         arms = {
             "without": [_judgment_brief(j) for j in base],
@@ -165,10 +170,14 @@ def replay_judgment(package: str | Path, judgment_id: str, llm=None) -> ReplayRe
             continue
 
         verdict.output_with, verdict.output_without = outputs["with"], outputs["without"]
-        verdict.score_with = round(_movement(outputs["with"], draft, final), 4)
-        verdict.score_without = round(_movement(outputs["without"], draft, final), 4)
+        # 判定用**原始分**（P2）：先 round 再比较会把真实但微小的改善（差 < 5e-5）错判成红灯——
+        # round 只服务展示值，绿灯/红灯以原始浮点差为准
+        score_with_raw = _movement(outputs["with"], draft, final)
+        score_without_raw = _movement(outputs["without"], draft, final)
+        verdict.score_with = round(score_with_raw, 4)
+        verdict.score_without = round(score_without_raw, 4)
         verdict.cited = judgment_id in outputs["with"]
-        moved = verdict.score_with > verdict.score_without
+        moved = score_with_raw > score_without_raw
         verdict.status = "green" if moved else "red"
         verdict.detail = f"score(注入)={verdict.score_with} vs score(不注入)={verdict.score_without} → " + (
             "输出从改前移向改后" if moved else "注入未使输出向专家改后移动"

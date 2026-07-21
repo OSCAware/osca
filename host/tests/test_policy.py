@@ -762,3 +762,14 @@ def test_charge_tokens_repeated_illegal_reports_never_pass_cap():
         assert p.authorize_llm("EP-1")[0]  # 额度未被合法消耗，授权仍过——止损靠 charge 侧拒绝
         ok, reason = p.charge_tokens("EP-1", -1)
         assert not ok and "用量上报非法" in reason  # 每次非法上报当场拒绝（剧集停），循环在第一次即断
+
+
+def test_redact_recurses_into_tuple():
+    """P2：tuple 内的手机号/身份证不许漏进审批展示与快照——redact 必须递归 tuple。"""
+    policy = PolicyInterceptor("p", {"data": {"redact": ["手机号"]}}, {})
+    value = {"联系": ({"手机": "13812345678"}, ["13898765432"], "备注 13811112222")}
+    redacted, hits = policy.redact(value)
+    assert hits == 3
+    assert isinstance(redacted["联系"], tuple)  # 形状保留
+    flat = str(redacted)
+    assert "13812345678" not in flat and "13898765432" not in flat and "13811112222" not in flat

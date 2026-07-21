@@ -39,13 +39,20 @@ def _decision(episode: Episode) -> object:
 def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episode) -> list[dict]:
     """对剧集上下文中的 objective 型对象逐个对账；返回落账记录（同时写进 episode.settlements）。"""
     results: list[dict] = []
+
+    def note(entry: dict) -> None:
+        # 逐项即时记账（P2）：多 objective 中途异常时，已落盘的 case 必须已在 episode.settlements
+        # 里可见——「case 在账本、settlements 为空」的静默 partial 不允许存在
+        results.append(entry)
+        episode.settlements.append(entry)
+
     for object_id, spec in sorted((episode.context.get("objects") or {}).items()):
         if not isinstance(spec, dict) or spec.get("kind") != "objective":
             continue
         declared = spec.get("settle")
         uses = str(declared.get("uses", "")) if isinstance(declared, dict) else ""
         if not INTERFACE_REF.fullmatch(uses):
-            results.append(
+            note(
                 {
                     "object": object_id,
                     "settled": False,
@@ -55,7 +62,7 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
             continue
         receipt = proxy.call(uses, step=None)  # 运行时内部调用，不走模型白名单
         if not receipt.ok:
-            results.append({"object": object_id, "settled": False, "note": f"对账取数失败：{receipt.error}"})
+            note({"object": object_id, "settled": False, "note": f"对账取数失败：{receipt.error}"})
             continue
 
         # 入账本锁协议（Review 十一轮）+ 安全目录发布（十三轮）：目录经 lstat/O_NOFOLLOW
@@ -75,6 +82,9 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
                 "input": {
                     "objective": object_id,
                     "episode": episode.episode_id,
+                    # 机器唯一身份（P2）：EP-xxxx 是跨重启可复用的展示号——outcome case 必须
+                    # 同时持久化 operation_id，事后归因才不会把两次重启的同号剧集混为一谈
+                    "operation_id": episode.operation_id,
                     "fired_trigger": episode.fired_trigger,
                     "当时生效判断集": [j["judgment_id"] for j in episode.context.get("judgments") or []],
                 },
@@ -93,7 +103,7 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
                     break
                 n += 1  # 无覆盖发布：撞号顺移重试（编号随内容重写保持一致），绝不截断他人内容
                 case_id = f"C-{n:04d}"
-        results.append(
+        note(
             {
                 "object": object_id,
                 "settled": True,
@@ -102,5 +112,4 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
             }
         )
 
-    episode.settlements.extend(results)
     return results

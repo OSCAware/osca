@@ -344,3 +344,42 @@ def test_load_without_bindings_is_explicit_non_deployment(make_pkg, base):
     result, root = load_osca(make_pkg(base))
     assert result.ok and root is not None
     assert any("非部署装载" in line for line in result.lines)
+
+
+# ── 校验和清单损坏（P2）：稳定装载失败，不许 traceback 穿透 ──
+
+
+def test_load_corrupted_checksums_stable_failure(make_pkg, base):
+    pkg = make_pkg(base)
+    (pkg / "indexes").mkdir()
+    (pkg / CHECKSUMS_REL).write_text("这一行没有双空格分隔也没有sha256前缀\n", encoding="utf-8")
+    result, root = load_osca(pkg)
+    assert not result.ok and root is None
+    assert any("清单" in line and "格式非法" in line for line in result.lines)
+
+
+def test_load_binary_checksums_stable_failure(make_pkg, base):
+    pkg = make_pkg(base)
+    (pkg / "indexes").mkdir()
+    (pkg / CHECKSUMS_REL).write_bytes(b"\xff\xfe\x00garbage")
+    result, root = load_osca(pkg)
+    assert not result.ok and root is None
+    assert any("清单读取失败" in line for line in result.lines)
+
+
+# ── zip 夹带缓存（P2）：未列入 checksum 的 indexes/.git 成员一律不解压 ──
+
+
+def test_load_zip_ignores_smuggled_cache_members(make_pkg, base, tmp_path):
+    zip_path = _packed(make_pkg, base, tmp_path)
+    with zipfile.ZipFile(zip_path, "a") as zf:
+        zf.writestr("indexes/replay-health.json", '{"green": 999, "red": 0}')  # 伪健康档案
+        zf.writestr("indexes/vectors.bin", "fake-vector-cache")
+        zf.writestr(".git/hooks/evil", "#!/bin/sh\n")
+    dest = tmp_path / "deploy"
+    result, root = load_osca(zip_path, dest=dest)
+    assert result.ok, result.render("load")
+    assert not (root / "indexes" / "replay-health.json").exists()  # 未经校验的健康档案不落地
+    assert not (root / "indexes" / "vectors.bin").exists()
+    assert not (root / ".git").exists()
+    assert (root / "indexes" / "judgments.index.yaml").is_file()  # 受支持缓存按已校验内容重建

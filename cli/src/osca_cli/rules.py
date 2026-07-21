@@ -25,6 +25,7 @@ from osca_cli.triggers import (
     AWARE_BUDGET_KEYS,
     PERFORMERS,
     POLICY_BUDGET_KEYS,
+    declared_triggers,
     parse_performer,
     parse_quantity,
     validate_gate,
@@ -91,8 +92,14 @@ def osca004_manifest(pkg: OscaPackage) -> list[Finding]:
         if not m.get(key):
             findings.append(_err("OSCA004", "osca.yaml", f"缺少必填字段 {key}"))
     entry = m.get("entry", "AGENT.md")
-    if isinstance(entry, str) and not pkg.exists(entry):
-        findings.append(_err("OSCA004", "osca.yaml", f"entry 指向的文件不存在：{entry}"))
+    if isinstance(entry, str):
+        # entry 是包内声明（不可信输入，P2）：绝对路径/`../`/链接逃逸可把 entry 指到包外文件——
+        # 与 impl/固件同一受限路径判据（resolve_in_root），越界即错，不因包外恰好存在而放行
+        resolved = resolve_in_root(pkg.root, entry)
+        if resolved is None:
+            findings.append(_err("OSCA004", "osca.yaml", f"entry 越出包根：{entry}——绝对路径/../链接逃逸一律拒绝"))
+        elif not resolved.is_file():
+            findings.append(_err("OSCA004", "osca.yaml", f"entry 指向的文件不存在：{entry}"))
     requires = m.get("requires")
     if requires is not None and not isinstance(requires, dict):
         findings.append(
@@ -458,7 +465,11 @@ def osca035_expiry(pkg: OscaPackage) -> list[Finding]:
 
 @rule
 def osca036_case_effective_set(pkg: OscaPackage) -> list[Finding]:
-    """OSCA036 case 必存「当时生效判断集」，无此字段回放不可信（SPEC §8）。"""
+    """OSCA036 case 必存「当时生效判断集」且须为字符串列表，否则回放不可信（SPEC §8）。
+
+    只查存在不查形状是 fail-open（P2）：字符串会被回放器逐字符遍历——历史判断集静默丢失、
+    A/B 两臂共享地基塌掉，回放结果全不可信。
+    """
     findings = []
     for f in pkg.typed_files("cases"):
         if f.parse_error:
@@ -466,6 +477,16 @@ def osca036_case_effective_set(pkg: OscaPackage) -> list[Finding]:
         input_ = f.mapping.get("input")
         if not isinstance(input_, dict) or "当时生效判断集" not in input_:
             findings.append(_err("OSCA036", f.relpath, "input 缺少必存字段「当时生效判断集」（回放不可信）"))
+            continue
+        effective = input_.get("当时生效判断集")
+        if not (isinstance(effective, list) and all(isinstance(x, str) for x in effective)):
+            findings.append(
+                _err(
+                    "OSCA036",
+                    f.relpath,
+                    "「当时生效判断集」必须是字符串列表——字符串会被逐字符遍历、回放静默丢失历史判断集",
+                )
+            )
     return findings
 
 
@@ -591,8 +612,7 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
         raw_triggers = f.mapping.get("triggers")
         if raw_triggers is not None and not isinstance(raw_triggers, list):
             bad_shape(f, "triggers", raw_triggers, "list（触发原语序列）")
-            raw_triggers = None
-        triggers = raw_triggers or ([f.mapping["trigger"]] if f.mapping.get("trigger") else [])
+        triggers = declared_triggers(f.mapping)  # 单数 trigger 兼容归一化（P2，与 OSCA041/Host loader 同源）
         if not triggers:
             findings.append(_err("OSCA040", f.relpath, "至少需要 1 个触发原语（triggers 或 trigger）"))
         for i, t in enumerate(triggers):
@@ -824,7 +844,9 @@ def osca041_trigger_gate_syntax(pkg: OscaPackage) -> list[Finding]:
     for f in pkg.typed_files("aware"):
         if f.parse_error:
             continue
-        triggers = [t for t in (f.mapping.get("triggers") or []) if isinstance(t, dict)]
+        # 单数 trigger 一并校验（P2）：修复前单数写法被 OSCA040 放行却不进本规则——语法错误
+        # 的 schedule/watch 全绿装载、Host 又只读复数，最终「Aware 启用却零触发器」
+        triggers = [t for t in declared_triggers(f.mapping) if isinstance(t, dict)]
         for t in triggers:
             findings.extend(_err("OSCA041", f.relpath, msg) for msg in validate_trigger(t))
         gate = f.mapping.get("gate")

@@ -413,9 +413,11 @@ class Host:
                 log.error(detail)
                 return {"ok": False, "detail": detail}
             gate.enabled = True
+            aware.enabled = True  # 声明结构跟运行态走（P2）：status 的 awares.enabled 不许与 Gate 自相矛盾
             detail = f"触发器启：{aware_id} 重新布防 {len(aware.triggers)} 条"
         else:
             gate.enabled = False
+            aware.enabled = False  # 声明结构跟运行态走（P2）
             # disable 边界（P1）：代际递增使所有旧代在途投递永久失效（撑过 disable→enable 也不发布）；
             # 组合闸门的部分推进状态（all 已见/sequence 指针）一并清除——半程状态不跨启停边界
             key = (package_id, aware_id)

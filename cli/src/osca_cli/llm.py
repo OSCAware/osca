@@ -15,6 +15,7 @@ mock 执行器与 Connector 代理的 mock 同一手法：按调用 tag 读 <目
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import urllib.error
@@ -31,6 +32,7 @@ ENV_MODEL = "OSCA_LLM_MODEL"
 ENV_KEY = "OSCA_LLM_API_KEY"
 
 TIMEOUT_SECONDS = 120
+MAX_RESPONSE_BYTES = 16 << 20  # 响应体读上限 16 MiB——巨响应体不触发 OOM（与 Host openapi 执行器同顶）
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}  # API key 走明文 http 仅限本地回环（开发面）
 
@@ -93,17 +95,32 @@ class OpenAICompatLLM:
                     f"拒绝发起：凭据明文外发风险；本地开发仅允许回环地址走 http（{tag}）"
                 )
             headers["Authorization"] = f"Bearer {self.api_key}"
-        request = urllib.request.Request(f"{self.base_url}/chat/completions", data=body, headers=headers)
         effective = TIMEOUT_SECONDS if timeout is None else min(TIMEOUT_SECONDS, max(0.001, timeout))
         try:
+            # Request 构造也在边界内（P2）：非法 URL 在构造期就抛 ValueError（unknown url type 等）
+            request = urllib.request.Request(f"{self.base_url}/chat/completions", data=body, headers=headers)
             with _OPENER.open(request, timeout=effective) as resp:  # noqa: S310 —— 网关地址来自部署环境；不跟随重定向
-                payload = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
+                raw = resp.read(MAX_RESPONSE_BYTES + 1)  # 读上限（P2）：巨响应体不吃光内存
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.HTTPException) as e:
+            # ValueError 罩非法 URL、HTTPException 罩畸形响应——不许 traceback 穿透
             raise LLMError(f"LLM 网关调用失败（{tag}）：{e}") from e
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise LLMError(f"LLM 网关响应体超限（>{MAX_RESPONSE_BYTES}B，{tag}）——拒绝解析")
         try:
-            text = payload["choices"][0]["message"]["content"] or ""
+            payload = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise LLMError(f"LLM 网关响应非 UTF-8 JSON（{tag}）：{type(e).__name__}") from e
+        try:
+            content = payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
-            raise LLMError(f"LLM 网关响应不是 chat/completions 形状（{tag}）：{payload}") from e
+            # 错误只带形状摘要（P2）：完整 payload 回显会把网关返回的数据（可能含敏感内容）灌进日志
+            shape = f"顶层键 {list(payload)[:8]}" if isinstance(payload, dict) else f"顶层类型 {type(payload).__name__}"
+            raise LLMError(f"LLM 网关响应不是 chat/completions 形状（{tag}；{shape}，payload 不回显）") from e
+        if content is None:
+            content = ""
+        if not isinstance(content, str):
+            raise LLMError(f"LLM 网关 content 非字符串（{tag}；类型 {type(content).__name__}）——拒绝，不猜")
+        text = content
         # 用量自报是不可信输入（预算硬顶的记账源）：负数会冲减已用额度、非整数会炸记账——
         # 缺失/0/负数/bool/非整数一律回落字符估算，绝不把非法上报放进硬预算（GPT Review P1 预算绕过）
         usage = payload.get("usage")

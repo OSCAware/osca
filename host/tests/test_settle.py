@@ -148,3 +148,35 @@ def test_settle_refuses_symlinked_cases_dir(loaded, proxy, tmp_path):
     with pytest.raises(OSError):
         settle_episode(loaded, proxy, _episode({"OBJ-009": OBJECTIVE}))
     assert list(outside.iterdir()) == []
+
+
+def test_case_carries_machine_unique_operation_id(loaded, proxy):
+    """P2：outcome case 须持久化机器唯一 operation_id——EP-xxxx 展示号跨重启可复用，不够归因。"""
+    episode = _episode({"OBJ-009": OBJECTIVE})
+    episode.operation_id = "EO-fixed42"
+    (result,) = settle_episode(loaded, proxy, episode)
+    case = yaml.safe_load((loaded.root / "cases" / f"{result['case']}.yaml").read_text(encoding="utf-8"))
+    assert case["input"]["operation_id"] == "EO-fixed42"
+
+
+def test_partial_settlement_recorded_before_midway_exception(loaded, proxy, monkeypatch):
+    """P2：多 objective 对账中途异常——已落盘的 case 必须已记入 episode.settlements（逐项记账，
+    不许「case 在账本、settlements 为空」的静默 partial）。"""
+    calls = {"n": 0}
+    real_call = proxy.call
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("对账中途崩（测试注入）")
+        return real_call(*args, **kwargs)
+
+    monkeypatch.setattr(proxy, "call", flaky)
+    first = dict(OBJECTIVE, object_id="OBJ-008")
+    episode = _episode({"OBJ-008": first, "OBJ-009": OBJECTIVE})
+    with pytest.raises(RuntimeError):
+        settle_episode(loaded, proxy, episode)
+    assert len(episode.settlements) == 1  # 第一项已逐项记账
+    assert episode.settlements[0]["object"] == "OBJ-008" and episode.settlements[0]["settled"] is True
+    case_path = loaded.root / "cases" / f"{episode.settlements[0]['case']}.yaml"
+    assert case_path.is_file()  # 落盘与记账一致

@@ -31,15 +31,15 @@ class Registry:
     watchers: dict[str, list[WatcherSlot]] = field(default_factory=dict)  # package_id → slots
 
     def register(self, pkg: LoadedPackage) -> list[str]:
-        """注册包并登记 watcher 槽位；返回人可读日志行。"""
+        """注册包并登记 watcher 槽位；返回人可读日志行。
+
+        槽位登记**全部** Aware 的触发原语（P2）：只登记 enabled 会让「装载后 enable」的 Aware
+        永远没有槽位——status 里 Gate 已启用而 watchers 缺席，控制面自相矛盾。armed/disabled
+        由 Host._sync_slots 按 Gate 运行态刷新。
+        """
         if pkg.package_id in self.packages:
             raise RegistryError(f"包已注册：{pkg.package_id}（同 ID 重复装载需先注销）")
-        slots = [
-            WatcherSlot(trigger_id=t.trigger_id, kind=t.kind)
-            for aware in pkg.awares
-            if aware.enabled
-            for t in aware.triggers
-        ]
+        slots = [WatcherSlot(trigger_id=t.trigger_id, kind=t.kind) for aware in pkg.awares for t in aware.triggers]
         self.packages[pkg.package_id] = pkg
         self.watchers[pkg.package_id] = slots
         return [

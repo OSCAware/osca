@@ -132,3 +132,25 @@ def test_cli_replay_without_llm_config(replay_base, make_pkg, monkeypatch, capsy
     monkeypatch.delenv("OSCA_LLM_URL", raising=False)
     assert main(["replay", str(make_pkg(replay_base)), "J-0001"]) == 1
     assert "OSCA_LLM_URL" in capsys.readouterr().out
+
+
+def test_effective_set_must_be_string_list_fail_closed(replay_base, make_pkg, llm_dir):
+    """P2：「当时生效判断集」是整串字符串 → 逐字符遍历会静默丢历史判断集——拒绝回放该断言（error）。"""
+    replay_base["cases/C-0001.yaml"]["input"]["当时生效判断集"] = "J-0001"
+    report = replay_judgment(make_pkg(replay_base), "J-0001", llm=MockLLM(llm_dir))
+    (v,) = report.verdicts
+    assert v.status == "error" and "字符串列表" in v.detail
+
+
+def test_verdict_compares_raw_scores_not_rounded(replay_base, make_pkg, llm_dir, monkeypatch):
+    """P2：先 round 再比较会把真实但微小的改善错判成红灯——判定必须用原始分,round 只服务展示。"""
+    import osca_cli.replay as replay_mod
+
+    def near_tie_movement(text: str, draft: str, final: str) -> float:
+        return 0.100049 if "J-0001" in text else 0.100001  # 差 4.8e-5:round(4) 后同值
+
+    monkeypatch.setattr(replay_mod, "_movement", near_tie_movement)
+    report = replay_judgment(make_pkg(replay_base), "J-0001", llm=MockLLM(llm_dir))
+    (v,) = report.verdicts
+    assert v.score_with == v.score_without  # 展示值确实四舍五入相等
+    assert v.status == "green"  # 但判定用原始分:真实微小改善不许判红

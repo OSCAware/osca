@@ -153,6 +153,19 @@ def parse_schedule(spec: object) -> tuple[Schedule | None, list[str]]:
     return Schedule(every=every, time=time_, day=day, tz=tz), []
 
 
+def declared_triggers(mapping: dict) -> list:
+    """Aware 声明的触发原语清单（单一真理源：lint OSCA040/OSCA041 与 Host loader 共用，P2）。
+
+    复数 triggers（list）优先；v0.3 单数 trigger 兼容归一化为单元素列表——修复前 lint 放行
+    单数写法、OSCA041 不校验、Host 只读复数：Aware 显示启用却零触发器（fail-open）。
+    """
+    raw = mapping.get("triggers")
+    if isinstance(raw, list):
+        return raw
+    single = mapping.get("trigger")
+    return [single] if single is not None else []
+
+
 def validate_trigger(t: dict) -> list[str]:
     """一条触发原语的受限语法校验。kind 枚举本身由 OSCA040 检查，这里查 kind 内语法。"""
     tid = t.get("id", "?")

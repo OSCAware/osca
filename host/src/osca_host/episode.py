@@ -149,7 +149,9 @@ def assemble(episode_id: str, loaded: LoadedPackage, aware: AwareDecl, fired_tri
     objects = {oid: spec for oid, spec in _by_id(loaded, "objects").items() if oid in object_ids}
 
     context = {
-        "agent": (loaded.root / "AGENT.md").read_text(encoding="utf-8"),
+        # AGENT 取自已校验的 pack 快照（P2）：实时读盘会与 _refresh_ledger 换代后的 YAML 快照
+        # 混代（半新半旧上下文）；快照同源则装配恒为同一代内容
+        "agent": loaded.pack.agent_text,
         "structure": structure_map,
         "discretion": aware.discretion,
         "objects": objects,

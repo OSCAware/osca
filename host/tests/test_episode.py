@@ -89,3 +89,14 @@ def test_assembly_is_deterministic(loaded):
     a = assemble("EP-0001", loaded, aware, "AW-001/T3")
     b = assemble("EP-0002", loaded, aware, "AW-001/T3")
     assert a.context == b.context  # 同包同 Aware → 同上下文（纯确定性）
+
+
+def test_agent_context_from_verified_snapshot_not_live_disk(loaded, sample_pack):
+    """P2：AGENT 内容取自已校验 pack 快照——装载后磁盘被换,装配出的上下文不得混入新盘内容（混代）。"""
+    original = loaded.pack.agent_text
+    assert original  # 快照已随装载读入
+    (sample_pack / "AGENT.md").write_text("# 中途被换的内容\n", encoding="utf-8")
+    aware = next(a for a in loaded.awares if a.aware_id == "AW-001")
+    episode = assemble("EP-0009", loaded, aware, "AW-001/T3")
+    assert episode.context["agent"] == original
+    assert "中途被换的内容" not in episode.context["agent"]

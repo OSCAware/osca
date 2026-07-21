@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import time
 import zipfile
@@ -152,9 +153,16 @@ def pack_package(path: str | Path, output: str | Path | None = None) -> tuple[Op
         return result, None
     result.step("零符号链接确认")
 
-    # 4. 清单与校验和
+    # 4. 清单与校验和——同一次读取的同一份字节既算摘要又进归档（P2 关 TOCTOU 窗：
+    # 摘要后二次读盘写 zip，并发修改会产出自校验必败的交付件）
     rels = package_files(root)
-    checksums = checksums_text(root, rels)
+    blobs: dict[str, bytes] = {}
+    lines = []
+    for rel in sorted(rels):
+        data = (root / rel).read_bytes()
+        blobs[rel] = data
+        lines.append(f"sha256:{hashlib.sha256(data).hexdigest()}  {rel}")
+    checksums = "\n".join(lines) + "\n"
     result.step(f"进包文件 {len(rels)} 个，已生成校验和清单")
 
     # 5. 确定性写 zip
@@ -171,7 +179,7 @@ def pack_package(path: str | Path, output: str | Path | None = None) -> tuple[Op
             info = zipfile.ZipInfo(rel, date_time=ZIP_EPOCH)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
-            zf.writestr(info, (root / rel).read_bytes())
+            zf.writestr(info, blobs[rel])  # 与摘要同一份字节快照（不二次读盘）
         info = zipfile.ZipInfo(CHECKSUMS_REL, date_time=ZIP_EPOCH)
         info.compress_type = zipfile.ZIP_DEFLATED
         info.external_attr = 0o644 << 16
@@ -186,11 +194,17 @@ def pack_package(path: str | Path, output: str | Path | None = None) -> tuple[Op
 
 
 def _safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
-    """防 zip-slip 与 zip bomb：路径越界、成员数、单成员与总解压量超限一律拒绝。"""
+    """防 zip-slip 与 zip bomb：路径越界、成员数、单成员与总解压量超限一律拒绝。
+
+    排除目录成员**不解压**（P2）：indexes/、.git/ 不进校验和清单——zip 可夹带不受校验的
+    `indexes/replay-health.json`（伪健康档案）/向量缓存/钩子。归档缓存一律忽略，缓存只由
+    装载后 rebuild_index 按已校验内容重建；唯一例外是清单自身 indexes/checksums.txt。
+    """
     infos = zf.infolist()
     if len(infos) > MAX_ZIP_MEMBERS:
         raise ValueError(f"zip 成员数 {len(infos)} 超上限 {MAX_ZIP_MEMBERS}——拒绝解压（zip bomb 防护）")
     total = 0
+    members: list[str] = []
     for info in infos:
         target = (dest / info.filename).resolve()
         if not target.is_relative_to(dest.resolve()):
@@ -200,19 +214,36 @@ def _safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
                 f"zip 成员 {info.filename} 解压后 {info.file_size} 字节超单成员上限——拒绝解压（zip bomb 防护）"
             )
         total += info.file_size
+        top = info.filename.split("/", 1)[0]
+        if top in EXCLUDE_TOP_DIRS and info.filename != CHECKSUMS_REL:
+            continue  # 归档缓存/版本库夹带：不解压（清单外内容不落地）
+        members.append(info.filename)
     if total > MAX_TOTAL_BYTES:
         raise ValueError(f"zip 总解压量 {total} 字节超上限 {MAX_TOTAL_BYTES}——拒绝解压（zip bomb 防护）")
-    zf.extractall(dest)
+    zf.extractall(dest, members=members)
+
+
+CHECKSUM_LINE = re.compile(r"sha256:([0-9a-f]{64})  (.+)")
 
 
 def verify_checksums(root: Path, result: OpResult) -> bool:
+    """校验和比对。清单自身损坏（不可读/非 UTF-8/行格式非法）→ 稳定装载失败（P2），
+    不许 ValueError/traceback 穿透——清单是完整性根基，坏了不猜、不兜底。"""
     checks_path = root / CHECKSUMS_REL
+    try:
+        text = checks_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        result.fail(f"校验和清单读取失败（{type(e).__name__}）——清单损坏，装载失败")
+        return False
     expected: dict[str, str] = {}
-    for line in checks_path.read_text(encoding="utf-8").splitlines():
+    for lineno, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
             continue
-        digest, rel = line.split("  ", 1)
-        expected[rel] = digest.removeprefix("sha256:")
+        m = CHECKSUM_LINE.fullmatch(line)
+        if m is None:
+            result.fail(f"校验和清单第 {lineno} 行格式非法——清单损坏，装载失败（格式：sha256:<hex64>␣␣<相对路径>）")
+            return False
+        expected[m.group(2)] = m.group(1)
 
     actual = set(package_files(root))
     ok = True
