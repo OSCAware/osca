@@ -115,3 +115,22 @@ def test_mock_tag_path_escape_rejected(tmp_path):
     (tmp_path / "leak.md").write_text("包外内容", encoding="utf-8")
     with pytest.raises(LLMError, match="越界"):
         MockLLM(fixture_dir).complete("s", "u", tag="../leak")
+
+
+def test_openai_compat_deadline_bounds_urlopen_timeout(monkeypatch):
+    """GPT Review 复审 P2：调用方剩余时间预算（timeout 参数）须传导为 urlopen 超时——
+    只剩 3s 不许再吊默认 120s；缺省仍用 TIMEOUT_SECONDS，超默认取默认。"""
+    seen = {}
+
+    def fake_urlopen(request, timeout):
+        seen["timeout"] = timeout
+        return _FakeResponse({"choices": [{"message": {"content": "回答"}}], "usage": {"total_tokens": 7}})
+
+    monkeypatch.setattr(llm_mod.urllib.request, "urlopen", fake_urlopen)
+    client = OpenAICompatLLM("https://g/v1", "m")
+    client.complete("s", "u", tag="t", timeout=3.0)
+    assert seen["timeout"] == 3.0  # 剩余预算生效
+    client.complete("s", "u", tag="t")
+    assert seen["timeout"] == llm_mod.TIMEOUT_SECONDS  # 缺省默认
+    client.complete("s", "u", tag="t", timeout=999.0)
+    assert seen["timeout"] == llm_mod.TIMEOUT_SECONDS  # 超默认取默认（不放大）

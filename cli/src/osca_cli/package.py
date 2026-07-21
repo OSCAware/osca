@@ -28,6 +28,20 @@ REQUIRED_FILES = ["osca.yaml", "AGENT.md", "policy.yaml", "structure.yaml"]
 SKIP_DIRS = {"indexes", ".git"}
 
 
+def resolve_in_root(root: Path | str, declared: str) -> Path | None:
+    """包内受限路径判据（单一真理源：lint OSCA024 与 Host 执行器/mock 固件共用）。
+
+    包内声明（impl / 固件名等）是不可信输入：resolve 后必须留在 root 内——绝对路径、`../` 与
+    符号链接逃逸一律返回 None（GPT Review：开发期与执行期同一判据，lint 放行的包不得在运行时
+    才被拒；反之 lint 也要拦运行时必拒的越界声明）。"""
+    base = Path(root).resolve()
+    try:
+        target = (base / declared).resolve()
+    except OSError:  # 病态路径（深度爆炸/链接循环等）——按越界拒
+        return None
+    return target if target.is_relative_to(base) else None
+
+
 @dataclass
 class YamlFile:
     relpath: str
@@ -97,6 +111,11 @@ def load_package(root: Path) -> OscaPackage:
             pkg.yaml_files[rel] = YamlFile(relpath=rel, data=data)
         except yaml.YAMLError as e:
             pkg.yaml_files[rel] = YamlFile(relpath=rel, data=None, parse_error=str(e))
+        except (UnicodeDecodeError, OSError) as e:
+            # 二进制伪装 .yaml（如 PNG 改名）/ 读取失败：不许 traceback 穿透 lint/pack/load——
+            # 一律转 parse_error，由 OSCA003 稳定报告并拒绝（GPT Review P2）
+            error = f"文件读取/解码失败（{type(e).__name__}）"
+            pkg.yaml_files[rel] = YamlFile(relpath=rel, data=None, parse_error=error)
 
     # 收集声明的 ID（文件内 ID 字段优先；用于引用解析与唯一性检查）
     for rel, f in pkg.yaml_files.items():

@@ -394,15 +394,66 @@ def test_parse_quantity_restricted_form():
     assert parse_quantity("1h") is None and parse_quantity(True) is None and parse_quantity(None) is None
 
 
-def test_agent_step_clamps_negative_token_report(episode, loaded, proxy, policy):
-    """GPT Review P1 预算绕过（aware 硬顶侧）：可插拔注入的 llm 误报负 tokens 不得冲减
-    episode.tokens_used——非法一律按 0 计（源头清洗在 osca_cli.llm，本处兜底注入路径）。"""
+def test_agent_step_estimates_on_illegal_token_report(episode, loaded, proxy, policy):
+    """GPT Review 复审 P1 预算绕过（aware 硬顶侧）：可插拔注入的 llm 误报负/零 tokens **不得按 0 记账**
+    （零成本无限过顶）也不得冲减——runner 看得见 prompt/产出，回落字符估算（与 OpenAICompatLLM 同口径）。"""
     from osca_cli.llm import LLMReply
 
     class NegLLM:
         def complete(self, system, user, *, tag):
-            return LLMReply(text="草稿", tokens=-100, model="fake")
+            return LLMReply(text="草稿" * 50, tokens=-100, model="fake")
 
     run_episode(episode, loaded, proxy, policy, llm=NegLLM())
-    assert episode.tokens_used == 0  # 负上报被钳制为 0，未冲减
+    assert episode.tokens_used > 0  # 非法上报按估算记账——既不冲减、也不白嫖
     assert all((s.get("tokens") or 0) >= 0 for s in episode.steps)
+
+
+def test_agent_step_zero_report_still_depletes_budget(episode, loaded, proxy, policy):
+    """最小复现反转：tokens=0 自报 + max_tokens 小额度 → 调用不能零成本反复通过，估算记账终会触顶。"""
+    from osca_cli.llm import LLMReply
+
+    class ZeroLLM:
+        def complete(self, system, user, *, tag):
+            return LLMReply(text="产出" * 200, tokens=0, model="fake")
+
+    episode.budget = dict(episode.budget, max_tokens=1)  # aware 硬顶收到 1 token
+    run_episode(episode, loaded, proxy, policy, llm=ZeroLLM())
+    assert episode.status == "stopped" and "预算硬顶" in episode.stop_reason  # 估算记账 → 触顶即停
+    assert episode.tokens_used > 1
+
+
+def test_optimizer_rejects_nan_and_infinity(loaded):
+    """GPT Review 复审 P2：NaN 不触发 float() 异常却毒化排序（NaN 候选可被选为 selected）——
+    非有限数一律拒绝，不进排序。"""
+    spec = {"step": "寻优", "performer": "optimizer", "input": "候选"}
+    objects = {"OBJ-9": {"object_id": "OBJ-9", "kind": "objective", "optimize": "maximize"}}
+    for poison in (float("nan"), float("inf"), "-Infinity", "NaN"):
+        artifacts = {"候选": [{"value": 1}, {"value": poison}]}
+        plan, detail = _run_optimizer(spec, artifacts, objects)
+        assert plan is None and "非有限数" in detail, poison
+
+
+def test_agent_step_passes_remaining_deadline_as_llm_timeout(episode, loaded, proxy, policy):
+    """GPT Review 复审 P2：max_minutes 剩余时间须传导为单次 LLM 调用超时——
+    只剩数秒时不许再吊默认 120s 外呼继续烧外部成本。"""
+    from osca_cli.llm import LLMReply
+
+    seen = {}
+
+    class TimeoutProbe:
+        def complete(self, system, user, *, tag, timeout=None):
+            seen["timeout"] = timeout
+            return LLMReply(text="草稿", tokens=5, model="fake")
+
+    episode.budget = dict(episode.budget, max_minutes=1)  # 剩余 ≤60s
+    run_episode(episode, loaded, proxy, policy, llm=TimeoutProbe())
+    assert seen["timeout"] is not None and 0 < seen["timeout"] <= 60
+
+
+def test_performer_substring_no_longer_matches(episode, loaded, proxy, policy):
+    """GPT Review 复审 P2：performer 受限语法（parse_performer，lint 同源）——
+    `not-a-connector` 不得再按子串识别成 connector，步骤直接拒绝。"""
+    episode.context = copy.deepcopy(episode.context)
+    episode.context["structure"]["pipeline"] = [{"step": "怪步", "performer": "not-a-connector"}]
+    run_episode(episode, loaded, proxy, policy)
+    assert episode.status == "failed" and "不可识别" in episode.stop_reason

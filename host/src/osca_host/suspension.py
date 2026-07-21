@@ -25,6 +25,7 @@ import contextlib
 import json
 import logging
 import os
+import threading
 
 log = logging.getLogger("osca-host")
 
@@ -35,40 +36,72 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 class SuspensionStore:
     """运行目录 fd 下的挂起快照存储。dir_fd 由 Host 从安全运行目录**借用**（不持有、不关闭——
-    fd 归 ControlServer 的 RuntimeDirectory，随 Host 关停一并释放）。"""
+    fd 归 ControlServer 的 RuntimeDirectory，随 Host 关停一并释放）。
+
+    **persist/delete 按 operation_id 串行 + 删除世代令牌（GPT Review 复审 P1）：** persist 下线程后，
+    「delete 找不到文件（persist 未落）→ 恢复真写 → persist 迟到落盘 → 崩溃」会把已兑现的 pending
+    快照留在盘上、重启重挂重批**重复写**。堵法：delete 在每-operation 锁内先把删除世代 +1 再 unlink；
+    persist 发起时（事件循环侧 `begin_persist`）取当时世代作令牌，线程落盘在同一锁内**复核令牌**——
+    晚于 delete 的落盘直接作废（不写文件），无论 delete 时文件存不存在。于是「决定竞态 + 崩溃」窗关死；
+    unload **不 delete**（快照留盘待重载重挂），在途 persist 照常落地——保留与作废由调用方语义区分。"""
 
     def __init__(self, dir_fd: int):
         self._fd = dir_fd
+        self._registry = threading.Lock()  # guards/世代表的注册锁（粗粒度、纯内存，纳秒级）
+        self._guards: dict[str, threading.Lock] = {}  # operation_id → persist/delete 互斥锁
+        # operation_id → 删除世代（进程内单调；重启归零无碍——重启后不存在在途 persist）
+        self._delete_gen: dict[str, int] = {}
 
     def _name(self, operation_id: str) -> str:
         return f"{PREFIX}{operation_id}{SUFFIX}"
 
-    def persist(self, operation_id: str, record: dict) -> bool:
+    def _guard(self, operation_id: str) -> threading.Lock:
+        with self._registry:
+            return self._guards.setdefault(operation_id, threading.Lock())
+
+    def begin_persist(self, operation_id: str) -> int:
+        """persist 发起时（事件循环侧、与挂起登记同临界区）取当前删除世代作令牌。"""
+        with self._registry:
+            return self._delete_gen.get(operation_id, 0)
+
+    def persist(self, operation_id: str, record: dict, token: int | None = None) -> bool:
         """原子写盘（temp + fsync + rename，均相对 dir_fd）。非 JSON 可序列化 → 跳过并告警，返回 False
-        （该剧集退回 L1）；成功返回 True。文件名按 operation_id 键化。"""
+        （该剧集退回 L1）；token 给定且与当前删除世代不符（落盘前已被 delete 作废）→ 不写、返回 False；
+        成功返回 True。文件名按 operation_id 键化。"""
         try:
             blob = json.dumps(record, ensure_ascii=False).encode("utf-8")
         except (TypeError, ValueError) as e:
             log.warning(f"挂起快照非 JSON 可序列化，跳过持久化（该剧集退回 L1、不活过重载/重启）：{e}")
             return False
-        name = self._name(operation_id)
-        tmp = name + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW, 0o600, dir_fd=self._fd)
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(blob)
-                f.flush()
-                os.fsync(f.fileno())
-            os.rename(tmp, name, src_dir_fd=self._fd, dst_dir_fd=self._fd)  # 原子替换
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp, dir_fd=self._fd)
-            raise
+        with self._guard(operation_id):
+            if token is not None:
+                with self._registry:
+                    if self._delete_gen.get(operation_id, 0) != token:
+                        log.info(f"挂起快照落盘前已被恢复作废（决定竞态），放弃写盘：{operation_id}")
+                        return False
+            name = self._name(operation_id)
+            tmp = name + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW, 0o600, dir_fd=self._fd)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(blob)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.rename(tmp, name, src_dir_fd=self._fd, dst_dir_fd=self._fd)  # 原子替换
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp, dir_fd=self._fd)
+                raise
         return True
 
     def delete(self, operation_id: str) -> None:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(self._name(operation_id), dir_fd=self._fd)
+        """作废并删除快照：世代 +1（在途 persist 令牌失配即弃写）再 unlink。锁竞争至多一次 fsync 时长
+        （仅决定恰与落盘并发的罕见时序），可接受。"""
+        with self._guard(operation_id):
+            with self._registry:
+                self._delete_gen[operation_id] = self._delete_gen.get(operation_id, 0) + 1
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self._name(operation_id), dir_fd=self._fd)
 
     def load_all(self) -> list[dict]:
         """读运行目录下全部挂起快照（坏文件跳过留痕）。调用方按 package_id 过滤 + 版本戳/过期校验。"""

@@ -19,10 +19,13 @@ from osca_cli.package import (
     OscaPackage,
     YamlFile,
     referenced_ids,
+    resolve_in_root,
 )
 from osca_cli.triggers import (
     AWARE_BUDGET_KEYS,
+    PERFORMERS,
     POLICY_BUDGET_KEYS,
+    parse_performer,
     parse_quantity,
     validate_gate,
     validate_trigger,
@@ -244,13 +247,23 @@ def osca023_policy_steps(pkg: OscaPackage) -> list[Finding]:
 
 @rule
 def osca024_impl_paths(pkg: OscaPackage) -> list[Finding]:
-    """OSCA024 connector 接口声明的 impl 路径必须真实存在（SPEC §4 层3）。"""
+    """OSCA024 connector 接口声明的 impl 路径必须真实存在，且不得越出包根（SPEC §4 层3）。
+
+    包内受限路径判据与 Host 执行器共用（package.resolve_in_root）——绝对路径、`../`、符号链接
+    逃逸报 error（GPT Review：运行时必拒的越界声明不许 lint 全绿、pack 出必死交付件）。"""
     findings = []
     for f in pkg.typed_files("connectors"):
         itfs = f.mapping.get("interfaces")
         for itf in itfs if isinstance(itfs, list) else []:
             impl = itf.get("impl") if isinstance(itf, dict) else None
-            if isinstance(impl, str) and not pkg.exists(impl):
+            if not isinstance(impl, str):
+                continue
+            resolved = resolve_in_root(pkg.root, impl)
+            if resolved is None:
+                findings.append(
+                    _err("OSCA024", f.relpath, f"impl 路径越界：{impl}——包内声明只可指包内文件（运行时同判据必拒）")
+                )
+            elif not resolved.is_file():
                 findings.append(_warn("OSCA024", f.relpath, f"impl 指向的文件不存在：{impl}"))
     return findings
 
@@ -786,6 +799,17 @@ def osca040_required_fields(pkg: OscaPackage) -> list[Finding]:
                         "OSCA040",
                         "structure.yaml",
                         f"pipeline 第 {i + 1} 项必须有非空字符串 step（policy 权限表以它为键）",
+                    )
+                )
+            elif parse_performer(step.get("performer", "")) is None:
+                # performer 受限语法与 Host runner 共用（parse_performer）——运行时不可识别即步骤失败，
+                # lint 不拦则「拼错 performer 的包全绿、跑必败」（GPT Review：runner 子串匹配已废，改共用解析）
+                findings.append(
+                    _err(
+                        "OSCA040",
+                        "structure.yaml",
+                        f"pipeline 第 {i + 1} 项 performer「{step.get('performer')}」不合受限语法"
+                        f"（须以 {'/'.join(PERFORMERS)} 开头，可带 `+ 修饰`/括注）",
                     )
                 )
 

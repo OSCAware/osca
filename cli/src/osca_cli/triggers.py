@@ -27,6 +27,22 @@ QUANTITY = re.compile(r"(\d+)\s*([kK]?)")
 # 接受运行时不执行的键 = 「声明了没人执行的硬顶」fail-open
 AWARE_BUDGET_KEYS = ("max_steps", "max_minutes", "max_tokens")  # 剧集执行器裁决
 POLICY_BUDGET_KEYS = ("max_tool_calls", "max_tokens")  # Policy 拦截器裁决
+
+# pipeline 步骤 performer 受限集（架构 §5；分发优先序无关——解析锚定开头关键词，非子串匹配）
+PERFORMERS = ("human", "connector", "optimizer", "agent", "runtime")
+PERFORMER_KIND = re.compile(r"(human|connector|optimizer|agent|runtime)(?=$|[\s+(（])")
+
+
+def parse_performer(value: object) -> str | None:
+    """performer 受限语法（单一真理源：lint OSCA040 与 Host runner 分发共用）。
+
+    须以受限集关键词**开头**，其后只允许空白/`+ 修饰`/括注——`agent + judgments`、
+    `human（专家终审）` 合法；`not-a-connector`、拼写变体一律 None（GPT Review：子串匹配会把
+    `not-a-connector` 当 connector、多关键词时结果依赖枚举顺序）。"""
+    m = PERFORMER_KIND.match(str(value).strip())
+    return m.group(1) if m else None
+
+
 TIME_HHMM = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
 WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 

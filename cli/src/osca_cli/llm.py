@@ -23,6 +23,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from osca_cli.package import resolve_in_root
+
 ENV_URL = "OSCA_LLM_URL"
 ENV_MODEL = "OSCA_LLM_MODEL"
 ENV_KEY = "OSCA_LLM_API_KEY"
@@ -41,7 +43,9 @@ class LLMReply:
     model: str
 
 
-def _estimate_tokens(*texts: str) -> int:
+def estimate_tokens(*texts: str) -> int:
+    """字符估算 tokens（恒正）。网关缺报/误报时的记账回落——预算硬顶的强制点绝不收非法上报；
+    Host runner 对可插拔 LLM 的非法上报同口径复用（单一真理源）。"""
     return max(1, sum(len(t) for t in texts) // 4)
 
 
@@ -53,7 +57,9 @@ class OpenAICompatLLM:
         self.model = model
         self.api_key = api_key
 
-    def complete(self, system: str, user: str, *, tag: str) -> LLMReply:
+    def complete(self, system: str, user: str, *, tag: str, timeout: float | None = None) -> LLMReply:
+        """timeout：调用方剩余时间预算（秒）——剧集 max_minutes 只剩数秒时不许再吊 120s 外呼
+        （GPT Review：时间预算须传导为单次调用硬顶）。缺省/超默认 → 用 TIMEOUT_SECONDS。"""
         body = json.dumps(
             {
                 "model": self.model,
@@ -66,8 +72,9 @@ class OpenAICompatLLM:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(f"{self.base_url}/chat/completions", data=body, headers=headers)
+        effective = TIMEOUT_SECONDS if timeout is None else min(TIMEOUT_SECONDS, max(0.001, timeout))
         try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as resp:  # noqa: S310 —— 网关地址来自部署环境
+            with urllib.request.urlopen(request, timeout=effective) as resp:  # noqa: S310 —— 网关地址来自部署环境
                 payload = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
             raise LLMError(f"LLM 网关调用失败（{tag}）：{e}") from e
@@ -80,7 +87,7 @@ class OpenAICompatLLM:
         usage = payload.get("usage")
         tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
-            tokens = _estimate_tokens(system, user, text)
+            tokens = estimate_tokens(system, user, text)
         return LLMReply(text=text, tokens=tokens, model=str(payload.get("model", self.model)))
 
 
@@ -92,18 +99,18 @@ class MockLLM:
         self.model = "mock"
         self.calls: list[str] = []  # 调用过的 tag，测试断言用
 
-    def complete(self, system: str, user: str, *, tag: str) -> LLMReply:
+    def complete(self, system: str, user: str, *, tag: str, timeout: float | None = None) -> LLMReply:
         self.calls.append(tag)
-        # tag 含包内声明的步骤名等成分（不可信输入）：`../` 会把固件读引出固件目录——resolve 后
-        # 强制留在目录内（合法 tag 本就带子目录分层，约束按目录包含而非禁分隔符）
-        base = self.fixture_dir.resolve()
-        fixture = (base / f"{tag}.md").resolve()
-        if not fixture.is_relative_to(base):
+        # tag 含包内声明的步骤名等成分（不可信输入）：`../` 会把固件读引出固件目录——包内受限路径
+        # 判据（package.resolve_in_root，与 lint/Host 同源）强制留在目录内（合法 tag 本就带子目录分层）。
+        # timeout 在 mock 里无实义（本地读文件），收下参数保持 complete 契约一致。
+        fixture = resolve_in_root(self.fixture_dir, f"{tag}.md")
+        if fixture is None:
             raise LLMError(f"mock LLM 固件路径越界：{tag}——tag 不得把固件读引出固件目录")
         if not fixture.is_file():
-            raise LLMError(f"mock LLM 固件缺失：{fixture}")
+            raise LLMError(f"mock LLM 固件缺失：{self.fixture_dir / f'{tag}.md'}")
         text = fixture.read_text(encoding="utf-8")
-        return LLMReply(text=text, tokens=_estimate_tokens(system, user, text), model="mock")
+        return LLMReply(text=text, tokens=estimate_tokens(system, user, text), model="mock")
 
 
 def resolve_llm(env: Mapping[str, str] | None = None) -> OpenAICompatLLM | MockLLM:

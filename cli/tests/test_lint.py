@@ -716,3 +716,49 @@ def test_osca061_non_mapping_is_error(make_pkg, base):
     result = lint_package(make_pkg(base))
     assert not result.ok
     assert any("layering 必须是 mapping" in f.message for f in result.findings if f.rule == "OSCA061")
+
+
+def test_osca024_impl_path_escape_is_error(make_pkg, base, tmp_path):
+    """GPT Review 复审 P2：越界 impl（../ 与绝对路径指向**现存**文件）lint 必须报 error——
+    运行时同判据必拒，不许 lint 全绿、pack 出必死交付件。"""
+    outside = tmp_path / "outside.sql"
+    outside.write_text("SELECT 1", encoding="utf-8")
+
+    base["connectors/CON-001-数据源.yaml"]["interfaces"][0]["impl"] = "../outside.sql"
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA024" and "越界" in f.message for f in result.findings)
+    assert not result.ok  # error 级，非 warning
+
+    base["connectors/CON-001-数据源.yaml"]["interfaces"][0]["impl"] = str(outside)
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA024" and "越界" in f.message for f in result.findings)
+    assert not result.ok
+
+
+def test_osca003_binary_masquerading_as_yaml_no_traceback(make_pkg, base):
+    """GPT Review 复审 P2：二进制文件（PNG 头）伪装 .yaml 不许 traceback 穿透 lint——
+    读取/解码失败转 parse_error，OSCA003 稳定报告并拒绝。"""
+    root = make_pkg(base)
+    (root / "objects" / "OBJ-999.yaml").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\xff\xfe")
+    result = lint_package(root)  # 此前直接 UnicodeDecodeError traceback
+    assert not result.ok
+    assert any(f.rule == "OSCA003" and "OBJ-999" in f.path for f in result.findings)
+
+
+def test_osca040_performer_restricted_syntax(make_pkg, base):
+    """GPT Review 复审 P2：performer 受限语法（parse_performer，与 Host runner 同源）——
+    拼写变体/子串包含报 error；合法修饰形（agent + judgments / human（…））放行。"""
+    base["structure.yaml"]["pipeline"] = [
+        {"step": "取数", "performer": "not-a-connector", "uses": "CON-001"},
+    ]
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA040" and "performer" in f.message for f in result.findings)
+    assert not result.ok
+
+    base["structure.yaml"]["pipeline"] = [
+        {"step": "取数", "performer": "connector", "uses": "CON-001"},
+        {"step": "裁决", "performer": "agent + judgments"},
+        {"step": "终审", "performer": "human（专家终审）"},
+    ]
+    result = lint_package(make_pkg(base))
+    assert not any(f.rule == "OSCA040" and "performer" in f.message for f in result.findings)

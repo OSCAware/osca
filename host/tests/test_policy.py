@@ -740,15 +740,25 @@ def test_replay_health_stamp_dirty_stamp_race_rejected(tmp_path, monkeypatch):
     assert policy_mod.replay_health(tmp_path)["replay_green"] == 1  # 稳定一致才采信
 
 
-def test_charge_tokens_illegal_report_counts_zero_not_negative():
-    """GPT Review P1 预算绕过第二道闸：负数/bool/非整数用量上报不得冲减已用额度——按 0 计 + 审计留痕
-    （记账源头在 osca_cli.llm 已清洗，强制点自持，不信任可插拔 LLM 自律）。"""
+def test_charge_tokens_illegal_report_fails_closed_not_zero():
+    """GPT Review 复审 P1 预算绕过：负数/零/bool/非整数用量上报在强制点**直接拒绝**——按 0 计账仍是
+    绕过（max_tokens=1 时可零成本无限过顶）；强制点看不见 prompt/产出、无法估算，唯 fail-closed。
+    合法路径恒为正整数（osca_cli.llm 源头清洗 + runner 估算兜底）。"""
     p = make({**POLICY, "budgets": {"per_episode": {"max_tokens": 100}}})
     assert p.charge_tokens("EP-1", 80)[0]
-    assert p.charge_tokens("EP-1", -1000)[0]  # 负上报按 0 计——不冲减
-    assert p.episode_budget_used("EP-1") == (0, 80)
-    assert p.charge_tokens("EP-1", True)[0]  # bool 不算数
-    assert p.episode_budget_used("EP-1") == (0, 80)
+    for bad in (-1000, 0, True, 3.5, "42"):
+        ok, reason = p.charge_tokens("EP-1", bad)
+        assert not ok and "用量上报非法" in reason, bad  # fail-closed 拒绝，剧集就地停
+    assert p.episode_budget_used("EP-1") == (0, 80)  # 已用量既未冲减也未白嫖
     ok, reason = p.charge_tokens("EP-1", 30)  # 真用量照记，超顶即拒（止损顶语义不变）
     assert not ok and "预算硬顶" in reason
-    assert any("用量上报非法" in a["reason"] for a in p.audit if a["decision"] == "warn")
+
+
+def test_charge_tokens_repeated_illegal_reports_never_pass_cap():
+    """GPT 最小复现反转：max_tokens=1 时连续 5 次 authorize_llm → charge(-1)，charge 必须 5 次全拒——
+    不存在「全部允许、累计恒 0」的零成本循环。"""
+    p = make({**POLICY, "budgets": {"per_episode": {"max_tokens": 1}}})
+    for _ in range(5):
+        assert p.authorize_llm("EP-1")[0]  # 额度未被合法消耗，授权仍过——止损靠 charge 侧拒绝
+        ok, reason = p.charge_tokens("EP-1", -1)
+        assert not ok and "用量上报非法" in reason  # 每次非法上报当场拒绝（剧集停），循环在第一次即断

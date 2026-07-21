@@ -926,3 +926,155 @@ async def test_d2b_survives_host_restart(sock_path, sample_pack, deploy_w5):
     finally:
         host_b._stop.set()
         await asyncio.wait_for(task_b, timeout=5)
+
+
+# ── GPT Review 复审：跨代发布 / persist-决定竞态 / fire 出全局锁（可控屏障时序测试）──────────
+
+
+def _slow_refresh(monkeypatch):
+    """把 _refresh_ledger 换成可控屏障版：entered 置位 = 已进慢刷新线程；release 放行后走原逻辑。"""
+    import threading as _threading
+
+    entered, release = _threading.Event(), _threading.Event()
+    original = Host._refresh_ledger
+
+    def slow(self, loaded, policy):
+        entered.set()
+        release.wait(timeout=10)
+        return original(self, loaded, policy)
+
+    monkeypatch.setattr(Host, "_refresh_ledger", slow)
+    return entered, release
+
+
+def _slow_stamp(monkeypatch):
+    """把 _pack_stamp 换成可控屏障版（persist / reattach 的线程重活都会经过它）。"""
+    import threading as _threading
+
+    entered, release = _threading.Event(), _threading.Event()
+    original = Host._pack_stamp
+
+    def slow(loaded):
+        entered.set()
+        release.wait(timeout=10)
+        return original(loaded)
+
+    monkeypatch.setattr(Host, "_pack_stamp", staticmethod(slow))
+    return entered, release
+
+
+async def test_stale_delivery_not_published_after_unload_reload(running_host, sample_pack, deploy, monkeypatch):
+    """跨代投递（复审 P1）：旧投递慢刷新期间 unload + 同 id reload → 线程返回后代际 CAS 失配，
+    旧触发不得唤醒新包（不发布、无剧集）。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    deliver = next(sub.deliver for w in host.table.watchers.values() for sub in w.subs if sub.trigger_id == "AW-001/T3")
+    entered, release = _slow_refresh(monkeypatch)
+
+    task = asyncio.create_task(deliver("AW-001/T3"))  # 旧 generation 投递
+    assert await asyncio.to_thread(entered.wait, 10)  # 已进慢刷新线程
+    await _send({"cmd": "unload", "package_id": pid}, host)
+    monkeypatch.undo()  # 新代不再慢（在途线程仍持旧慢函数引用）
+    await _load_pack(host, sample_pack, deploy)  # 同 package_id 新一代
+    release.set()
+    await asyncio.wait_for(task, timeout=10)
+
+    response = await _send({"cmd": "status"}, host)
+    (gate,) = response["packages"][0]["gates"]
+    assert gate["wakes"] == 0  # 新代闸门未被旧触发唤醒
+    assert (await _send({"cmd": "episodes"}, host))["episodes"] == []  # 未装配任何剧集
+
+
+async def test_persist_race_with_approve_leaves_no_stale_snapshot(running_host, sample_pack, deploy_w5, monkeypatch):
+    """persist-决定竞态（复审 P1）：快照线程落盘前决定已到、恢复真写——删除世代令牌令迟到落盘弃写，
+    磁盘最终态**无快照**（此刻崩溃也不会重挂重批重复写）。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+    entered, release = _slow_stamp(monkeypatch)
+
+    exec_task = asyncio.create_task(host._execute_episode(episode, loaded, proxy, policy))
+    assert await asyncio.to_thread(entered.wait, 10)  # 挂起已登记，persist 线程正算指纹（文件未落）
+    [ch] = policy.pending_challenges()
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+    host._sweep_suspensions()  # 触发恢复：delete（此刻文件不存在）→ 世代 +1 → 真写
+    release.set()
+    await asyncio.wait_for(exec_task, timeout=10)  # persist 完成：令牌失配 → 弃写
+    await _await_status(episode, "completed")
+    assert episode.status == "completed"
+    assert next(s for s in episode.steps if s["step"] == "下发")["status"] == "done"  # 写已兑现
+    # 关键断言：迟到快照未落盘——「兑现后崩溃 → 重挂旧 pending → 重批重复写」的窗不存在
+    assert [r for r in host._suspension_store.load_all() if r["operation_id"] == episode.operation_id] == []
+
+
+async def test_persist_during_unload_retains_snapshot(running_host, sample_pack, deploy_w5, monkeypatch):
+    """persist-unload 竞态（复审 P1）：落盘线程在途时 unload（挂起迁 stopped）——unload **不作废**快照，
+    迟到落盘照常保留（活过包重载语义不取决于时序），重载后可重挂。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+    entered, release = _slow_stamp(monkeypatch)
+
+    exec_task = asyncio.create_task(host._execute_episode(episode, loaded, proxy, policy))
+    assert await asyncio.to_thread(entered.wait, 10)  # persist 线程在途（文件未落）
+    await _send({"cmd": "unload", "package_id": pid}, host)  # 挂起迁 stopped；快照语义 = 留盘
+    assert episode.status == "stopped"
+    monkeypatch.undo()
+    release.set()
+    await asyncio.wait_for(exec_task, timeout=10)
+    # 迟到落盘保留（unload 不 delete）——重载后 _reattach 可重挂兑现
+    assert [r for r in host._suspension_store.load_all() if r["operation_id"] == episode.operation_id]
+    await _load_pack(host, sample_pack, deploy_w5)
+    _reapply_write_config(host, pid)
+    opid = episode.operation_id
+    reattached = next(
+        (e for e in host.episodes.values() if e.operation_id == opid and e.status == "suspended_pending_approval"),
+        None,
+    )
+    assert reattached is not None
+
+
+async def test_reattach_aborts_when_unloaded_during_disk_scan(running_host, sample_pack, deploy_w5, monkeypatch):
+    """异步重挂跨代（复审 P1）：重挂读盘/指纹期间包被 unload → 线程返回后代际 CAS 失配 →
+    整体放弃，不向台账/_suspensions/挑战库写入任何状态；快照留盘未消费。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+    await host._execute_episode(episode, loaded, proxy, policy)  # 挂起 + 落盘
+    opid = episode.operation_id
+    await _send({"cmd": "unload", "package_id": pid}, host)  # 快照留盘
+
+    entered, release = _slow_stamp(monkeypatch)
+    load_task = asyncio.create_task(_load_pack(host, sample_pack, deploy_w5))  # reload → 重挂读盘慢
+    assert await asyncio.to_thread(entered.wait, 10)  # 重挂线程在途
+    await _send({"cmd": "unload", "package_id": pid}, host)  # 读盘期间再 unload（注销新一代）
+    release.set()
+    await asyncio.wait_for(load_task, timeout=10)
+
+    # 未发布孤儿挂起剧集（首轮 unload 留下的 stopped 旧条目照旧，不算发布）
+    assert not any(e.operation_id == opid and e.status == "suspended_pending_approval" for e in host.episodes.values())
+    assert host._suspensions == {}
+    assert [r for r in host._suspension_store.load_all() if r["operation_id"] == opid]  # 快照未消费，留待下次重挂
+
+
+async def test_status_not_blocked_behind_slow_fire(running_host, sample_pack, deploy, monkeypatch):
+    """fire 出全局命令锁（复审 P2）：慢投递（刷新在线程屏障上挂着）进行中，status 立即返回——
+    控制通道不再整体排队在慢 fire 之后。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    entered, release = _slow_refresh(monkeypatch)
+
+    fire_task = asyncio.create_task(_send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host))
+    assert await asyncio.to_thread(entered.wait, 10)  # fire 已进慢投递
+    status = await asyncio.wait_for(_send({"cmd": "status"}, host), timeout=5)  # 不被 fire 压住
+    assert status["ok"]
+    assert not fire_task.done()  # fire 仍在等投递完成（响应语义保持）
+    release.set()
+    response = await asyncio.wait_for(fire_task, timeout=10)
+    assert response["ok"]
+    assert len((await _send({"cmd": "episodes"}, host))["episodes"]) == 1  # 投递最终照常发布

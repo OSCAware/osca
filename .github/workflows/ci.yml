@@ -36,7 +36,9 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: 样例包绿灯
         working-directory: cli
-        run: uv run osca lint ../examples/oper-diagnosis.osca
+        run: |
+          uv run osca lint ../examples/oper-diagnosis.osca
+          uv run osca lint ../examples/oper-dispatch.osca
 
   test:
     name: pytest + ruff
