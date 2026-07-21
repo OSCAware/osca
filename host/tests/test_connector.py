@@ -448,3 +448,11 @@ def test_mock_fixture_path_escape_rejected(proxy, mock_dir):
     (mock_dir.parent / "leak.yaml").write_text("外部: true", encoding="utf-8")
     payload, err = proxy._execute_mock(f"mock://{mock_dir}", "CON-001.../leak", {})
     assert payload is None and "越界" in err
+
+
+def test_mock_fixture_symlink_loop_no_traceback(proxy, mock_dir):
+    """GPT 三审 P2：mock 固件符号链接环——resolve_in_root 收敛为回执错误，不炸穿 call()。"""
+    loop = mock_dir / "环.yaml"
+    loop.symlink_to(loop.name)
+    payload, err = proxy._execute_mock(f"mock://{mock_dir}", "CON-001.环", {})
+    assert payload is None and err

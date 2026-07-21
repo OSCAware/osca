@@ -336,3 +336,15 @@ def test_sql_readonly_impl_symlink_escape_rejected(tmp_path):
 
     rows, err = _run_sql(db, "sql/linked.sql", {}, pack_root=pack)
     assert rows is None and "越界" in err
+
+
+def test_sql_readonly_impl_symlink_loop_no_traceback(tmp_path):
+    """GPT 三审 P2：impl 指向符号链接环——resolve_in_root（与 lint 同一判据）收敛为回执错误，
+    RuntimeError 不许炸穿执行器。"""
+    db = _make_fee_db(tmp_path)
+    pack = tmp_path / "pack"
+    (pack / "sql").mkdir(parents=True)
+    loop = pack / "sql" / "loop.sql"
+    loop.symlink_to(loop.name)  # 自指链接环
+    rows, err = _run_sql(db, "sql/loop.sql", {}, pack_root=pack)
+    assert rows is None and err  # 越界或缺失（按解释器版本收敛），恒不 traceback

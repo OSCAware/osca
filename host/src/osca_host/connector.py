@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 import yaml
+from osca_cli.package import resolve_in_root
 
 from osca_host.executor import Executor, default_executors
 from osca_host.loader import LoadedPackage
@@ -200,11 +201,11 @@ class ConnectorProxy:
     # ── 执行器 ────────────────────────────────────────────────────────
 
     def _execute_mock(self, endpoint: str, interface_ref: str, itf: dict) -> tuple[object, str | None]:
-        # 接口名来自包内 manifest（不可信输入）：带 `../`/绝对段会把固件读引出固件目录（宿主机任意
-        # YAML 被当取数结果注入剧集）。resolve 后强制留在固件目录内（GPT Review 路径越界同口径）。
-        base = Path(endpoint.removeprefix("mock://")).resolve()
-        fixture = (base / f"{interface_ref.split('.', 1)[1]}.yaml").resolve()
-        if not fixture.is_relative_to(base):
+        # 接口名来自包内 manifest（不可信输入）：带 `../`/绝对段/链接环会把固件读引出固件目录或炸穿。
+        # 判据与 lint/执行器**同一 helper**（resolve_in_root，GPT 三审 P2：真共用，不手写第二份）。
+        base = Path(endpoint.removeprefix("mock://"))
+        fixture = resolve_in_root(base, f"{interface_ref.split('.', 1)[1]}.yaml")
+        if fixture is None:
             return None, f"mock 固件路径越界：{interface_ref}——接口名不得把固件读引出固件目录，拒绝"
         if not fixture.is_file():
             return None, f"mock 固件缺失：{fixture}"

@@ -37,8 +37,12 @@ class Subscription:
     aware_id: str
     trigger_id: str  # 全局 ID，如 AW-001/T1
     # 发射回调：deliver(trigger_id) → 闸门裁决。可回协程（Host 的投递把账本刷新/precondition
-    # 取数下线程，事件循环不承载阻塞 IO）；同步回调（测试裸用）也接受。
-    deliver: Callable[[str], Awaitable[None] | None]
+    # 取数下线程，事件循环不承载阻塞 IO）；同步回调（测试裸用）也接受。协程可回「未发布原因」
+    # 字符串（生命周期失效等）——人工 fire 据此如实报失败；watcher 自动发射只记日志。
+    deliver: Callable[[str], Awaitable[str | None] | None]
+    # watch 轮询回调（Host 注入，捕获**本代** Connector 代理——跨代不外呼，GPT Review 三审 P1）。
+    # None 时轮询回落表级 poller（测试裸用）；仍无则只计 tick。
+    poll: Callable[[str], object] | None = None
 
 
 @dataclass
@@ -113,7 +117,8 @@ class TriggerTable:
 
     async def fire_manual(self, package_id: str, trigger_id: str) -> str | None:
         """人工发射（操作者通道）。仅 event 触发原语可人工发射；返回错误消息或 None。
-        投递等到裁决/装配完成才返回——fire 命令的响应语义保持确定（发射即可查台账）。"""
+        投递等到裁决/装配完成才返回——fire 命令的响应语义保持确定（发射即可查台账）。
+        投递回「未发布原因」（关停/跨代失效）时如实转错误——失效的人工 fire 不许假报成功（GPT 三审 P1）。"""
         for watcher in self.watchers.values():
             for sub in watcher.subs:
                 if sub.package_id == package_id and sub.trigger_id == trigger_id:
@@ -123,10 +128,12 @@ class TriggerTable:
                     try:
                         result = sub.deliver(sub.trigger_id)
                         if inspect.isawaitable(result):
-                            await result
+                            result = await result
                     except Exception as e:
                         log.exception(f"人工发射派发异常：{trigger_id}")
                         return f"发射派发异常：{e}（watcher 存活，详见 Host 日志）"
+                    if isinstance(result, str) and result:
+                        return f"发射未发布：{result}"
                     return None
         return f"触发原语未布防：{package_id} 的 {trigger_id}"
 
@@ -172,12 +179,17 @@ class TriggerTable:
         while True:
             await asyncio.sleep(every.total_seconds())
             watcher.ticks += 1
-            if self.poller is None:
+            # 每 tick 从订阅取**本代** poll（Host 注入，捕获本代 proxy——跨代不外呼，GPT 三审 P1）；
+            # 无 sub.poll 回落表级 poller（测试裸用）；仍无则只计 tick
+            poll = next((s.poll for s in list(watcher.subs) if s.poll is not None), None)
+            if poll is None and self.poller is not None:
+                poll = lambda u, scope=watcher.scope: self.poller(scope, u)  # noqa: E731
+            if poll is None:
                 log.info(f"轮询 tick {watcher.key}（{uses}）：poller 未注入，只计 tick（第 {watcher.ticks} 次）")
                 continue
-            # 取数下线程（GPT Review P1）：poller 经 Connector 代理可能做真实网络取数（urllib timeout 10s）——
+            # 取数下线程（GPT Review P1）：poll 经 Connector 代理可能做真实网络取数（urllib timeout 10s）——
             # 在事件循环上同步调它会压住控制通道（status/stop/审批）整整一次外呼的时长
-            new_state = await asyncio.to_thread(self.poller, watcher.scope, uses)
+            new_state = await asyncio.to_thread(poll, uses)
             if new_state is None:
                 log.warning(f"轮询 {watcher.key}（{uses}）取数失败，本轮不发射（第 {watcher.ticks} 次）")
                 continue

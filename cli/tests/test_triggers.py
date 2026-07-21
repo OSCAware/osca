@@ -130,3 +130,28 @@ def test_gate_contradictions():
     assert any("combine=both" in e for e in validate_gate({"combine": "both"}, 2))
     assert any("debounce" in e for e in validate_gate({"debounce": "三天"}, 2))
     assert any("未知字段" in e for e in validate_gate({"cooldown": "1h"}, 2))
+
+
+def test_parse_performer_full_grammar():
+    """GPT 三审 P2：performer 是**全串** fullmatch 受限语法——裸关键词 / `+ 修饰词` / 闭合括注；
+    垃圾后缀、未闭合括注、非词修饰一律拒（此前只查前缀，`agent !!!` 也全绿）。"""
+    from osca_cli.triggers import parse_performer
+
+    assert parse_performer("agent") == "agent"
+    assert parse_performer("agent + judgments") == "agent"
+    assert parse_performer("human（专家终审）") == "human"
+    assert parse_performer("human(王工)") == "human"
+    assert parse_performer("  runtime  ") == "runtime"
+    for bad in (
+        "agent !!!",
+        "agent + ???",
+        "human（未闭合",
+        "connector (garbage",
+        "not-a-connector",
+        "agentx",
+        "agent + judg ments 多余",
+        "agent + judgments 尾巴",
+        "",
+        None,
+    ):
+        assert parse_performer(bad) is None, bad

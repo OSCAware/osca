@@ -111,7 +111,7 @@ def test_kill_switch_mid_episode_blocks_next_llm_call(episode, loaded, proxy, po
     class TripAfterFirst:
         model = "mock"
 
-        def complete(self, system, user, tag=None):
+        def complete(self, system, user, tag=None, timeout=None):
             reply = llm.complete(system, user, tag=tag)
             policy.publish_kill_switch("tripped", "kill switch 触发：测试注入")
             return reply
@@ -400,7 +400,7 @@ def test_agent_step_estimates_on_illegal_token_report(episode, loaded, proxy, po
     from osca_cli.llm import LLMReply
 
     class NegLLM:
-        def complete(self, system, user, *, tag):
+        def complete(self, system, user, *, tag, timeout=None):
             return LLMReply(text="草稿" * 50, tokens=-100, model="fake")
 
     run_episode(episode, loaded, proxy, policy, llm=NegLLM())
@@ -413,7 +413,7 @@ def test_agent_step_zero_report_still_depletes_budget(episode, loaded, proxy, po
     from osca_cli.llm import LLMReply
 
     class ZeroLLM:
-        def complete(self, system, user, *, tag):
+        def complete(self, system, user, *, tag, timeout=None):
             return LLMReply(text="产出" * 200, tokens=0, model="fake")
 
     episode.budget = dict(episode.budget, max_tokens=1)  # aware 硬顶收到 1 token
@@ -457,3 +457,46 @@ def test_performer_substring_no_longer_matches(episode, loaded, proxy, policy):
     episode.context["structure"]["pipeline"] = [{"step": "怪步", "performer": "not-a-connector"}]
     run_episode(episode, loaded, proxy, policy)
     assert episode.status == "failed" and "不可识别" in episode.stop_reason
+
+
+def test_max_minutes_with_non_timeout_llm_fails_closed(episode, loaded, proxy, policy):
+    """GPT 三审 P2：max_minutes 声明为硬顶时，timeout 是强制契约——不支持的可插拔 LLM
+    fail-closed 拒绝发起（否则「只剩数秒仍无限外呼」把运行时硬预算做成 fail-open）。"""
+    from osca_cli.llm import LLMReply
+
+    class NoTimeoutLLM:
+        def complete(self, system, user, *, tag):  # 无 timeout、无 **kwargs
+            return LLMReply(text="草稿", tokens=5, model="fake")
+
+    episode.budget = dict(episode.budget, max_minutes=1)
+    run_episode(episode, loaded, proxy, policy, llm=NoTimeoutLLM())
+    assert episode.status == "failed" and "timeout" in episode.stop_reason
+
+
+def test_var_keyword_llm_receives_timeout(episode, loaded, proxy, policy):
+    """GPT 三审 P2：**kwargs 兜收的适配器同样满足契约、且真实收到 timeout。"""
+    from osca_cli.llm import LLMReply
+
+    seen = {}
+
+    class KwLLM:
+        def complete(self, system, user, **kwargs):
+            seen.update(kwargs)
+            return LLMReply(text="草稿", tokens=5, model="fake")
+
+    episode.budget = dict(episode.budget, max_minutes=1)
+    run_episode(episode, loaded, proxy, policy, llm=KwLLM())
+    assert "timeout" in seen and 0 < seen["timeout"] <= 60
+
+
+def test_no_max_minutes_no_timeout_requirement(episode, loaded, proxy, policy):
+    """未声明 max_minutes 时不要求 timeout 契约——无时间硬顶即无强制传导（不误伤旧适配器）。"""
+    from osca_cli.llm import LLMReply
+
+    class NoTimeoutLLM:
+        def complete(self, system, user, *, tag):
+            return LLMReply(text="草稿", tokens=5, model="fake")
+
+    episode.budget = {k: v for k, v in episode.budget.items() if k != "max_minutes"}
+    run_episode(episode, loaded, proxy, policy, llm=NoTimeoutLLM())
+    assert episode.status == "completed"

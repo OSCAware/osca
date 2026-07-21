@@ -65,7 +65,9 @@ class Host:
         control_group: str | None = None,
     ):
         self.registry = Registry()
-        self.table = TriggerTable(poller=self._poll)
+        # 触发表不注入表级 poller：watch 轮询走 Subscription 携带的本代 poll（_make_poll 捕获本代 proxy，
+        # 跨代不外呼——GPT Review 三审 P1）；表级 poller 仅测试裸用
+        self.table = TriggerTable()
         self.gates: dict[tuple[str, str], Gate] = {}  # (package_id, aware_id) → Gate
         self.policies: dict[str, PolicyInterceptor] = {}
         self.proxies: dict[str, ConnectorProxy] = {}
@@ -77,6 +79,7 @@ class Host:
         self._episode_seq = 0
         self._episode_tasks: set[asyncio.Task] = set()  # 在跑剧集（认知平面，独立线程）
         self._suspensions: dict[str, str] = {}  # challenge_id → episode_id：挂起等批的写剧集（可恢复剧集，D2a）
+        self._resuming: set[str] = set()  # episode_id：恢复在途（删盘在线程，防同剧集双恢复；GPT 三审 P2）
         # 挂起快照磁盘持久层（D2b·L2）：run() 里锚定运行目录后建；未建（如单元测试直连）时挂起仅 L1（进程内）
         self._suspension_store: SuspensionStore | None = None
         self.authorizer = Authorizer()
@@ -273,8 +276,12 @@ class Host:
             policy_file = loaded.pack.yaml_files.get("policy.yaml")
             policy = PolicyInterceptor(pid, policy_file.mapping if policy_file else {}, ledger_stats(loaded.pack))
             proxy = ConnectorProxy(loaded, pkg_bindings, policy)
+            # precondition 绑**本代** proxy（跨代不外呼，GPT 三审 P1）——旧 Gate 的求值恒走旧代理，
+            # unload 后旧 policy 已 revoke，授权层必拒
             gates = {
-                aware.aware_id: Gate(pid, aware, precondition_eval=lambda text, p=pid: self._eval_precondition(p, text))
+                aware.aware_id: Gate(
+                    pid, aware, precondition_eval=lambda text, pr=proxy: self._eval_precondition(pr, text)
+                )
                 for aware in loaded.awares
             }
         except Exception as e:
@@ -316,7 +323,11 @@ class Host:
                                 t.kind,
                                 t.spec,
                                 Subscription(
-                                    pid, aware.aware_id, t.trigger_id, self._make_deliver(pid, aware.aware_id)
+                                    pid,
+                                    aware.aware_id,
+                                    t.trigger_id,
+                                    self._make_deliver(pid, aware.aware_id),
+                                    poll=self._make_poll(pid, proxy),
                                 ),
                             )
                             armed += 1
@@ -368,13 +379,20 @@ class Host:
         if enabled and gate.enabled:
             return {"ok": True, "detail": f"{aware_id} 已是启用状态——幂等，不重复布防（防止双份订阅双份唤醒）"}
         if enabled:
-            # 全部订阅成功才置 enabled：任一条失败即补偿回滚——不留「显示启用、实际半布防」的 Aware
+            # 全部订阅成功才置 enabled：任一条失败即补偿回滚——不留「显示启用、实际半布防」的 Aware。
+            # poll 绑当前在册（本代）proxy——enable 恒发生在本代存续期内
             try:
                 for t in aware.triggers:
                     self.table.subscribe(
                         t.kind,
                         t.spec,
-                        Subscription(package_id, aware_id, t.trigger_id, self._make_deliver(package_id, aware_id)),
+                        Subscription(
+                            package_id,
+                            aware_id,
+                            t.trigger_id,
+                            self._make_deliver(package_id, aware_id),
+                            poll=self._make_poll(package_id, self.proxies.get(package_id)),
+                        ),
                     )
             except Exception as e:
                 self.table.unsubscribe(package_id, aware_id)  # 撤已布防的部分
@@ -399,50 +417,77 @@ class Host:
         return {"ok": True, "detail": f"已人工发射 {trigger_id}（裁决见 Host 日志与 status.gates）"}
 
     def _make_deliver(self, package_id: str, aware_id: str):
-        async def deliver(trigger_id: str) -> None:
+        async def deliver(trigger_id: str) -> str | None:
             # 投递的两段重活（GPT Review P1 事件循环阻塞）都下线程：账本刷新是磁盘重活（全量 lint +
-            # 索引重建），闸门裁决内含 precondition 真取数（经 Connector 代理走真实网络）——原先直接跑在
-            # 事件循环上，一次外呼/慢盘就压住控制通道（status/stop/审批）。同包投递按包锁串行：保住
-            # 账本非阻塞 flock 的旧序语义（并发刷新会互踩误拒唤醒），闸门状态机也因此无并发写。
+            # 索引重建），闸门裁决内含 precondition 真取数（经**本代** Connector 代理走真实网络）——原先
+            # 直接跑在事件循环上，一次外呼/慢盘就压住控制通道（status/stop/审批）。同包投递按包锁串行：
+            # 保住账本非阻塞 flock 的旧序语义（并发刷新会互踩误拒唤醒），闸门状态机也因此无并发写。
             #
-            # 跨代发布防护（GPT Review 复审 P1）：重活下线程后，unload/同 package_id reload 可在任一
-            # await 期间发生——旧 generation 投递若继续走旧 Gate 裁决、再从注册表取到**新包**装配，
-            # 就把陈旧触发发布进了新一代。故进锁后按对象身份取齐三件套，**每个 await 返回后 CAS 复核**
-            # （reload 必造新对象，身份失配即代际失配），失配即整体放弃、绝不发布。
+            # 生命周期 CAS（GPT Review 复审 P1 + 三审 P1）：重活下线程后，unload/同 id reload/**stop**
+            # 可在任一 await 期间发生——旧 generation 投递若继续裁决、再从注册表取到新包装配，或在
+            # DRAINING 后发布新剧集，都违反「迟到发布必见 tombstone」。故进锁后按对象身份取齐三件套，
+            # **进锁即查 + 每个 await 返回后复核**（HostState 一并纳入），失效即整体放弃、绝不发布。
+            # 返回值 = 未发布原因（None=正常投递完成）——人工 fire 据此如实报失败。
             async with self._deliver_locks.setdefault(package_id, asyncio.Lock()):
                 gate = self.gates.get((package_id, aware_id))
                 policy = self.policies.get(package_id)
                 loaded = self.registry.packages.get(package_id)
                 if gate is None:
-                    return
+                    return f"{package_id}/{aware_id} 未布防或已卸载——投递不发布"
 
-                def stale() -> bool:
-                    return (
+                def stale() -> str | None:
+                    if self.state is not HostState.RUNNING:
+                        return f"Host 已 {self.state.name}——迟到投递不发布（tombstone 生效）"
+                    if (
                         self.gates.get((package_id, aware_id)) is not gate
                         or self.policies.get(package_id) is not policy
                         or self.registry.packages.get(package_id) is not loaded
-                    )
+                    ):
+                        return "包已卸载/重载——跨代投递不发布"
+                    return None
 
+                if why := stale():  # 进锁即查：fire 短锁状态检查与投递之间的 stop/unload TOCTOU
+                    log.info(f"[{package_id}/{aware_id}] {trigger_id} 投递放弃：{why}")
+                    return why
                 if policy and loaded and not await asyncio.to_thread(self._refresh_ledger, loaded, policy):
                     log.warning(
                         f"[{package_id}/{aware_id}] {trigger_id} 命中 → 账本刷新失败，本次唤醒拒绝（保留旧快照）"
                     )
-                    return
-                if stale():
-                    log.info(f"[{package_id}/{aware_id}] {trigger_id} 投递放弃：刷新期间包已卸载/重载（跨代不发布）")
-                    return
+                    return None
+                if why := stale():
+                    log.info(f"[{package_id}/{aware_id}] {trigger_id} 投递放弃：{why}")
+                    return why
                 if policy and policy.kill_tripped:
                     log.warning(f"[{package_id}/{aware_id}] {trigger_id} 命中 → 拒绝唤醒：{policy.kill_reason}")
-                    return
+                    return None
                 woke, verdict = await asyncio.to_thread(gate.on_trigger, trigger_id)
-                if stale():
-                    log.info(f"[{package_id}/{aware_id}] {trigger_id} 投递放弃：裁决期间包已卸载/重载（跨代不发布）")
-                    return
+                if why := stale():
+                    log.info(f"[{package_id}/{aware_id}] {trigger_id} 投递放弃：{why}")
+                    return why
                 log.info(f"[{package_id}/{aware_id}] {trigger_id} 命中 → {verdict}")
                 if woke:
                     self._assemble_episode(package_id, aware_id, trigger_id)
+                return None
 
         return deliver
+
+    def _make_poll(self, package_id: str, proxy):
+        """watch 轮询回调——**捕获本代 proxy**（GPT Review 三审 P1）：旧 watcher 的在途轮询绝不动态取
+        `self.proxies[package_id]`（unload+reload 后那是**新代**代理，会对新 binding 产生陈旧外呼）。
+        unload 时本代 policy 已 revoke，本代 proxy.call 在授权层被拒——外呼前的复核由授权强制点承担
+        （身份快查只是省一次必拒调用），fail-closed 无竞态窗。"""
+
+        def poll(uses: str):
+            if proxy is None or self.proxies.get(package_id) is not proxy:
+                return None  # 本代已下线：快路径不再发起（即便发起，本代 revoked policy 也必拒）
+            receipt = proxy.call(uses, step=None)
+            if not receipt.ok:
+                log.warning(f"[{package_id}] 轮询取数失败：{receipt.error}")
+                return None
+            payload = receipt.payload
+            return payload if isinstance(payload, dict) else {"value": payload}
+
+        return poll
 
     def _refresh_ledger(self, loaded, policy: PolicyInterceptor) -> bool:
         """唤醒前把账本刷成磁盘现状（持账本写锁，与 oscapipe 写入者互斥）。
@@ -475,25 +520,16 @@ class Host:
         policy.publish_kill_switch(kill_state, kill_reason)
         return True
 
-    # ── 运行时内部取数（precondition / watch 轮询，经 Connector 代理 + Policy） ──
+    # ── 运行时内部取数（precondition，经**本代** Connector 代理 + Policy） ──
 
-    def _poll(self, package_id: str, uses: str):
-        proxy = self.proxies.get(package_id)
-        if proxy is None:
-            return None
-        receipt = proxy.call(uses, step=None)
-        if not receipt.ok:
-            log.warning(f"[{package_id}] 轮询取数失败：{receipt.error}")
-            return None
-        payload = receipt.payload
-        return payload if isinstance(payload, dict) else {"value": payload}
-
-    def _eval_precondition(self, package_id: str, text: str) -> tuple[bool | None, str]:
+    def _eval_precondition(self, proxy, text: str) -> tuple[bool | None, str]:
+        """precondition 求值——proxy 是 Gate 构建时**捕获的本代代理**（GPT Review 三审 P1）：
+        不动态取 self.proxies[package_id]（unload+reload 后那是新代，旧投递会对新 binding 陈旧外呼、
+        甚至在新 Policy 里长出无主审批挑战）。unload 即 revoke 本代 policy，旧代外呼在授权层必拒。"""
         parsed = parse_precondition(text)
         if parsed is None:
             return None, "不可求值（受限形式：CON-xxx.接口(参数) 返回非空），默认放行"
         connector_id, interface, params = parsed
-        proxy = self.proxies.get(package_id)
         if proxy is None:
             return None, "Connector 代理未就绪，默认放行"
         receipt = proxy.call(f"{connector_id}.{interface}", params, step=None)
@@ -590,23 +626,44 @@ class Host:
         return True  # 挑战仍 pending → 调用方做 L2 持久（活过包重载 / Host 重启）
 
     def _schedule_resume(self, episode_id: str, loaded, proxy, policy) -> None:
-        """删盘 → CAS suspended→running（事件循环单线程内，INV-3）→ 调度恢复线程。抢不到即放弃（幂等，防双恢复）。"""
+        """调度一次恢复（幂等）：真正的「删盘 → CAS → 起写线程」在异步状态机 _resume_after_delete 里——
+        删盘可能等一次 fsync（与在途 persist 争 operation 锁），**不许上事件循环**（GPT 三审 P2：同步
+        delete 会把审批/status/stop 一起压住 fsync 时长，存储故障时无上界）。_resuming 防同剧集双恢复。"""
         episode = self.episodes.get(episode_id)
         if episode is None or episode.status != "suspended_pending_approval":
             return  # 已淘汰/已恢复/已终态——放弃（幂等）
-        if self._suspension_store is not None:
-            # 删盘**早于**改状态与起写线程：① 崩溃于「写已落地、终态未记」也不会重挂重批重写（关双写窗，§2.4）；
-            # ② 删盘失败（磁盘/权限）则**保留挂起态、不提交 running**——否则会推进成永卡的假 running（GPT 外审 P1）：
-            # 留 _suspensions 映射，下次清扫/审批事件重试。删盘与改状态间无 await，事件循环上原子。
-            try:
-                self._suspension_store.delete(episode.operation_id)
-            except OSError as e:
-                log.warning(f"删除挂起快照失败，保留挂起态待清扫重试（不推进假 running）：{episode_id}（{e}）")
+        if episode_id in self._resuming:
+            return  # 已有恢复在途（删盘在线程中）——放弃（幂等，防双恢复）
+        self._resuming.add(episode_id)
+        task = asyncio.create_task(self._resume_after_delete(episode_id, loaded, proxy, policy))
+        self._episode_tasks.add(task)
+        task.add_done_callback(self._episode_tasks.discard)
+
+    async def _resume_after_delete(self, episode_id: str, loaded, proxy, policy) -> None:
+        """恢复状态机：删盘（线程）→ CAS suspended→running（事件循环）→ 起写线程。崩溃安全序不变
+        （delete-before-write）：① 崩溃于「写已落地、终态未记」不会重挂重批重写（快照早没了，§2.4）；
+        ② 删盘失败（磁盘/权限）保留挂起态、不提交 running（假 running 永卡，GPT 外审 P1），待清扫重试；
+        ③ 删盘线程期间 unload/关停把剧集迁 stopped → CAS 失败放弃执行（快照已删、写不执行——与旧序
+        「CAS 后 unload、恢复被 revoked 拒绝」同为 fail-closed 丢写，审计可见）。"""
+        try:
+            episode = self.episodes.get(episode_id)
+            if episode is None or episode.status != "suspended_pending_approval":
                 return
-        episode.status = "running"  # CAS：删盘成功后才提交内存状态
-        cid = episode.resume.get("challenge_id") if episode.resume else None
-        if cid is not None:
-            self._suspensions.pop(cid, None)
+            if self._suspension_store is not None:
+                try:
+                    await asyncio.to_thread(self._suspension_store.delete, episode.operation_id)
+                except OSError as e:
+                    log.warning(f"删除挂起快照失败，保留挂起态待清扫重试（不推进假 running）：{episode_id}（{e}）")
+                    return
+            if episode.status != "suspended_pending_approval":  # 删盘线程期间 unload/关停已迁 stopped
+                log.warning(f"剧集 {episode_id} 恢复放弃：删盘期间已离开挂起态（{episode.status}）")
+                return
+            episode.status = "running"  # CAS：删盘成功后才提交内存状态（与 pop/起线程间无 await，循环上原子）
+            cid = episode.resume.get("challenge_id") if episode.resume else None
+            if cid is not None:
+                self._suspensions.pop(cid, None)
+        finally:
+            self._resuming.discard(episode_id)
         task = asyncio.create_task(self._execute_episode(episode, loaded, proxy, policy))
         self._episode_tasks.add(task)
         task.add_done_callback(self._episode_tasks.discard)
@@ -648,6 +705,9 @@ class Host:
             await asyncio.to_thread(_stamp_and_persist)
         except OSError as e:  # 磁盘满/权限/fd 已关等——真正退回 L1（对抗审查 minor-1：不炸成未处理 task 异常）
             log.warning(f"挂起快照落盘失败（该剧集退回 L1、不活过重载/重启）：{e}")
+            # 异常可能发生在 persist 之前（指纹计算）——归还 begin_persist 的在途凭据；persist 已跑过则
+            # 它自己已归还，abandon 的双释放有钳制（防 store 注册表泄漏，GPT 三审 P2 有界性）
+            store.abandon_persist(episode.operation_id)
 
     @staticmethod
     def _pack_stamp(loaded) -> str:

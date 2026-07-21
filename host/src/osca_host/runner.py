@@ -39,6 +39,21 @@ def _yaml(data) -> str:
     return yaml.safe_dump(data, allow_unicode=True, sort_keys=False).strip()
 
 
+def _llm_supports_timeout(llm) -> tuple[bool, str]:
+    """LLM 通道是否提供 timeout 有界执行契约（显式 timeout 参数或 **kwargs 兜收）。
+
+    max_minutes 声明为硬顶时这是**强制契约**（GPT 三审 P2）：不支持的适配器 fail-closed 拒绝发起
+    ——「只剩数秒仍无限外呼」是把运行时硬预算做成 fail-open。签名不可内省（C 扩展/怪 callable）
+    同判不支持（fail-closed，不炸穿 runner）。"""
+    try:
+        params = inspect.signature(llm.complete).parameters
+    except (TypeError, ValueError):
+        return False, "complete 签名不可内省"
+    if "timeout" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True, ""
+    return False, "complete 未声明 timeout 参数（也无 **kwargs）"
+
+
 def render_system_prompt(episode: Episode) -> str:
     """一次性上下文 → 模型可读文本。policy.yaml 在装配时已刻意缺席（公理 A5）。"""
     ctx = episode.context
@@ -387,7 +402,8 @@ def run_episode(
                 )
             user_prompt = _step_user_prompt(spec, step_name, input_key, artifacts.get(input_key))
             # 时间预算传导为单次调用硬顶（GPT Review P2）：max_minutes 只剩数秒时不许再吊默认 120s
-            # 外呼继续烧外部成本。可插拔 llm 未声明 timeout 参数则不传（有界执行契约归其实现，诚实标注）。
+            # 外呼继续烧外部成本。timeout 是**强制契约**（三审收口）：max_minutes 在而通道不支持
+            # timeout（无参数、无 **kwargs、签名不可内省）→ fail-closed 拒绝发起，绝不 fail-open 无界外呼。
             deadline: float | None = None
             if max_minutes is not None:
                 remaining = max_minutes * 60 - (time.monotonic() - started)
@@ -397,7 +413,15 @@ def run_episode(
             try:
                 llm = llm or resolve_llm()
                 kwargs = {}
-                if deadline is not None and "timeout" in inspect.signature(llm.complete).parameters:
+                if deadline is not None:
+                    supported, why = _llm_supports_timeout(llm)
+                    if not supported:
+                        detail = (
+                            f"aware.budget max_minutes 是运行时硬顶，但注入的 LLM 通道无 timeout 有界执行契约"
+                            f"（{why}）——fail-closed 拒绝发起调用（宁可拒绝，不可无硬顶外呼）"
+                        )
+                        _record(episode, step_name, performer, "failed", detail)
+                        return _finish(episode, "failed", detail)
                     kwargs["timeout"] = deadline
                 reply = llm.complete(system_prompt, user_prompt, tag=f"episode/{step_name}", **kwargs)
             except LLMError as e:

@@ -64,3 +64,34 @@ def test_ignores_non_suspension_neighbours(store):
     (tmp / "host.sock.token").write_text("y")
     s.persist("EO-1", {"operation_id": "EO-1"})
     assert [r["operation_id"] for r in s.load_all()] == ["EO-1"]  # 只认 susp-*.json
+
+
+def test_op_registry_bounded_after_terminal_operations(store):
+    """GPT 三审 P2：per-operation 状态（锁/删除世代）以在途凭据引用计数——大量终态 operation 后
+    注册表清零，常驻进程无无界增长。"""
+    s, _ = store
+    for i in range(200):
+        opid = f"EO-{i:04x}"
+        token = s.begin_persist(opid)
+        assert s.persist(opid, {"operation_id": opid}, token=token) is True
+        s.delete(opid)
+    assert s._ops == {}  # 全部回收
+
+
+def test_delete_generation_survives_inflight_begin(store):
+    """删除世代 tombstone 须活过在途 persist：begin 后 delete，迟到 persist 令牌失配弃写——
+    即便中途无其他持票者，条目也不得被提前回收导致世代归零误放行。"""
+    s, tmp = store
+    token = s.begin_persist("EO-race")
+    s.delete("EO-race")  # begin 与 persist 之间作废
+    assert s.persist("EO-race", {"operation_id": "EO-race"}, token=token) is False  # 弃写
+    assert not (tmp / "susp-EO-race.json").exists()
+    assert s._ops == {}  # persist 归还凭据后回收
+
+
+def test_abandon_persist_releases_credit(store):
+    """begin 后未走到 persist（如指纹计算失败）→ abandon 归还凭据，注册表不泄漏。"""
+    s, _ = store
+    s.begin_persist("EO-abandon")
+    s.abandon_persist("EO-abandon")
+    assert s._ops == {}

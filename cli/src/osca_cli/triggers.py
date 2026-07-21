@@ -28,18 +28,20 @@ QUANTITY = re.compile(r"(\d+)\s*([kK]?)")
 AWARE_BUDGET_KEYS = ("max_steps", "max_minutes", "max_tokens")  # 剧集执行器裁决
 POLICY_BUDGET_KEYS = ("max_tool_calls", "max_tokens")  # Policy 拦截器裁决
 
-# pipeline 步骤 performer 受限集（架构 §5；分发优先序无关——解析锚定开头关键词，非子串匹配）
+# pipeline 步骤 performer 受限集（架构 §5；分发优先序无关——全串 fullmatch，非子串/前缀匹配）
 PERFORMERS = ("human", "connector", "optimizer", "agent", "runtime")
-PERFORMER_KIND = re.compile(r"(human|connector|optimizer|agent|runtime)(?=$|[\s+(（])")
+# 全语法（fullmatch，GPT 三审 P2：只查前缀会放行任意垃圾后缀）：裸关键词 ｜ 关键词 + 一个修饰词
+# （`agent + judgments`）｜ 关键词带**闭合**中/英文括注（`human（专家终审）`/`human(王工)`）。
+PERFORMER_KIND = re.compile(r"(human|connector|optimizer|agent|runtime)(?:\s*\+\s*\w+|\s*（[^（）]+）|\s*\([^()]+\))?")
 
 
 def parse_performer(value: object) -> str | None:
     """performer 受限语法（单一真理源：lint OSCA040 与 Host runner 分发共用）。
 
-    须以受限集关键词**开头**，其后只允许空白/`+ 修饰`/括注——`agent + judgments`、
-    `human（专家终审）` 合法；`not-a-connector`、拼写变体一律 None（GPT Review：子串匹配会把
-    `not-a-connector` 当 connector、多关键词时结果依赖枚举顺序）。"""
-    m = PERFORMER_KIND.match(str(value).strip())
+    整串须匹配：裸关键词 / `关键词 + 修饰词` / `关键词（括注）`——`agent + judgments`、
+    `human（专家终审）` 合法；`not-a-connector`、拼写变体、垃圾后缀（`agent !!!`）、未闭合括注
+    （`human（未闭合`）一律 None（GPT Review：子串匹配与前缀匹配都放行过非法形）。"""
+    m = PERFORMER_KIND.fullmatch(str(value).strip())
     return m.group(1) if m else None
 
 

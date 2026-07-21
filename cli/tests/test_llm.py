@@ -134,3 +134,14 @@ def test_openai_compat_deadline_bounds_urlopen_timeout(monkeypatch):
     assert seen["timeout"] == llm_mod.TIMEOUT_SECONDS  # 缺省默认
     client.complete("s", "u", tag="t", timeout=999.0)
     assert seen["timeout"] == llm_mod.TIMEOUT_SECONDS  # 超默认取默认（不放大）
+
+
+def test_mock_symlink_loop_raises_llm_error_not_runtime(tmp_path):
+    """GPT 三审 P2：固件目录内符号链接环——resolve_in_root 收敛为 LLMError（越界/缺失），
+    不许 RuntimeError 穿透成非 LLMError。"""
+    fixture_dir = tmp_path / "fx"
+    fixture_dir.mkdir()
+    loop = fixture_dir / "loop.md"
+    loop.symlink_to(loop.name)  # 自指链接环
+    with pytest.raises(LLMError):
+        MockLLM(fixture_dir).complete("s", "u", tag="loop")

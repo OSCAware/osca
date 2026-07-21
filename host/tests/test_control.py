@@ -876,6 +876,10 @@ async def test_d2b_delete_failure_keeps_suspended_not_fake_running(running_host,
 
     monkeypatch.setattr(host._suspension_store, "delete", _boom)
     host._schedule_resume(episode.episode_id, loaded, proxy, policy)  # 删盘失败 → 不推进
+    for _ in range(300):  # 恢复状态机异步（删盘在线程）——等它退场再断言
+        if episode.episode_id not in host._resuming:
+            break
+        await asyncio.sleep(0.01)
 
     assert episode.status == "suspended_pending_approval"  # 仍挂起（未变假 running）
     assert host._suspensions.get(cid) == episode.episode_id  # 映射保留，可重试
@@ -1078,3 +1082,114 @@ async def test_status_not_blocked_behind_slow_fire(running_host, sample_pack, de
     response = await asyncio.wait_for(fire_task, timeout=10)
     assert response["ok"]
     assert len((await _send({"cmd": "episodes"}, host))["episodes"]) == 1  # 投递最终照常发布
+
+
+# ── GPT Review 三审：fire/stop 生命周期 TOCTOU / 跨代外呼 / 恢复删盘不压事件循环 ──────────
+
+
+async def test_delivery_aborts_after_draining_and_manual_fire_fails(running_host, sample_pack, deploy, monkeypatch):
+    """三审 P1：慢投递期间 stop 到达（DRAINING）→ 投递返回后生命周期 CAS 失效 → 零发布；
+    人工 fire 如实报失败（不假报成功）——「任何迟到发布都会看到 tombstone」由此成立。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    calls = []
+    proxy = host.proxies[pid]
+    original_call = proxy.call
+    monkeypatch.setattr(proxy, "call", lambda *a, **k: (calls.append(a), original_call(*a, **k))[1])
+    entered, release = _slow_refresh(monkeypatch)
+
+    fire_task = asyncio.create_task(host._fire(pid, "AW-001/T3"))  # 直接调 Host（socket 会随关停拆掉）
+    assert await asyncio.to_thread(entered.wait, 10)  # 已进慢刷新线程
+    host._begin_draining()  # stop 到达：进入 DRAINING
+    release.set()
+    response = await asyncio.wait_for(fire_task, timeout=10)
+
+    assert not response["ok"] and "不发布" in response["detail"]  # 失效的人工 fire 报失败
+    assert host.episodes == {}  # DRAINING 后零剧集发布
+    assert calls == []  # 零 Connector 调用（precondition 从未被求值）
+
+
+async def test_stale_precondition_uses_own_generation_proxy(running_host, sample_pack, deploy, monkeypatch):
+    """三审 P1：旧投递在 precondition 外呼中挂起，期间 unload + 同 id reload——恢复后旧投递只走
+    **本代（旧）proxy**（unload 已 revoke，授权层必拒），绝不触碰新代 Connector/binding。"""
+    import threading as _threading
+
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    old_proxy = host.proxies[pid]
+    deliver = next(sub.deliver for w in host.table.watchers.values() for sub in w.subs if sub.trigger_id == "AW-001/T3")
+    entered, release = _threading.Event(), _threading.Event()
+    original_call = old_proxy.call
+
+    def slow_call(*a, **k):  # 旧代 precondition 外呼在此挂起
+        entered.set()
+        release.wait(timeout=10)
+        return original_call(*a, **k)
+
+    monkeypatch.setattr(old_proxy, "call", slow_call)
+    task = asyncio.create_task(deliver("AW-001/T3"))
+    assert await asyncio.to_thread(entered.wait, 10)  # 旧投递已在 precondition 外呼中
+    await _send({"cmd": "unload", "package_id": pid}, host)
+    await _load_pack(host, sample_pack, deploy)  # 同 id 新一代
+    new_calls = []
+    new_proxy = host.proxies[pid]
+    new_original = new_proxy.call
+    monkeypatch.setattr(new_proxy, "call", lambda *a, **k: (new_calls.append(a), new_original(*a, **k))[1])
+    release.set()
+    await asyncio.wait_for(task, timeout=10)
+
+    assert new_calls == []  # 旧投递未触碰新代 Connector（本代恒本代，跨代不外呼）
+    assert (await _send({"cmd": "episodes"}, host))["episodes"] == []  # 且未发布任何剧集
+
+
+async def test_stale_watch_poll_does_not_call_new_generation(running_host, sample_pack, deploy, monkeypatch):
+    """三审 P1（watch 侧）：旧代 watcher 的 poll 捕获本代 proxy——unload+reload 后调用旧 poll，
+    新代 Connector 零调用；旧代已下线，poll 返回 None（本轮不发射）。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    old_poll = next(s.poll for w in host.table.watchers.values() if w.kind == "watch" for s in w.subs)
+    assert old_poll is not None
+
+    await _send({"cmd": "unload", "package_id": pid}, host)
+    await _load_pack(host, sample_pack, deploy)  # 新一代
+    new_calls = []
+    new_proxy = host.proxies[pid]
+    new_original = new_proxy.call
+    monkeypatch.setattr(new_proxy, "call", lambda *a, **k: (new_calls.append(a), new_original(*a, **k))[1])
+
+    result = await asyncio.to_thread(old_poll, "CON-001.拉取费用明细")  # 模拟旧 watcher 在途 tick
+    assert result is None  # 旧代已下线：不发射
+    assert new_calls == []  # 新代 Connector 零调用（陈旧外呼被堵死）
+
+
+async def test_resume_delete_runs_off_event_loop(running_host, sample_pack, deploy_w5, monkeypatch):
+    """三审 P2：恢复的删盘可能等一次 fsync（与在途 persist 争锁）——现在跑在线程里，
+    _sweep_suspensions 同步返回不再携带删盘时长（事件循环不被压住）。"""
+    import time as _time
+
+    from osca_host.suspension import SuspensionStore
+
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    pid = "demo-group-oper-diagnosis"
+    episode, loaded, proxy, policy = _setup_write_episode(host, pid)
+    await host._execute_episode(episode, loaded, proxy, policy)  # 挂起 + 落盘
+    [ch] = policy.pending_challenges()
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+
+    original_delete = SuspensionStore.delete
+
+    def slow_delete(self, opid):  # 模拟存储慢（fsync 争锁/坏盘）
+        _time.sleep(0.35)
+        original_delete(self, opid)
+
+    monkeypatch.setattr(SuspensionStore, "delete", slow_delete)
+    t0 = _time.monotonic()
+    host._sweep_suspensions()  # 触发恢复——删盘应已下线程
+    elapsed = _time.monotonic() - t0
+    assert elapsed < 0.2, f"删盘仍在事件循环上同步执行（sweep 耗时 {elapsed:.3f}s）"
+    await _await_status(episode, "completed")
+    assert episode.status == "completed"  # 恢复照常兑现

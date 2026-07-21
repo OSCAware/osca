@@ -762,3 +762,21 @@ def test_osca040_performer_restricted_syntax(make_pkg, base):
     ]
     result = lint_package(make_pkg(base))
     assert not any(f.rule == "OSCA040" and "performer" in f.message for f in result.findings)
+
+
+def test_osca024_symlink_loop_no_traceback(make_pkg, base):
+    """GPT 三审 P2：符号链接环让 Path.resolve 抛 RuntimeError（≤3.12）——lint 不许 traceback，
+    按 OSCA024 稳定报告（环即不可解析：越界拒 或 不存在告警，取决于解释器版本，两者都收敛）。"""
+    root = make_pkg(base)
+    (root / "sql").mkdir(exist_ok=True)
+    loop = root / "sql" / "loop.sql"
+    loop.symlink_to(loop.name)  # 自指链接环
+    import yaml as _yaml
+
+    conn = root / "connectors" / "CON-001-数据源.yaml"
+    data = _yaml.safe_load(conn.read_text(encoding="utf-8"))
+    data["interfaces"][0]["impl"] = "sql/loop.sql"
+    conn.write_text(_yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    result = lint_package(root)  # 此前 RuntimeError traceback 穿透
+    assert "OSCA024" in rules_hit(result)

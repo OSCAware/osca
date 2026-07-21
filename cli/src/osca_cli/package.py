@@ -29,15 +29,18 @@ SKIP_DIRS = {"indexes", ".git"}
 
 
 def resolve_in_root(root: Path | str, declared: str) -> Path | None:
-    """包内受限路径判据（单一真理源：lint OSCA024 与 Host 执行器/mock 固件共用）。
+    """包内受限路径判据（单一真理源：lint OSCA024、Host SQL 执行器、Connector mock 固件、
+    MockLLM 固件**全部**经此判定，不各写第二份）。
 
     包内声明（impl / 固件名等）是不可信输入：resolve 后必须留在 root 内——绝对路径、`../` 与
     符号链接逃逸一律返回 None（GPT Review：开发期与执行期同一判据，lint 放行的包不得在运行时
-    才被拒；反之 lint 也要拦运行时必拒的越界声明）。"""
-    base = Path(root).resolve()
+    才被拒；反之 lint 也要拦运行时必拒的越界声明）。符号链接**环**在 ≤3.12 的 Path.resolve 抛
+    RuntimeError（3.13 起并入 OSError）——两者都按越界拒，不许 traceback 穿透 lint/执行器
+    （GPT 三审 P2）。"""
     try:
+        base = Path(root).resolve()
         target = (base / declared).resolve()
-    except OSError:  # 病态路径（深度爆炸/链接循环等）——按越界拒
+    except (OSError, RuntimeError, ValueError):  # 链接环/深度爆炸/非法字符等病态路径——按越界拒
         return None
     return target if target.is_relative_to(base) else None
 
