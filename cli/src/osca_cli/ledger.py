@@ -224,7 +224,11 @@ def ledger_lock(root: Path, *, blocking: bool = True):
     打开方式 O_NOFOLLOW 且不截断：锁文件被预置成符号链接即报错，不覆写链接目标。
     """
     path = _lock_path(Path(root))
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    # 锁以 O_RDWR 打开——多 UID 共写同一账本（M7 三用户部署：host settle + bridge capture 同组共写）时，
+    # 第二个 UID 打开既存锁需组写位；0o644 无组写位、umask 只能清位不能加位，故建成 0o660（配合部署侧
+    # umask 0007 + 包 .git 属组共写组 + core.sharedRepository=group）。单 UID 部署下 0o660 = 属主 rw、无 world，
+    # 较原 0o644 更严（去掉无谓的 world 读）。
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o660)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
