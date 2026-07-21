@@ -41,6 +41,22 @@ jobs:
           uv run --locked osca lint ../examples/oper-diagnosis.osca
           uv run --locked osca lint ../examples/oper-dispatch.osca
 
+  root-security:
+    # 跨真实 UID 的控制通道安全测试需要 root 才能 setuid——普通 test job 固定跳过；
+    # 本 job 用 runner 的免密 sudo 单独跑该探针（探针子进程走系统 /usr/bin/python3，
+    # 降权后无需访问 0700 venv）。
+    name: 跨 UID 控制通道安全（root）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: root 跑真实 setuid 探针
+        working-directory: host
+        run: |
+          uv sync --locked
+          sudo .venv/bin/python -m pytest -q -rs \
+            tests/test_control_security.py::test_real_different_uid_kernel_probe
+
   test:
     name: pytest + ruff
     runs-on: ubuntu-latest

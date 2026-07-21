@@ -106,7 +106,7 @@ osca/
 
 - **Public implementation/tests are reproducible**: the finalized SPEC v0.4, the synthetic demo, CLI, and Host
   are public; a fresh clone can reproduce Lint/Pack/Load and the automated tests. Actual Replay needs an LLM/mock;
-  a full Episode also needs Bindings, a Connector fixture/Executor, and an LLM. The demo passes all 24 lint rules;
+  a full Episode also needs Bindings, a Connector fixture/Executor, and an LLM. The demo passes all 25 lint rules;
   that does not mean an enterprise environment is connected.
 - **First-party feedback flywheel engineering loop (M3)**: Capture → Distill → Candidate Queue →
   Confirm/Reject → Git Judgment Ledger → Index → Retrieve → Checkup is complete in the private implementation

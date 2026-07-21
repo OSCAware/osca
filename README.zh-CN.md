@@ -98,7 +98,7 @@ osca/
 
 - **公开实现/测试可复现**：SPEC v0.4 定稿、合成演示包、CLI 和 Host 均已公开；
   fresh clone 可复现 Lint/Pack/Load 与自动测试。实际 Replay 需要 LLM/mock；完整 Episode 还
-  需要 Binding、Connector fixture/Executor 与 LLM。样例通过全部 24 条 lint 规则；这不等于
+  需要 Binding、Connector fixture/Executor 与 LLM。样例通过全部 25 条 lint 规则；这不等于
   企业环境已经接通。
 - **第一方反馈飞轮工程闭环（M3）**：Capture → Distill → Candidate Queue → Confirm/Reject → Git
   Judgment Ledger → Index → Retrieve → Checkup 已在私有实现中完成，并由合成夹具与自动测试
