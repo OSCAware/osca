@@ -45,19 +45,28 @@ class _OpState:
         self.pending = 0
 
 
+# PersistTicket 生命周期（GPT 五审 P2：一次性**使用**也要强制，不只释放幂等）：
+# PENDING（begin 发出，可 abandon）→ CLAIMED（persist 在 registry 锁内原子认领，abandon 变 no-op）
+# → RELEASED（persist finally / abandon 归还，终态）。已 RELEASED/CLAIMED、跨 store、脱离注册表的
+# 票在 persist 认领时一律拒绝且不建文件——否则「abandon 后旧票仍持旧状态与旧世代（0）」：delete 用
+# 新状态递增世代并回收后，拿旧票 persist 查的是旧状态 delete_gen==token==0，会在注册表全空时复活快照。
+_PENDING, _CLAIMED, _RELEASED = "pending", "claimed", "released"
+
+
 class PersistTicket:
-    """begin_persist 发的一次性在途凭据（GPT 四审 P2）：绑定**具体状态对象** + 当时删除世代，
-    释放幂等（exactly-once）。裸整数令牌 + 按 operation_id 释放会 ABA——persist 异常自归还后
-    调用方再 abandon，第二次释放偷走并发 delete 的票、提前回收条目，同 id 新状态世代归零，
-    迟到 persist 便能复活已作废快照。凭据绑状态身份 + 幂等标志后，双释放/跨代释放都不可达。"""
+    """begin_persist 发的一次性在途凭据（GPT 四审 + 五审 P2）：绑定**具体状态对象、当时删除世代与
+    所属 store**，使用（claim）与释放都 exactly-once。裸整数令牌 + 按 operation_id 释放会 ABA（偷走
+    并发 delete 的票、世代归零复活快照）；只幂等释放不锁使用，abandon 过的旧票仍能拿旧状态里的
+    旧世代通过校验重新落盘——状态机 + 原子 claim 把两条路都封死。"""
 
-    __slots__ = ("operation_id", "state", "token", "released")
+    __slots__ = ("operation_id", "state", "token", "status", "store")
 
-    def __init__(self, operation_id: str, state: _OpState, token: int):
+    def __init__(self, operation_id: str, state: _OpState, token: int, store: SuspensionStore):
         self.operation_id = operation_id
         self.state = state
         self.token = token
-        self.released = False
+        self.status = _PENDING
+        self.store = store
 
 
 class SuspensionStore:
@@ -87,15 +96,16 @@ class SuspensionStore:
         with self._registry:
             st = self._ops.setdefault(operation_id, _OpState())
             st.pending += 1
-            return PersistTicket(operation_id, st, st.delete_gen)
+            return PersistTicket(operation_id, st, st.delete_gen, self)
 
-    def _release_ticket(self, ticket: PersistTicket) -> None:
-        """幂等释放：只释放**本票绑定的状态对象**的那一份计数——双释放/跨代释放不可达
-        （GPT 四审 P2：按 operation_id 裸释放 + 钳制会偷走并发 delete 的票、ABA 复活快照）。"""
+    def _release_ticket(self, ticket: PersistTicket, *, allowed: str) -> None:
+        """exactly-once 释放（registry 锁内）：只从 allowed 态迁 RELEASED，只释放**本票绑定的状态
+        对象**的那一份计数——双释放/跨代释放/错态释放全 no-op（GPT 四审 P2：裸释放 + 钳制会偷走
+        并发 delete 的票、ABA 复活快照）。"""
         with self._registry:
-            if ticket.released:
+            if ticket.status is not allowed:
                 return
-            ticket.released = True
+            ticket.status = _RELEASED
             st = self._ops.get(ticket.operation_id)
             if st is not ticket.state:
                 return  # 条目已被替换（持票期间不可能；防御性：绝不动别代的状态）
@@ -105,24 +115,38 @@ class SuspensionStore:
 
     def begin_persist(self, operation_id: str) -> PersistTicket:
         """persist 发起时（事件循环侧、与挂起登记同临界区）领一次性在途凭据（含当时删除世代）。
-        对应的 persist() 在 finally 归还；发起后未走到 persist（如指纹计算失败）由 abandon_persist
-        归还——释放幂等，调用方分不清异常发生在 persist 前后时也可安全兜底调用。"""
+        对应的 persist() 在认领后于 finally 归还；发起后未走到 persist（如指纹计算失败）由
+        abandon_persist 归还——abandon 只作用于 PENDING 票，persist 已认领/已归还时是 no-op。"""
         return self._acquire_ticket(operation_id)
 
     def abandon_persist(self, ticket: PersistTicket) -> None:
-        """begin_persist 后未走到 persist 的归还口。幂等：persist 已自归还时本调用是 no-op，
-        绝不偷走其他在途者（并发 delete/新一代 begin）的票。"""
-        self._release_ticket(ticket)
+        """begin_persist 后未走到 persist 的归还口。只归还 **PENDING** 票（GPT 五审 P2）：
+        CLAIMED（persist 使用中，其 finally 自归还）与 RELEASED 一律 no-op——绝不偷走其他
+        在途者（并发 delete/新一代 begin）的票，也绝不把用过的票洗回可用。"""
+        self._release_ticket(ticket, allowed=_PENDING)
 
     def persist(self, operation_id: str, record: dict, ticket: PersistTicket | None = None) -> bool:
         """原子写盘（temp + fsync + rename，均相对 dir_fd）。非 JSON 可序列化 → 跳过并告警，返回 False
         （该剧集退回 L1）；ticket 的删除世代与当前不符（落盘前已被 delete 作废）→ 不写、返回 False；
-        成功返回 True。文件名按 operation_id 键化。ticket 在 finally 幂等归还；无票直调
-        （测试/工具路径）自持一票，保证操作期间状态条目与锁对象稳定。"""
+        成功返回 True。文件名按 operation_id 键化。
+
+        **一次性使用强制**（GPT 五审 P2）：开写前在 registry 锁内原子校验并认领（PENDING→CLAIMED）——
+        已 abandon/已用过（含并发双用）、跨 store、脱离注册表的票一律拒绝且不建文件。abandon 后的旧票
+        持旧状态与旧世代，不拦会在 delete 回收后借「旧状态 delete_gen==旧 token」复活快照。
+        认领后 finally 归还；无票直调（测试/工具路径）自持一票新领即认领。"""
         if ticket is None:
             ticket = self._acquire_ticket(operation_id)
         elif ticket.operation_id != operation_id:
             raise ValueError(f"persist 凭据不属于 {operation_id}（属 {ticket.operation_id}）——拒绝错票落盘")
+        with self._registry:  # 原子校验并认领：一次性凭据的「使用」也 exactly-once
+            if (
+                ticket.store is not self
+                or ticket.status is not _PENDING
+                or self._ops.get(operation_id) is not ticket.state
+            ):
+                log.warning(f"persist 凭据无效（已用过/已归还/跨 store/已脱离注册表），拒绝落盘：{operation_id}")
+                return False
+            ticket.status = _CLAIMED
         st = ticket.state
         try:
             try:
@@ -151,23 +175,23 @@ class SuspensionStore:
                     raise
             return True
         finally:
-            self._release_ticket(ticket)
+            self._release_ticket(ticket, allowed=_CLAIMED)  # 认领过的票由此 exactly-once 归还
 
     def delete(self, operation_id: str) -> None:
         """作废并删除快照：世代 +1（在途 persist 令牌失配即弃写）再 unlink。**本方法可能等一次 fsync**
         （与在途 persist 争同一状态锁）——调用方须在线程里调（Host._resume_after_delete / 重挂批量清理），
-        不上事件循环。自持一票凭据护住文件操作期间的状态条目与锁对象。"""
+        不上事件循环。自持一票凭据护住文件操作期间的状态条目与锁对象（内部票不外流、原地归还）。"""
         with self._registry:
             st = self._ops.setdefault(operation_id, _OpState())
             st.delete_gen += 1
             st.pending += 1
-        ticket = PersistTicket(operation_id, st, st.delete_gen)  # 仅作归还凭据（token 不参与判定）
+        ticket = PersistTicket(operation_id, st, st.delete_gen, self)  # 仅作归还凭据（token 不参与判定）
         try:
             with st.lock:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(self._name(operation_id), dir_fd=self._fd)
         finally:
-            self._release_ticket(ticket)
+            self._release_ticket(ticket, allowed=_PENDING)
 
     def load_all(self) -> list[dict]:
         """读运行目录下全部挂起快照（坏文件跳过留痕）。调用方按 package_id 过滤 + 版本戳/过期校验。"""

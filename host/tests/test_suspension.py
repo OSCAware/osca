@@ -138,3 +138,69 @@ def test_persist_oserror_then_abandon_does_not_reset_delete_generation(store, mo
     assert s.persist("EO-x", {"a": 2}, ticket=t2) is False  # 世代未归零——迟到 persist 弃写，快照不复活
     assert not (tmp / "susp-EO-x.json").exists()
     assert s._ops == {}
+
+
+def test_released_ticket_cannot_resurrect_snapshot(store):
+    """GPT 五审 P2（复现反转）：begin → abandon → delete（新状态世代 +1 后回收）→ 拿旧票 persist——
+    旧票持旧状态旧世代（0），不锁使用会在注册表全空时复活快照。须拒绝且零快照。"""
+    s, tmp = store
+    t1 = s.begin_persist("EO-old")
+    s.abandon_persist(t1)  # 旧票 RELEASED
+    s.delete("EO-old")  # 新状态：世代 +1 → 回收 → 注册表空
+    assert s._ops == {}
+    assert s.persist("EO-old", {"a": 1}, ticket=t1) is False  # 已归还的票拒绝使用
+    assert not (tmp / "susp-EO-old.json").exists()  # 不建文件——快照未复活
+    assert s._ops == {}
+
+
+def test_same_ticket_cannot_persist_twice(store):
+    """GPT 五审 P2：同一票串行用两次——第二次必须拒绝（使用也 exactly-once，不只释放幂等）。"""
+    s, tmp = store
+    t = s.begin_persist("EO-twice")
+    assert s.persist("EO-twice", {"n": 1}, ticket=t) is True
+    assert s.persist("EO-twice", {"n": 2}, ticket=t) is False  # 已用过的票拒绝重用
+    assert json.loads((tmp / "susp-EO-twice.json").read_text(encoding="utf-8")) == {"n": 1}  # 内容未被第二次覆写
+    s.delete("EO-twice")
+    assert s._ops == {}
+
+
+def test_cross_store_ticket_rejected(store, tmp_path):
+    """GPT 五审 P2：Store A 的票传给 Store B（同 operation_id）——跨 store 拒绝且不建文件。"""
+    s_a, _ = store
+    other_dir = tmp_path / "other-store"
+    other_dir.mkdir()
+    fd = os.open(str(other_dir), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        s_b = SuspensionStore(fd)
+        t_a = s_a.begin_persist("EO-cross")
+        assert s_b.persist("EO-cross", {"a": 1}, ticket=t_a) is False  # 错店的票不认
+        assert not (other_dir / "susp-EO-cross.json").exists()
+        assert s_b._ops == {}  # B 店零残留
+        s_a.abandon_persist(t_a)  # A 店的票仍可正常归还
+        assert s_a._ops == {}
+    finally:
+        os.close(fd)
+
+
+def test_abandon_is_noop_on_claimed_ticket(store, monkeypatch):
+    """abandon 只作用于 PENDING：persist 认领后（含内部异常自归还后）abandon 一律 no-op——
+    用过的票不被洗回可用，也不双计释放。"""
+    import osca_host.suspension as susp_mod
+
+    s, tmp = store
+    t = s.begin_persist("EO-claimed")
+    real_open = os.open
+
+    def boom(path, *args, **kwargs):
+        if isinstance(path, str) and path.startswith("susp-EO-claimed"):
+            raise OSError("disk full（测试注入）")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(susp_mod.os, "open", boom)
+    with pytest.raises(OSError):
+        s.persist("EO-claimed", {"a": 1}, ticket=t)  # 认领后炸——finally 已归还（CLAIMED→RELEASED）
+    monkeypatch.undo()
+    s.abandon_persist(t)  # no-op
+    assert s.persist("EO-claimed", {"a": 2}, ticket=t) is False  # 终态票不可再用
+    assert not (tmp / "susp-EO-claimed.json").exists()
+    assert s._ops == {}
