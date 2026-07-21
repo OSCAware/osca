@@ -116,14 +116,14 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
                 # 新预约一律拒（关「过检后阻塞于 ledger lock、期间 revoke、恢复后落账」的窗）；发布
                 # I/O 本身在锁外（卡死的 fsync/link 不许把 revoke/关停一起卡死），revoke 以有界等待
                 # 收尾在途提交、超时明标悬挂。
-                active, deny = proxy.policy.begin_final_commit()
+                active, token = proxy.policy.begin_final_commit()  # token=FC-xxxx 或拒绝原因
                 if not active:
-                    aborted = deny
+                    aborted = token
                     break
                 try:
                     published = publish_file_in_dir(cases_fd, f"{case_id}.yaml", payload, overwrite=False)
                 finally:
-                    proxy.policy.end_final_commit()
+                    proxy.policy.end_final_commit(token)
                 if published:
                     break
                 n += 1  # 无覆盖发布：撞号顺移重试（编号随内容重写保持一致），绝不截断他人内容

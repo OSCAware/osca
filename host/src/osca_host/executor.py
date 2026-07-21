@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import http.client
 import json
 import sqlite3
@@ -214,6 +213,10 @@ class OpenapiExecutor:
                 # 只在块间查 deadline 时，deadline 前启动的一次 read 仍可吊满旧 per-op timeout。
                 sock = getattr(getattr(resp, "fp", None), "raw", None)
                 sock = getattr(sock, "_sock", None)
+                if deadline is not None and sock is None:
+                    # fail-closed（六项复核 P2）：拿不到底层连接就无法实施绝对 deadline——声明了
+                    # max_minutes 时**拒绝无界读**，不静默退回「单次 op timeout 可越过 deadline」
+                    return None, f"openapi {method} 无法获取底层连接以实施绝对 deadline——fail-closed（不做无界读）"
                 # 分块读 + 读上限：巨响应体不触发 OOM（DoS + call() 恒回 Receipt）。截断不在此判——
                 # 由下方 Content-Length 比对显式 fail-closed（不静默把半截数据当取数结果）。
                 chunks: list[bytes] = []
@@ -223,9 +226,11 @@ class OpenapiExecutor:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             return None, f"openapi {method} 总 deadline 用尽（响应读取中止）——fail-closed"
-                        if sock is not None:
-                            with contextlib.suppress(OSError):
-                                sock.settimeout(max(0.001, min(per_op, remaining)))
+                        try:
+                            sock.settimeout(max(0.001, min(per_op, remaining)))
+                        except OSError:
+                            # 收不紧读超时同样 fail-closed（六项复核 P2）——不许静默降级成旧 per-op timeout
+                            return None, f"openapi {method} 无法把读超时收紧到剩余预算——fail-closed"
                     chunk = resp.read1(min(65536, _MAX_BODY + 1 - got))
                     if not chunk:
                         break

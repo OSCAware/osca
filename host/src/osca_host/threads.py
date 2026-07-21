@@ -19,6 +19,47 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import threading
+import time
+
+
+class PublishFence:
+    """不可逆发布的预约栅栏（五轮复核 P1，与 policy 终局提交同型）——覆盖 load/index/swap。
+
+    发布方在栅栏锁内 `begin(check)`：复核作废条件并登记在途，随后在**锁外**执行发布 I/O、
+    `end()` 归还。生命周期变更方在**条件已生效之后**调 `barrier(grace)` 有界等待在途发布收尾。
+    「检查已过、真正 syscall 尚未执行」的窗由此关死：发布要么先于变更返回完成、要么 begin 被拒；
+    存储卡死（超过 grace）按有界语义明标悬挂，不无界阻塞生命周期（与 H-1 同一诚实边界——
+    需要「超时强制终止」语义的部署以进程隔离运行）。
+    """
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._inflight = 0
+
+    def begin(self, check) -> str | None:
+        """预约一次不可逆发布：栅栏锁内跑 check——返回 None=已登记可发布；返回原因串=已作废。"""
+        with self._cv:
+            why = check() if check is not None else None
+            if why is not None:
+                return why
+            self._inflight += 1
+            return None
+
+    def end(self) -> None:
+        with self._cv:
+            self._inflight = max(0, self._inflight - 1)
+            self._cv.notify_all()
+
+    def barrier(self, grace: float) -> int:
+        """生命周期变更（作废条件已生效）后的收尾栅栏：有界等待在途发布归零；返回悬挂数（0=干净）。"""
+        deadline = time.monotonic() + grace
+        with self._cv:
+            while self._inflight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cv.wait(remaining)
+            return self._inflight
 
 
 async def run_in_daemon_thread(fn, *args, name: str = "osca-worker"):

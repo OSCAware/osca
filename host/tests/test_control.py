@@ -1692,3 +1692,80 @@ async def test_stopped_within_bound_when_final_commit_hangs(running_host, sample
     assert host.state.name == "STOPPED"
     assert elapsed < 8.0  # 有界关停:悬挂提交明标后放行,不无界等待
     policy.end_final_commit()  # 收尾,不留悬挂计数
+
+
+async def test_inflight_index_publish_drains_before_stopped(sock_path, sample_pack, tmp_path, monkeypatch):
+    """五轮复核 P1：worker 已通过 abort 复核、在**预约内**卡在 publish syscall 之前——关停栅栏
+    有界等待:发布先于 STOPPED 完成（收尾路径）,不存在「STOPPED 已报、发布才落」的静默窗。"""
+    import threading
+
+    from osca_cli import packer as packer_mod
+
+    entered, release = threading.Event(), threading.Event()
+    real_publish = packer_mod.publish_file_in_dir
+
+    def gated_publish(fd, name, data, **kwargs):
+        if name == "judgments.index.yaml":
+            entered.set()
+            release.wait(10)  # 已过 begin 预约,卡在真正 syscall 之前
+        return real_publish(fd, name, data, **kwargs)
+
+    monkeypatch.setattr(packer_mod, "publish_file_in_dir", gated_publish)
+    host = Host(sock_path)
+    host._load_fence_grace = 5.0
+    host.deployments["d"] = {"path": str(sample_pack), "bindings": _stub_bindings(sample_pack)}
+    run_task = asyncio.create_task(host.run())
+    for _ in range(100):
+        if host.control.socket_path.exists():
+            break
+        await asyncio.sleep(0.01)
+    load_task = asyncio.create_task(_send({"cmd": "load", "deployment_id": "d"}, host))
+    assert await asyncio.to_thread(entered.wait, 5)
+    threading.Timer(0.3, release.set).start()  # 栅栏等待期间(事件循环被有界阻塞)由线程释放
+    host._stop.set()
+    assert await asyncio.wait_for(run_task, timeout=15) in (0, 1)
+    assert host.state.name == "STOPPED"
+    assert (sample_pack / "indexes" / "judgments.index.yaml").is_file()  # 发布先于关停完成(预约收尾)
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(load_task, timeout=5)
+
+
+async def test_hung_publish_flagged_and_stop_bounded(sock_path, sample_pack, tmp_path, monkeypatch, caplog):
+    """五轮复核 P1（悬挂边界）：预约内发布永久卡死——关停仍有界完成,悬挂在 Host 日志明标
+    （不是静默迟到）。"""
+    import threading
+
+    from osca_cli import packer as packer_mod
+
+    entered, release = threading.Event(), threading.Event()
+    real_publish = packer_mod.publish_file_in_dir
+
+    def gated_publish(fd, name, data, **kwargs):
+        if name == "judgments.index.yaml":
+            entered.set()
+            release.wait(30)  # 卡死到关停之后
+        return real_publish(fd, name, data, **kwargs)
+
+    monkeypatch.setattr(packer_mod, "publish_file_in_dir", gated_publish)
+    host = Host(sock_path)
+    host._load_fence_grace = 0.1
+    host._episode_shutdown_timeout = 0.2
+    host.deployments["d"] = {"path": str(sample_pack), "bindings": _stub_bindings(sample_pack)}
+    run_task = asyncio.create_task(host.run())
+    for _ in range(100):
+        if host.control.socket_path.exists():
+            break
+        await asyncio.sleep(0.01)
+    load_task = asyncio.create_task(_send({"cmd": "load", "deployment_id": "d"}, host))
+    assert await asyncio.to_thread(entered.wait, 5)
+    import time as time_mod
+
+    started = time_mod.monotonic()
+    host._stop.set()
+    assert await asyncio.wait_for(run_task, timeout=15) in (0, 1)
+    assert time_mod.monotonic() - started < 10  # 有界关停
+    assert host.state.name == "STOPPED"
+    assert "装载发布仍悬挂于存储" in caplog.text  # 悬挂明标,非静默
+    release.set()  # 释放悬挂线程收尾
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(load_task, timeout=5)

@@ -42,6 +42,18 @@ class LoadAborted(Exception):
     """装载作废令牌在写边界命中（四轮复核 P1）——调用方转稳定装载失败，不是异常路径。"""
 
 
+def _abort_begin(abort) -> tuple[str | None, bool]:
+    """发布预约（五轮复核 P1）：abort 实现栅栏协议（begin/end，如 Host 的 PublishFence 适配器）时
+    走**预约**——begin 在栅栏锁内复核并登记在途，返回 (拒绝原因或 None, 是否需 end 归还)。
+    纯可调用（测试/简单调用方）退化为临界检查（无预约、无栅栏语义）——生产 Host 恒传栅栏。"""
+    if abort is None:
+        return None, False
+    begin = getattr(abort, "begin", None)
+    if callable(begin):
+        return begin(), True
+    return abort(), False
+
+
 # zip bomb 防护上限（.osca 包是纯文本 Markdown/YAML，正常包远小于这些数）
 MAX_ZIP_MEMBERS = 2000
 MAX_MEMBER_BYTES = 50 * 1024 * 1024  # 单成员解压上限
@@ -314,9 +326,16 @@ def rebuild_index(root: Path, pkg=None, *, abort: Callable[[], str | None] | Non
     # 安全目录发布（与 settle 落账同一机制）：fd 锚定包根 + O_NOFOLLOW 打开 indexes/——
     # indexes 或索引文件被预置成符号链接时在此拒绝，索引写入永远出不了包根
     with open_ledger_dir(root, "indexes") as fd:
-        if abort is not None and (why := abort()):
-            raise LoadAborted(why)
-        publish_file_in_dir(fd, "judgments.index.yaml", data, overwrite=True)
+        # 发布预约（五轮复核 P1）：begin 与生命周期变更方共享栅栏锁——「检查已过、publish 未执行」
+        # 期间发生 STOPPED/unload 时,变更方的 barrier 会等本次发布收尾(有界),不存在静默迟到落盘
+        why, reserved = _abort_begin(abort)
+        try:
+            if why is not None:
+                raise LoadAborted(why)
+            publish_file_in_dir(fd, "judgments.index.yaml", data, overwrite=True)
+        finally:
+            if reserved:
+                abort.end()
     return root / "indexes" / "judgments.index.yaml"
 
 
@@ -396,41 +415,49 @@ def _swap_into_dest(tmp: Path, root: Path, abort: Callable[[], str | None] | Non
 
     上位失败的恢复纪律（复核 P1）：若 root 已被锁外闯入者占用，先把未知内容**隔离**到
     quarantine 再把旧部署归位——绝不静默把错误内容留在 dest、也绝不丢弃合法旧部署。
-    abort（四轮复核 P1）：flock 等待可以无限长——锁前的作废检查关不住「等锁期间 STOPPED、
-    释放后迟到切换」；**取得锁之后、第一次 rename 之前**必须复核。
+    abort（四轮/五轮复核 P1）：flock 等待可以无限长——锁前的作废检查关不住「等锁期间 STOPPED、
+    释放后迟到切换」；取得锁之后走**发布预约**（begin/end，与生命周期变更方共享栅栏）——
+    整段 rename 序列在预约内执行，变更方的 barrier 有界等待其收尾，不存在静默迟到切换。
     """
     old: Path | None = None
     try:
         with _swap_lock(root):
-            if abort is not None and (why := abort()):
-                shutil.rmtree(tmp, ignore_errors=True)
-                return f"装载已作废：{why}——取得切换锁后复核止步，dest 未被触碰（迟到切换零副作用）"
-            # 锁内重查可接管性：_dest_error 首查与拿锁之间 dest 可能被并发换成用户内容——
-            # 锁内不过判据就放弃，绝不把来历不明的目录挪走再删掉
-            error = _dest_error(root)
-            if error:
-                shutil.rmtree(tmp, ignore_errors=True)
-                return f"{error}（切换前锁内复核）"
-            if root.exists():
-                old = root.parent / f".{root.name}.osca-old-{os.getpid()}-{time.monotonic_ns()}"
-                os.rename(root, old)
+            why, reserved = _abort_begin(abort)
             try:
-                os.rename(tmp, root)
-            except OSError as e:
-                shutil.rmtree(tmp, ignore_errors=True)
-                if old is None:
-                    return f"发布切换失败：{e}"
-                notes = []
+                if why is not None:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    return f"装载已作废：{why}——取得切换锁后复核（预约被拒）止步，dest 未被触碰（迟到切换零副作用）"
+                # 锁内重查可接管性：_dest_error 首查与拿锁之间 dest 可能被并发换成用户内容——
+                # 锁内不过判据就放弃，绝不把来历不明的目录挪走再删掉
+                error = _dest_error(root)
+                if error:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    return f"{error}（切换前锁内复核）"
+                if root.exists():
+                    old = root.parent / f".{root.name}.osca-old-{os.getpid()}-{time.monotonic_ns()}"
+                    os.rename(root, old)
                 try:
-                    if root.exists() or root.is_symlink():
-                        quarantine = root.parent / f".{root.name}.osca-quarantine-{os.getpid()}-{time.monotonic_ns()}"
-                        os.rename(root, quarantine)
-                        notes.append(f"锁外并发占用内容已隔离到 {quarantine}")
-                    os.rename(old, root)
-                    notes.append("旧部署已恢复原位")
-                except OSError as restore_error:
-                    notes.append(f"恢复失败（旧部署暂存于 {old}，请人工归位）：{restore_error}")
-                return f"发布切换失败：{e}（{'；'.join(notes)}）"
+                    os.rename(tmp, root)
+                except OSError as e:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    if old is None:
+                        return f"发布切换失败：{e}"
+                    notes = []
+                    try:
+                        if root.exists() or root.is_symlink():
+                            quarantine = (
+                                root.parent / f".{root.name}.osca-quarantine-{os.getpid()}-{time.monotonic_ns()}"
+                            )
+                            os.rename(root, quarantine)
+                            notes.append(f"锁外并发占用内容已隔离到 {quarantine}")
+                        os.rename(old, root)
+                        notes.append("旧部署已恢复原位")
+                    except OSError as restore_error:
+                        notes.append(f"恢复失败（旧部署暂存于 {old}，请人工归位）：{restore_error}")
+                    return f"发布切换失败：{e}（{'；'.join(notes)}）"
+            finally:
+                if reserved:
+                    abort.end()
     except OSError as e:
         shutil.rmtree(tmp, ignore_errors=True)
         return f"发布切换失败（swap 跨进程锁）：{e}"

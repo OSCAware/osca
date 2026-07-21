@@ -809,3 +809,19 @@ def test_revoke_waits_briefly_for_inflight_commit_to_finish():
     elapsed = time_mod.monotonic() - started
     assert 0.05 < elapsed < 3.0  # 等到了 end(≈0.1s),而非立即返回或吊满 grace
     assert not any("悬挂" in a["reason"] for a in policy.audit)
+
+
+def test_hung_final_commit_observable_in_host_log_after_unload(caplog):
+    """六项复核 P2：unload 会把 policy pop 出 status 可达面——悬挂与迟到收尾必须落 **Host 日志**
+    且带唯一提交 ID,运维在真实 unload/stop 后仍可观测。"""
+    import logging
+
+    policy = PolicyInterceptor("p", {}, {})
+    policy.final_commit_grace = 0.1
+    ok, commit_id = policy.begin_final_commit()
+    assert ok and commit_id.startswith("FC-")
+    with caplog.at_level(logging.WARNING, logger="osca-host"):
+        policy.revoke("unload（测试:提交悬挂）")
+        assert "悬挂" in caplog.text and commit_id in caplog.text  # Host 级日志,非仅 policy.audit
+        policy.end_final_commit(commit_id)  # 迟到收尾
+        assert "在包停/关停之后收尾" in caplog.text and caplog.text.count(commit_id) >= 2  # 终态留痕

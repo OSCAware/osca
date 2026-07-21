@@ -473,7 +473,7 @@ def test_openapi_per_read_socket_timeout_tightened_to_remaining():
         conn.recv(65536)
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Type: application/json\r\n\r\n")
         try:
-            time_mod.sleep(0.15)
+            time_mod.sleep(0.4)
             conn.sendall(b"x")  # 首字节后停顿:后续 read 在 deadline 前启动、旧 timeout 未收紧则吊满
             time_mod.sleep(5)
         except OSError:
@@ -495,10 +495,114 @@ def test_openapi_per_read_socket_timeout_tightened_to_remaining():
             secret=None,
             is_write=False,
             pack_root=Path("."),
-            timeout=0.25,
+            timeout=0.5,
         )
     finally:
         s.close()
     elapsed = time_mod.monotonic() - started
     assert payload is None and err is not None
-    assert elapsed < 0.85, elapsed  # ≈ deadline(0.25)+余量;绝非 0.15+完整旧 timeout 的 0.4s 起步再加连接层重试
+    # 判别性上界（六项复核 P2）：新实现 ≈ deadline(0.5)+小余量;旧实现（read 吊满整个 per-op
+    # timeout）≥ 0.4+0.5=0.9,必败于此断言——上界不再宽到新旧同过
+    assert elapsed < 0.75, elapsed
+
+
+def test_openapi_read_timeout_set_to_remaining_each_round(monkeypatch):
+    """六项复核 P2（判别性断言）：逐轮直接断言 settimeout 收到的值 == min(per_op, remaining)——
+    单调收紧,不靠时序上界间接推断。"""
+    import osca_host.executor as ex_mod
+
+    recorded: list[float] = []
+
+    class _Sock:
+        def settimeout(self, value):
+            recorded.append(value)
+
+    class _Raw:
+        pass
+
+    class _FP:
+        pass
+
+    class _Resp:
+        status = 200
+
+        def __init__(self):
+            self.fp = _FP()
+            self.fp.raw = _Raw()
+            self.fp.raw._sock = _Sock()
+            self._chunks = [b'{"a"', b": 1}", b""]
+
+        def getheader(self, name):
+            return None
+
+        def read1(self, n):
+            return self._chunks.pop(0)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(ex_mod, "_OPENER", type("O", (), {"open": staticmethod(lambda req, timeout=None: _Resp())})())
+    payload, err = OpenapiExecutor().execute(
+        endpoint="openapi://h.internal",
+        interface={"method": "GET", "path": "/x"},
+        params={},
+        secret=None,
+        is_write=False,
+        pack_root=Path("."),
+        timeout=5.0,
+    )
+    assert err is None and payload == {"a": 1}
+    assert len(recorded) == 3  # 每轮 read 前各设一次
+    assert all(0 < v <= 5.0 for v in recorded)
+    for earlier, later in zip(recorded, recorded[1:], strict=False):
+        assert later <= earlier + 1e-6  # remaining 单调收紧
+
+
+def test_openapi_fail_closed_when_socket_unavailable_under_deadline(monkeypatch):
+    """六项复核 P2：拿不到底层连接（非 CPython 布局/wrapper 变化）——声明 deadline 时 fail-closed,
+    不静默退回旧 per-op timeout;未声明 deadline 不受影响。"""
+    import osca_host.executor as ex_mod
+
+    class _Resp:
+        status = 200
+        fp = None  # 无底层 socket 可及
+
+        def getheader(self, name):
+            return None
+
+        def read1(self, n):
+            return b""
+
+        def read(self, n=None):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(ex_mod, "_OPENER", type("O", (), {"open": staticmethod(lambda req, timeout=None: _Resp())})())
+    payload, err = OpenapiExecutor().execute(
+        endpoint="openapi://h.internal",
+        interface={"method": "GET", "path": "/x"},
+        params={},
+        secret=None,
+        is_write=False,
+        pack_root=Path("."),
+        timeout=1.0,
+    )
+    assert payload is None and "无法获取底层连接" in err  # fail-closed
+
+    payload, err = OpenapiExecutor().execute(
+        endpoint="openapi://h.internal",
+        interface={"method": "GET", "path": "/x"},
+        params={},
+        secret=None,
+        is_write=False,
+        pack_root=Path("."),
+    )
+    assert err is None  # 未声明 deadline:兼容路径不要求私有布局

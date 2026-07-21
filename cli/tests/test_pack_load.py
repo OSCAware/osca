@@ -629,3 +629,38 @@ def test_dir_mode_abort_at_index_write_boundary(make_pkg, base, monkeypatch):
     assert not result.ok and root is None
     assert any("索引写入边界复核止步" in line for line in result.lines)
     assert not (pkg / "indexes" / "judgments.index.yaml").exists()  # 零发布
+
+
+def test_load_uses_publish_reservation_protocol(make_pkg, base, tmp_path):
+    """五轮复核 P1：abort 实现栅栏协议时,不可逆发布(索引 publish/dest 切换)在 begin/end 预约内
+    执行;begin 被拒即零发布。"""
+    zip1 = _packed(make_pkg, base, tmp_path)
+
+    class Fence:
+        def __init__(self):
+            self.events: list[str] = []
+
+        def __call__(self):
+            return None
+
+        def begin(self):
+            self.events.append("begin")
+            return None
+
+        def end(self):
+            self.events.append("end")
+
+    fence = Fence()
+    dest = tmp_path / "deploy"
+    result, root = load_osca(zip1, dest=dest, abort=fence)
+    assert result.ok, result.render("load")
+    assert fence.events == ["begin", "end", "begin", "end"]  # 索引发布 + dest 切换各一次预约,恒配对
+
+    class RejectFence(Fence):
+        def begin(self):
+            return "已作废（测试）"
+
+    dest2 = tmp_path / "deploy2"
+    result, root = load_osca(zip1, dest=dest2, abort=RejectFence())
+    assert not result.ok and root is None
+    assert not dest2.exists()  # begin 被拒:零发布、dest 未被触碰

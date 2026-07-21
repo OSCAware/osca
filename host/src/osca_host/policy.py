@@ -27,6 +27,7 @@ kill_switch 可求值形式两种（SPEC v0.4 §4）：
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import threading
@@ -49,6 +50,8 @@ from osca_host.challenge import (  # W3 审批：绑定挑战替换旧无绑定 
 )
 
 __all__ = ["PolicyInterceptor", "REDACTORS", "ledger_stats", "parse_quantity", "replay_health"]
+
+log = logging.getLogger("osca-host")
 
 # 边界用数字负向断言而非 \b：中文与数字同属正则「单词字符」，
 # 「手机号13812345678」这类紧邻写法在 \b 下无边界、会整条漏掉（Review 八轮实测）
@@ -207,6 +210,8 @@ class PolicyInterceptor:
         # 文件 I/O 全在锁外——卡死的 fsync/link 绝不把 revoke/关停一起卡死（有界关停语义）
         self._commit_cv = threading.Condition(self._gate)
         self._final_commits_inflight = 0
+        self._final_commit_seq = 0  # 终局提交唯一 ID（六项复核 P2：悬挂/迟到留痕可指认到笔）
+        self._final_commit_ids: set[str] = set()
         self.final_commit_grace = 2.0  # revoke 等在途终局提交收尾的上限（秒）；超时明标悬挂，不无界等
         state, reason = self._eval_kill_switch(policy, ledger_stats)
         # 装载时无先前安全状态可保留：unavailable 以「未触发 + 警告留痕」起步——
@@ -357,32 +362,48 @@ class PolicyInterceptor:
                     break
                 self._commit_cv.wait(remaining)
             hung = self._final_commits_inflight
+            hung_ids = "、".join(sorted(self._final_commit_ids)) or "?"
         self._record("deny", None, self.package_id, f"包停/撤销：{reason}——在途剧集步间即停，后续调用全部拒绝")
         if hung:
-            self._record(
-                "warn",
-                None,
-                self.package_id,
-                f"revoke 时 {hung} 个终局提交仍悬挂于存储（有界等待 {self.final_commit_grace:.0f}s 超时）——"
-                "其发布可能迟到落地（存储卡死边界，明标；修复存储后核对账本）",
+            detail = (
+                f"revoke 时 {hung} 个终局提交仍悬挂于存储（{hung_ids}；有界等待 "
+                f"{self.final_commit_grace:.0f}s 超时）——其发布可能迟到落地（存储卡死边界，明标；"
+                "修复存储后按提交 ID 核对账本）"
             )
+            self._record("warn", None, self.package_id, detail)
+            # Host 级日志（六项复核 P2）：unload 会把 policy pop 出 status 可达面——审计条目随之
+            # 不可读。悬挂必须落 Host 日志才对运维可观测。
+            log.error(f"[{self.package_id}] {detail}")
 
     def begin_final_commit(self) -> tuple[bool, str]:
         """终局提交预约（四轮复核 P1 短事务协议）：gate 内**纯内存**登记在途提交——revoked 后新预约
         一律拒绝。不可逆发布的文件 I/O 在锁外执行,完成后 end_final_commit 归还。与 revoke 的
-        栅栏配合：revoke 返回后零新提交开始;在途提交由 revoke 有界等待收尾。"""
+        栅栏配合：revoke 返回后零新提交开始;在途提交由 revoke 有界等待收尾。
+        返回 (True, 提交唯一 ID「FC-xxxx」) 或 (False, 拒绝原因)——ID 用于悬挂/迟到留痕指认。"""
         with self._gate:
             if self.revoked:
                 self._record("deny", None, self.package_id, f"终局提交拒绝：包已停（{self.revoked}）")
                 return False, f"包已停：{self.revoked}"
             self._final_commits_inflight += 1
-            return True, ""
+            self._final_commit_seq += 1
+            commit_id = f"FC-{self._final_commit_seq:04d}"
+            self._final_commit_ids.add(commit_id)
+            return True, commit_id
 
-    def end_final_commit(self) -> None:
-        """归还终局提交预约（与 begin 配对,finally 里调）。"""
+    def end_final_commit(self, commit_id: str | None = None) -> None:
+        """归还终局提交预约（与 begin 配对,finally 里调）。包停后才收尾的提交（悬挂后迟到完成/
+        失败）写 Host 级终态留痕（六项复核 P2）——unload 已 pop policy 时审计不可读,日志兜底。"""
         with self._gate:
             self._final_commits_inflight = max(0, self._final_commits_inflight - 1)
+            if commit_id is not None:
+                self._final_commit_ids.discard(commit_id)
             self._commit_cv.notify_all()
+            late = bool(self.revoked)
+        if late:
+            log.warning(
+                f"[{self.package_id}] 终局提交 {commit_id or '?'} 在包停/关停之后收尾（完成或失败）——"
+                "终态留痕，请按提交 ID 核对账本"
+            )
 
     # ── 工具白名单（默认拒绝） ─────────────────────────────────────────
 

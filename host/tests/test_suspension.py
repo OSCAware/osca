@@ -297,17 +297,21 @@ def test_persist_persistent_storage_fault_still_no_resurrection(store, monkeypat
     """收回 unlink 成功、但删除耐久性未知（收回后的目录 fsync 也失败）：崩溃后快照可复活——
     进入显式存储故障态（三轮复核 P2）,不得按 L1 继续运行。"""
     s, tmp = store
+    calls = {"dir": 0}
     real_fsync = os.fsync
 
-    def always_fail_dir_fsync(fd):
+    def fail_from_second_dir_fsync(fd):
         if fd == s._fd:
-            raise OSError("持续存储故障")
+            calls["dir"] += 1
+            if calls["dir"] >= 2:  # intent 建立成功;post-rename 与收回后的 fsync 持续失败
+                raise OSError("持续存储故障")
         return real_fsync(fd)
 
-    monkeypatch.setattr(os, "fsync", always_fail_dir_fsync)
+    monkeypatch.setattr(os, "fsync", fail_from_second_dir_fsync)
     with pytest.raises(OSError):
         s.persist("EO-df", {"operation_id": "EO-df"})
     assert not (tmp / "susp-EO-df.json").exists()  # unlink 成功即收回（fsync 失败不阻止收回）
+    assert (tmp / "susp-EO-df.json.intent").exists()  # intent 保留——崩溃复活也按可疑跳过（五轮 P1）
     assert s.storage_fault is not None and "耐久性未知" in s.storage_fault  # 显式降级,非静默 L1
     monkeypatch.undo()
     assert s.load_all() == []  # 故障态禁止重挂
@@ -318,11 +322,14 @@ def test_reclaim_unlink_failure_enters_storage_fault(store, monkeypatch):
     """三轮复核 P2：目录 fsync 失败且收回 unlink 也失败——盘上留孤本,不得再宣称「退回 L1」：
     进入显式存储故障态,persist/重挂全停（fail-closed,要求运维修复）。"""
     s, tmp = store
+    calls = {"dir": 0}
     real_fsync, real_unlink = os.fsync, os.unlink
 
     def fail_dir_fsync(fd):
         if fd == s._fd:
-            raise OSError("目录 fsync 失败")
+            calls["dir"] += 1
+            if calls["dir"] >= 2:  # intent 建立成功;post-rename 起持续失败
+                raise OSError("目录 fsync 失败")
         return real_fsync(fd)
 
     def fail_susp_unlink(name, *args, **kwargs):
@@ -349,11 +356,14 @@ def test_storage_fault_marker_survives_restart(store, monkeypatch, tmp_path):
     from osca_host.suspension import FAULT_MARKER, SuspensionStore
 
     s, tmp = store
+    calls = {"dir": 0}
     real_fsync, real_unlink = os.fsync, os.unlink
 
     def fail_dir_fsync(fd):
         if fd == s._fd:
-            raise OSError("目录 fsync 失败")
+            calls["dir"] += 1
+            if calls["dir"] >= 2:  # intent 建立成功;post-rename 起持续失败
+                raise OSError("目录 fsync 失败")
         return real_fsync(fd)
 
     def fail_susp_unlink(name, *args, **kwargs):
@@ -384,5 +394,118 @@ def test_storage_fault_marker_survives_restart(store, monkeypatch, tmp_path):
     try:
         healthy = SuspensionStore(fd3)
         assert healthy.storage_fault is None  # 显式确认后方可恢复
+        # 五轮复核 P1：只删 marker **不会**复活孤本——孤本带未了结的 write-ahead intent,按可疑跳过。
+        # 崩溃安全由 rename 前耐久建立的 intent 承担,不再依赖 marker 自身的耐久性。
+        assert (tmp / "susp-EO-orphan.json").exists() and (tmp / "susp-EO-orphan.json.intent").exists()
+        assert healthy.load_all() == []
     finally:
         os.close(fd3)
+
+
+# ── write-ahead intent 联锁（五轮复核 P1/P2/P3） ──
+
+
+def test_normal_persist_leaves_no_intent(store):
+    s, tmp = store
+    assert s.persist("EO-clean", {"operation_id": "EO-clean"}) is True
+    assert not (tmp / "susp-EO-clean.json.intent").exists()  # 生命周期证毕:intent 已耐久移除
+    assert s.load_all() == [{"operation_id": "EO-clean"}]
+    s.delete("EO-clean")
+    assert not any(p.name.endswith(".intent") for p in tmp.iterdir())
+
+
+def test_intent_fsync_failure_aborts_before_any_snapshot(store, monkeypatch):
+    """intent 自身建不耐久（第 1 次目录 fsync 失败）→ rename 之前干净中止:零快照、零残留、不降级。"""
+    s, tmp = store
+    calls = {"dir": 0}
+    real_fsync = os.fsync
+
+    def fail_first_dir_fsync(fd):
+        if fd == s._fd:
+            calls["dir"] += 1
+            if calls["dir"] == 1:
+                raise OSError("intent 目录 fsync 失败")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_first_dir_fsync)
+    with pytest.raises(OSError):
+        s.persist("EO-ia", {"operation_id": "EO-ia"})
+    assert not (tmp / "susp-EO-ia.json").exists()  # rename 未发生
+    assert not (tmp / "susp-EO-ia.json.intent").exists()  # 干净中止,intent 一并撤
+    assert s.storage_fault is None
+    assert s._ops == {}
+
+
+def test_orphan_with_intent_skipped_even_without_marker(tmp_path):
+    """五轮复核 P1 核心：孤本压制**不依赖 marker 耐久性**——盘上只有孤本+intent（marker 因存储
+    故障没写成/丢失）,新 store 照样按可疑跳过,不重挂。"""
+    (tmp_path / "susp-EO-o.json").write_text('{"operation_id": "EO-o"}', encoding="utf-8")
+    (tmp_path / "susp-EO-o.json.intent").write_text("pending", encoding="utf-8")
+    fd = os.open(str(tmp_path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fresh = SuspensionStore(fd)
+        assert fresh.storage_fault is None  # 无 marker——但联锁不靠它
+        assert fresh.load_all() == []  # intent 尚存 → 可疑跳过
+        assert (tmp_path / "susp-EO-o.json").exists()  # 只跳过不删——留给运维核对
+    finally:
+        os.close(fd)
+
+
+def test_stale_intent_without_snapshot_cleaned(store):
+    """崩于 rename 之前:盘上只剩 intent——load_all 清理且不炸、不影响正常快照。"""
+    s, tmp = store
+    (tmp / "susp-EO-ghost.json.intent").write_text("pending", encoding="utf-8")
+    s.persist("EO-live", {"operation_id": "EO-live"})
+    assert s.load_all() == [{"operation_id": "EO-live"}]
+    assert not (tmp / "susp-EO-ghost.json.intent").exists()  # stale intent 已清理
+
+
+def test_persist_refused_when_fault_entered_during_file_ops(store, monkeypatch):
+    """五轮复核 P2：文件操作期间另一线程进故障态——写后复核收回快照（intent 保留）,不返回 True。"""
+    s, tmp = store
+    real_rename = os.rename
+
+    def rename_then_fault(src, dst, **kwargs):
+        result = real_rename(src, dst, **kwargs)
+        if str(dst).startswith("susp-EO-race"):
+            s._enter_storage_fault("并发操作故障（测试注入:rename 后、复核前进故障态）")
+        return result
+
+    monkeypatch.setattr(os, "rename", rename_then_fault)
+    assert s.persist("EO-race", {"operation_id": "EO-race"}) is False  # 不得宣称持久成功
+    monkeypatch.undo()
+    assert not (tmp / "susp-EO-race.json").exists()  # 已收回
+    assert (tmp / "susp-EO-race.json.intent").exists()  # intent 保留(重启按可疑)
+    assert s.load_all() == []  # 故障态禁止重挂
+    assert s._ops == {}
+
+
+def test_load_all_invalidated_when_fault_enters_during_scan(store, monkeypatch):
+    """五轮复核 P2：扫描期间进故障态——本次结果整体作废,不半截可信。"""
+    s, tmp = store
+    s.persist("EO-scan", {"operation_id": "EO-scan"})
+    real_open = os.open
+
+    def open_then_fault(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        if isinstance(path, str) and path == "susp-EO-scan.json":
+            s._enter_storage_fault("扫描期间故障（测试注入）")
+        return fd
+
+    monkeypatch.setattr(os, "open", open_then_fault)
+    assert s.load_all() == []  # 扫描后复核:整体作废
+    monkeypatch.undo()
+
+
+def test_binary_fault_marker_enters_fault_not_crash(tmp_path):
+    """六项复核 P3：marker 内容非 UTF-8——构造器不许炸(UnicodeDecodeError),按不可读标记进故障态。"""
+    from osca_host.suspension import FAULT_MARKER
+
+    (tmp_path / FAULT_MARKER).write_bytes(b"\xff\xfe\x00binary")
+    fd = os.open(str(tmp_path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fresh = SuspensionStore(fd)  # 不抛异常
+        assert fresh.storage_fault is not None and "读取失败" in fresh.storage_fault
+        assert fresh.load_all() == []
+    finally:
+        os.close(fd)

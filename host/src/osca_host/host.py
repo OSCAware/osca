@@ -43,12 +43,31 @@ from osca_host.registry import Registry, RegistryError
 from osca_host.runner import run_episode
 from osca_host.settle import settle_episode
 from osca_host.suspension import SuspensionStore
-from osca_host.threads import run_in_daemon_thread
+from osca_host.threads import PublishFence, run_in_daemon_thread
 from osca_host.triggers import Subscription, TriggerTable
 
 log = logging.getLogger("osca-host")
 
 EPISODE_LEDGER_CAP = 100  # 剧集台账只留近期；持久归档随 M3 采集器/账本落地
+
+
+class _AbortFence:
+    """packer 发布栅栏适配（五轮复核 P1）：__call__ 是快路径检查（无预约），begin/end 走 Host
+    全局 PublishFence——packer 的不可逆发布（索引 publish / dest 切换）在预约内执行，
+    _begin_draining/_unload 以 barrier 有界等待收尾。"""
+
+    def __init__(self, fence: PublishFence, check):
+        self._fence = fence
+        self._check = check
+
+    def __call__(self) -> str | None:
+        return self._check()
+
+    def begin(self) -> str | None:
+        return self._fence.begin(self._check)
+
+    def end(self) -> None:
+        self._fence.end()
 
 
 class HostState(Enum):
@@ -103,6 +122,10 @@ class Host:
         self._last_unload_operation = 0
         self._control_tasks: set[asyncio.Task] = set()
         self._episode_shutdown_timeout = 60.0  # 关停等在跑剧集的上限（秒）；测试可注入缩短
+        # 装载发布栅栏（五轮复核 P1）：packer 的索引 publish/dest 切换走 begin/end 预约,
+        # 关停与 unload 在条件生效后 barrier 有界收尾——「检查已过、syscall 未执行」窗关死
+        self._load_fence = PublishFence()
+        self._load_fence_grace = 2.0
 
     # ── 控制命令（schema 与授权已在 ControlServer 裁决后才进到这里） ──────
 
@@ -199,6 +222,14 @@ class Host:
         for _, _, task in self._load_slots.values():
             if not task.done():
                 task.cancel()
+        # 发布收尾栅栏（五轮复核 P1）：作废条件（state/generation）已生效——有界等待在途的
+        # 索引 publish/dest 切换收尾;悬挂（存储卡死）明标,不无界阻塞关停
+        hung = self._load_fence.barrier(self._load_fence_grace)
+        if hung:
+            log.error(
+                f"关停栅栏：{hung} 个装载发布仍悬挂于存储（有界等待 {self._load_fence_grace:.0f}s 超时）——"
+                "其磁盘发布可能迟到落地（存储卡死边界,明标;修复存储后核对部署目录）"
+            )
         self._stop.set()
 
     async def _request_load(self, deployment_id: str, spec: dict) -> dict:
@@ -271,7 +302,10 @@ class Host:
 
         def _build():
             result, loaded = load_for_host(
-                str(spec.get("path")), dest=spec.get("dest"), bindings=spec.get("bindings"), abort=_abort
+                str(spec.get("path")),
+                dest=spec.get("dest"),
+                bindings=spec.get("bindings"),
+                abort=_AbortFence(self._load_fence, _abort),
             )
             pkg_bindings: dict = {}
             replay_kill_unprovable = False
@@ -379,6 +413,13 @@ class Host:
         deployment_id = self._package_deployments.pop(package_id, None)
         if deployment_id is not None:
             self._deployment_generations[deployment_id] = self._deployment_generations.get(deployment_id, 0) + 1
+        # 发布收尾栅栏（五轮复核 P1）：tombstone/generation 已生效——有界等待在途装载发布收尾
+        hung = self._load_fence.barrier(self._load_fence_grace)
+        if hung:
+            log.error(
+                f"unload 栅栏：{hung} 个装载发布仍悬挂于存储（有界等待 {self._load_fence_grace:.0f}s 超时）——"
+                "其磁盘发布可能迟到落地（存储卡死边界,明标）"
+            )
         removed = self.table.unsubscribe(package_id)
         for key in [k for k in self.gates if k[0] == package_id]:
             del self.gates[key]

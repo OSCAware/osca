@@ -32,6 +32,7 @@ log = logging.getLogger("osca-host")
 PREFIX = "susp-"
 SUFFIX = ".json"
 FAULT_MARKER = "storage-fault.marker"  # 持久故障标记（四轮复核 P2）：活过重启，运维修复后手工删除
+INTENT_SUFFIX = ".intent"  # write-ahead 意向标记（五轮复核 P1）：rename 前耐久建立、生命周期证毕后耐久移除
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
@@ -103,8 +104,10 @@ class SuspensionStore:
             log.error(f"挂起持久层带故障标记启动——persist/重挂停用：{self.storage_fault}")
         except FileNotFoundError:
             pass
-        except OSError as e:  # 标记在但读不了——同样按故障态处理（fail-closed）
-            self.storage_fault = f"存储故障标记读取失败（{e}）——按故障态处理"
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            # 标记在但读不了/内容损坏（六项复核 P3：非 UTF-8 曾抛 UnicodeDecodeError 炸构造器）——
+            # 一律按故障态恢复（fail-closed），不许中断 Store/Host 初始化
+            self.storage_fault = f"存储故障标记读取失败（{type(e).__name__}）——按故障态处理"
             log.error(self.storage_fault)
 
     def _fault(self) -> str | None:
@@ -205,7 +208,7 @@ class SuspensionStore:
             with st.lock:
                 with self._registry:
                     invalidated = st.delete_gen != ticket.token
-                    fault = self.storage_fault  # 与 fault 迁移共享存储级 gate（四轮复核 P2：无并发穿越窗）
+                    fault = self.storage_fault  # 与 fault 迁移共享存储级 gate（四轮复核 P2）
                 if fault:
                     log.warning(f"挂起持久层已进入存储故障态（写前复核），拒绝持久化：{operation_id}")
                     return False
@@ -213,24 +216,34 @@ class SuspensionStore:
                     log.info(f"挂起快照落盘前已被恢复作废（决定竞态），放弃写盘：{operation_id}")
                     return False
                 name = self._name(operation_id)
+                intent = name + INTENT_SUFFIX
                 tmp = name + ".tmp"
-                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW, 0o600, dir_fd=self._fd)
+                renamed = False
                 try:
+                    # ① write-ahead intent（五轮复核 P1）：rename **之前**耐久建立意向标记——此后任何
+                    # 失败/崩溃，快照都因 intent 尚存被 load_all 按可疑跳过（不复活）；intent 自身建
+                    # 不耐久则在 rename 前就中止（零快照，安全侧）。崩溃恢复的正确性由此**不再依赖**
+                    # 故障 marker 的耐久性（marker 只是运维 UX 的带子）。
+                    ifd = os.open(intent, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW, 0o600, dir_fd=self._fd)
+                    with os.fdopen(ifd, "wb") as f:
+                        f.write(b"pending\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.fsync(self._fd)  # intent 目录项耐久——失败即抛，rename 不会发生
+                    # ② 快照本体
+                    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW, 0o600, dir_fd=self._fd)
                     with os.fdopen(fd, "wb") as f:
                         f.write(blob)
                         f.flush()
                         os.fsync(f.fileno())
                     os.rename(tmp, name, src_dir_fd=self._fd, dst_dir_fd=self._fd)  # 原子替换
+                    renamed = True
                     try:
-                        # rename 后同步目录（P1）：只 fsync 文件不 fsync 目录，断电可把已落名快照回滚成
-                        # 不存在（rename 丢失）。同步失败按 OSError 上抛——调用方按落盘失败退回 L1。
+                        # rename 后同步目录（P1）：断电可把已落名快照回滚成不存在（rename 丢失）。
                         os.fsync(self._fd)
                     except OSError:
-                        # durability-unknown（存储故障，复核 P2）：rename 已成、耐久未证——必须**收回**
-                        # 刚落名的快照，否则「退回 L1、不活过重启」是谎话（load_all 会读回）。
-                        # 收回自身失败 = 盘上留孤本 / 收回后的目录 fsync 失败 = 删除耐久性未知（崩溃
-                        # 可复活）——两者都不许再按 L1 继续运行：进入显式存储故障态（persist/重挂
-                        # 全停，要求运维修复），不是静默降级。
+                        # durability-unknown（四轮复核 P2）：收回刚落名的快照；收回失败/收回耐久未知
+                        # → 显式存储故障态。intent **保留**——即便孤本/复活，重启也按可疑跳过（五轮 P1）。
                         try:
                             os.unlink(name, dir_fd=self._fd)
                         except OSError as unlink_error:
@@ -244,8 +257,27 @@ class SuspensionStore:
                 except BaseException:
                     with contextlib.suppress(OSError):
                         os.unlink(tmp, dir_fd=self._fd)
-                        os.fsync(self._fd)  # 临时名清理同样耐久（best-effort，不掩盖原异常）
+                    if not renamed:
+                        # rename 未发生：干净中止——intent 一并撤（不留待清理的悬疑标记）
+                        with contextlib.suppress(OSError):
+                            os.unlink(intent, dir_fd=self._fd)
+                    with contextlib.suppress(OSError):
+                        os.fsync(self._fd)  # 清理同样耐久（best-effort，不掩盖原异常）
                     raise
+                # ③ 写后故障复核（五轮复核 P2）：文件操作期间另一线程可能已进故障态——已落名快照按
+                # 可疑收回（intent 保留），不得返回 True（不对故障存储宣称持久成功）
+                with self._registry:
+                    faulted = self.storage_fault
+                if faulted:
+                    with contextlib.suppress(OSError):
+                        os.unlink(name, dir_fd=self._fd)
+                        os.fsync(self._fd)
+                    log.warning(f"存储故障态期间完成的快照已收回（intent 保留，重启按可疑跳过）：{operation_id}")
+                    return False
+                # ④ 生命周期证毕：耐久移除 intent——移除失败按 OSError 上抛（快照留着 intent，
+                # 重启按可疑跳过，fail-closed：persist 失败 = 不作持久承诺）
+                os.unlink(intent, dir_fd=self._fd)
+                os.fsync(self._fd)
             return True
         finally:
             self._release_ticket(ticket, allowed=_CLAIMED)  # 认领过的票由此 exactly-once 归还
@@ -263,6 +295,8 @@ class SuspensionStore:
             with st.lock:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(self._name(operation_id), dir_fd=self._fd)
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(self._name(operation_id) + INTENT_SUFFIX, dir_fd=self._fd)  # 意向标记随快照清理
                 # unlink 后同步目录（P1）：断电可把删除回滚——已兑现写入的旧快照复活会被重挂重批
                 # **重复写**。同步失败 OSError 上抛：调用方保留挂起态待清扫重试，绝不带着「删没删成
                 # 不确定」推进真写。
@@ -284,9 +318,15 @@ class SuspensionStore:
             names = os.listdir(self._fd)
         except OSError:
             return out
+        name_set = set(names)
         for name in names:
             if not name.startswith(PREFIX) or not name.endswith(SUFFIX):
-                continue  # tmp（.json.tmp）与 socket/token/lock 一并排除
+                continue  # tmp（.json.tmp）/intent 与 socket/token/lock 一并排除
+            if name + INTENT_SUFFIX in name_set:
+                # write-ahead intent 尚存（五轮复核 P1）：该快照的生命周期未证完成（崩于目录 fsync/
+                # 收回失败的孤本/删除耐久性未知后的复活）——按可疑跳过不重挂，请运维核对后清理
+                log.warning(f"挂起快照带未了结的 write-ahead intent——按可疑跳过不重挂，请运维核对：{name}")
+                continue
             try:
                 fd = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=self._fd)
                 with os.fdopen(fd, "rb") as f:
@@ -298,4 +338,19 @@ class SuspensionStore:
                 log.warning(f"挂起快照非 mapping，跳过：{name}")
                 continue
             out.append(obj)
+        # 清理无快照的 stale intent（崩于 rename 之前）——**在途 persist 的 intent 勿动**（其
+        # operation 仍在注册表；动了会拆掉正在建立的联锁）
+        for name in names:
+            if not name.endswith(INTENT_SUFFIX) or name[: -len(INTENT_SUFFIX)] in name_set:
+                continue
+            opid = name[len(PREFIX) : -len(SUFFIX + INTENT_SUFFIX)] if name.startswith(PREFIX) else ""
+            with self._registry:
+                inflight = opid in self._ops
+            if not inflight:
+                with contextlib.suppress(OSError):
+                    os.unlink(name, dir_fd=self._fd)
+        # 扫描后复核（五轮复核 P2）：扫描期间进故障态 → 结果整体作废（不半截可信）
+        if self._fault():
+            log.error("挂起持久层在扫描期间进入存储故障态——本次重挂结果整体作废")
+            return []
         return out
