@@ -169,9 +169,19 @@ class SuspensionStore:
                         f.flush()
                         os.fsync(f.fileno())
                     os.rename(tmp, name, src_dir_fd=self._fd, dst_dir_fd=self._fd)  # 原子替换
-                    # rename 后同步目录（P1）：只 fsync 文件不 fsync 目录，断电可把已落名快照回滚成
-                    # 不存在（rename 丢失）。同步失败按 OSError 上抛——调用方按落盘失败退回 L1，不假报持久。
-                    os.fsync(self._fd)
+                    try:
+                        # rename 后同步目录（P1）：只 fsync 文件不 fsync 目录，断电可把已落名快照回滚成
+                        # 不存在（rename 丢失）。同步失败按 OSError 上抛——调用方按落盘失败退回 L1。
+                        os.fsync(self._fd)
+                    except OSError:
+                        # durability-unknown（存储故障，复核 P2）：rename 已成、耐久未证——若把已落名
+                        # 文件留在盘上，「退回 L1、不活过重启」就是谎话（load_all 之后仍会重挂）。
+                        # fail-closed：**收回**刚落名的快照（best-effort unlink + 目录同步），确保
+                        # 失败后不会在未来意外重挂；收回也失败（存储彻底坏）仍上抛原故障留痕。
+                        with contextlib.suppress(OSError):
+                            os.unlink(name, dir_fd=self._fd)
+                            os.fsync(self._fd)
+                        raise
                 except BaseException:
                     with contextlib.suppress(OSError):
                         os.unlink(tmp, dir_fd=self._fd)

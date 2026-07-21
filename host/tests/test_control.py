@@ -1431,3 +1431,187 @@ async def test_enable_disable_status_not_self_contradictory(running_host, sample
     (gate,) = pkg["gates"]
     assert aware["enabled"] is True and gate["enabled"] is True
     assert [w["state"] for w in pkg["watchers"]] == ["armed"] * 3
+
+
+# ── 复核 P1：订阅代际固化 / STOPPED 后零迟到副作用 / 卡死重活下进程限期退出 ──
+
+
+async def test_old_subscription_closure_holds_old_generation(running_host, sample_pack, deploy):
+    """旧订阅闭包（disable 前创建）在 disable→enable 之后才执行——代际固化于创建时,永久失效。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    old_deliver = host._make_deliver(pid, "AW-001")  # 装载期创建的旧订阅闭包
+    host._set_aware(pid, "AW-001", False)
+    host._set_aware(pid, "AW-001", True)
+    why = await old_deliver("AW-001/T3")  # 旧闭包此刻才开始执行——已拿不到新代际
+    assert why is not None and "永久失效" in why
+    assert host.episodes == {}
+
+
+async def test_queued_old_subscription_after_disable_enable_zero_publish(running_host, sample_pack, deploy):
+    """复核 P1 场景复刻：共享 watcher 派发快照里,A 订阅阻塞、B 旧订阅排队;期间 disable→enable;
+    旧 B 回调随后才开始执行——必须零发布（代际在订阅创建时固化,不在回调开始时读取）。"""
+    from osca_host.triggers import Subscription
+
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    watcher = next(w for w in host.table.watchers.values() if any(s.trigger_id == "AW-001/T3" for s in w.subs))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def blocking_deliver(trigger_id):
+        entered.set()
+        await release.wait()
+
+    watcher.subs.insert(0, Subscription(pid, "AW-000", "AW-000/TX", blocking_deliver))
+    fire_task = asyncio.create_task(host.table._fire(watcher))
+    await asyncio.wait_for(entered.wait(), timeout=5)  # A 阻塞;B 旧订阅仍在派发快照里排队
+    host._set_aware(pid, "AW-001", False)
+    host._set_aware(pid, "AW-001", True)  # 新订阅换新代际;旧订阅永久持旧代际
+    release.set()
+    await asyncio.wait_for(fire_task, timeout=5)  # 旧 B 回调此刻才开始执行
+    assert host.episodes == {}  # 零发布
+    assert host.gates[(pid, "AW-001")].wakes == 0
+
+
+async def test_no_late_settle_write_after_stopped(running_host, sample_pack, deploy):
+    """复核 P1：STOPPED 后迟到副作用绝不发生——卡在对账之前的线程于 STOPPED 后才继续,零落账。"""
+    import threading
+
+    from osca_host.episode import Episode
+    from osca_host.settle import settle_episode
+
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    loaded, proxy = host.registry.packages[pid], host.proxies[pid]
+    episode = Episode(
+        episode_id="EP-0777",
+        package_id=pid,
+        aware_id="AW-001",
+        fired_trigger="AW-001/T3",
+        assembled_at="2026-07-21T09:00:00+08:00",
+        then="STR-001",
+        budget={},
+        context={
+            "objects": {
+                "OBJ-009": {
+                    "object_id": "OBJ-009",
+                    "kind": "objective",
+                    "optimize": "maximize",
+                    "settle": {"uses": "CON-001.拉取费用明细"},
+                }
+            },
+            "judgments": [],
+        },
+        status="completed",
+        steps=[{"step": "寻优", "performer": "optimizer", "status": "done", "output": {"x": 1}}],
+    )
+    release = threading.Event()
+
+    def late_settle():
+        release.wait(10)  # 卡到 STOPPED 之后才继续
+        return settle_episode(loaded, proxy, episode)
+
+    late = asyncio.create_task(host._run_in_daemon_thread(late_settle))
+    host._episode_tasks.add(late)
+    late.add_done_callback(host._episode_tasks.discard)
+    await asyncio.sleep(0)
+    host._episode_shutdown_timeout = 0.2
+    host._stop.set()
+    for _ in range(200):
+        if host.state.name == "STOPPED":
+            break
+        await asyncio.sleep(0.05)
+    assert host.state.name == "STOPPED"
+    cases_before = sorted(p.name for p in (loaded.root / "cases").glob("*.yaml"))
+    release.set()  # STOPPED 之后线程才继续跑到对账
+    results = await asyncio.wait_for(late, timeout=5)
+    assert results and all(not r["settled"] for r in results)  # 迟到对账零落账
+    assert sorted(p.name for p in (loaded.root / "cases").glob("*.yaml")) == cases_before
+    assert all("包已停" in r["note"] for r in results)  # 授权层/落账门按 revoke 拒绝留痕
+
+
+async def test_settle_dispatched_on_daemon_thread(running_host, sample_pack, deploy, monkeypatch):
+    """复核 P1：settle 不进默认 executor——经统一守护线程模型执行（卡死不阻塞进程退出）。"""
+    import threading
+
+    import osca_host.host as host_mod
+    from osca_host.episode import Episode
+
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    loaded, proxy, policy = host.registry.packages[pid], host.proxies[pid], host.policies[pid]
+    seen: dict[str, bool] = {}
+
+    def fake_run_episode(episode, *args, **kwargs):
+        episode.status = "completed"
+        return episode
+
+    def fake_settle(loaded, proxy, episode):
+        seen["daemon"] = threading.current_thread().daemon
+        return []
+
+    monkeypatch.setattr(host_mod, "run_episode", fake_run_episode)
+    monkeypatch.setattr(host_mod, "settle_episode", fake_settle)
+    episode = Episode(
+        episode_id="EP-0778",
+        package_id=pid,
+        aware_id="AW-001",
+        fired_trigger="AW-001/T3",
+        assembled_at="2026-07-21T09:00:00+08:00",
+        then="STR-001",
+        budget={},
+        context={"objects": {}, "judgments": []},
+    )
+    await host._execute_episode(episode, loaded, proxy, policy)
+    assert seen["daemon"] is True
+
+
+def test_process_exits_within_deadline_with_hung_worker(tmp_path):
+    """复核 P1（子进程真实验证）：settle 类重活永久卡死时,进程仍在期限内退出——统一守护线程
+    模型下 asyncio.run 收尾不再等默认 executor;若该重活仍在默认 executor,本用例会超时失败。"""
+    import shutil as shutil_mod
+    import subprocess
+    import sys
+    import tempfile
+    import textwrap
+    import time as time_mod
+
+    workdir = tempfile.mkdtemp(prefix="oscah-", dir="/tmp")
+    sock = f"{workdir}/h.sock"
+    script = textwrap.dedent(
+        f"""
+        import asyncio, threading
+        from pathlib import Path
+        from osca_host.host import Host
+
+        async def main():
+            host = Host(Path({sock!r}))
+            host._episode_shutdown_timeout = 0.2
+            task = asyncio.create_task(host.run())
+            for _ in range(100):
+                if host.control.socket_path.exists():
+                    break
+                await asyncio.sleep(0.01)
+            hung = asyncio.create_task(host._run_in_daemon_thread(threading.Event().wait))  # 永久卡死的重活
+            host._episode_tasks.add(hung)
+            hung.add_done_callback(host._episode_tasks.discard)
+            await asyncio.sleep(0)
+            host._stop.set()
+            await task
+            print("STOPPED", flush=True)
+
+        asyncio.run(main())
+        """
+    )
+    started = time_mod.monotonic()
+    try:
+        proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=20)
+    finally:
+        shutil_mod.rmtree(workdir, ignore_errors=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "STOPPED" in proc.stdout
+    assert time_mod.monotonic() - started < 15  # 进程限期退出（卡死线程随进程消亡）

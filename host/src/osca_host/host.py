@@ -15,7 +15,6 @@ import hashlib
 import logging
 import os
 import signal
-import threading
 import time
 from collections import OrderedDict
 from dataclasses import asdict, replace
@@ -44,6 +43,7 @@ from osca_host.registry import Registry, RegistryError
 from osca_host.runner import run_episode
 from osca_host.settle import settle_episode
 from osca_host.suspension import SuspensionStore
+from osca_host.threads import run_in_daemon_thread
 from osca_host.triggers import Subscription, TriggerTable
 
 log = logging.getLogger("osca-host")
@@ -278,7 +278,7 @@ class Host:
                 replay_kill_unprovable = has_replay_condition and ledger_stamp(loaded.root) is None
             return result, loaded, pkg_bindings, replay_kill_unprovable
 
-        result, loaded, pkg_bindings, replay_kill_unprovable = await asyncio.to_thread(_build)
+        result, loaded, pkg_bindings, replay_kill_unprovable = await run_in_daemon_thread(_build, name="osca-load")
         if loaded is None:
             return {"ok": False, "detail": result.lines}
 
@@ -436,6 +436,12 @@ class Host:
         return {"ok": True, "detail": f"已人工发射 {trigger_id}（裁决见 Host 日志与 status.gates）"}
 
     def _make_deliver(self, package_id: str, aware_id: str):
+        # Aware 代际**固化于订阅闭包创建时**（复核 P1）：若在 deliver 开始执行时才读当前代际，
+        # 共享 watcher 的派发快照里排队的旧订阅回调可能在 disable→enable **之后**才开始执行——
+        # 那时读到的已是新代际，CAS 形同虚设。闭包创建即持永久 token：enable 重建的新订阅拿
+        # 新代际，旧订阅（无论何时才轮到执行）恒持旧代际、恒被拒。
+        subscription_generation = self._aware_generations.get((package_id, aware_id), 0)
+
         async def deliver(trigger_id: str) -> str | None:
             # 投递的两段重活（GPT Review P1 事件循环阻塞）都下线程：账本刷新是磁盘重活（全量 lint +
             # 索引重建），闸门裁决内含 precondition 真取数（经**本代** Connector 代理走真实网络）——原先
@@ -451,9 +457,6 @@ class Host:
                 gate = self.gates.get((package_id, aware_id))
                 policy = self.policies.get(package_id)
                 loaded = self.registry.packages.get(package_id)
-                # Aware 代际快照（P1）：投递开始取当时代际，每个 await 返回后复核——disable 递增代际，
-                # 旧代投递即便撑过 disable→enable（gate/policy/loaded 对象身份全不变）也永久失效
-                aware_generation = self._aware_generations.get((package_id, aware_id), 0)
                 if gate is None:
                     return f"{package_id}/{aware_id} 未布防或已卸载——投递不发布"
 
@@ -466,14 +469,20 @@ class Host:
                         or self.registry.packages.get(package_id) is not loaded
                     ):
                         return "包已卸载/重载——跨代投递不发布"
-                    if self._aware_generations.get((package_id, aware_id), 0) != aware_generation:
-                        return "Aware 已停用（disable）——旧代投递永久失效，不发布"
+                    # 订阅创建时固化的代际 vs 当前代际：disable 递增后旧订阅永久失效——
+                    # 即便旧回调排队到 enable 之后才开始执行也拿不到新代际（复核 P1）
+                    if self._aware_generations.get((package_id, aware_id), 0) != subscription_generation:
+                        return "Aware 已停用（disable）——旧代订阅永久失效，不发布"
                     return None
 
                 if why := stale():  # 进锁即查：fire 短锁状态检查与投递之间的 stop/unload TOCTOU
                     log.info(f"[{package_id}/{aware_id}] {trigger_id} 投递放弃：{why}")
                     return why
-                if policy and loaded and not await asyncio.to_thread(self._refresh_ledger, loaded, policy):
+                if (
+                    policy
+                    and loaded
+                    and not await run_in_daemon_thread(self._refresh_ledger, loaded, policy, name="osca-ledger")
+                ):
                     log.warning(
                         f"[{package_id}/{aware_id}] {trigger_id} 命中 → 账本刷新失败，本次唤醒拒绝（保留旧快照）"
                     )
@@ -484,7 +493,7 @@ class Host:
                 if policy and policy.kill_tripped:
                     log.warning(f"[{package_id}/{aware_id}] {trigger_id} 命中 → 拒绝唤醒：{policy.kill_reason}")
                     return None
-                woke, verdict = await asyncio.to_thread(gate.on_trigger, trigger_id)
+                woke, verdict = await run_in_daemon_thread(gate.on_trigger, trigger_id, name="osca-gate")
                 if why := stale():
                     log.info(f"[{package_id}/{aware_id}] {trigger_id} 投递放弃：{why}")
                     return why
@@ -589,29 +598,10 @@ class Host:
         task.add_done_callback(self._episode_tasks.discard)
 
     async def _run_in_daemon_thread(self, fn, *args):
-        """认知平面重活（run_episode）跑在**守护线程**（P1 关停语义）：asyncio.to_thread 的默认执行器
-        线程不可取消，且 asyncio.run 收尾时会无限等它——「60s 兜底」成空话：网关/写连接器卡死时
-        Host 已报 STOPPED、socket 已删，而进程永不退出、卡死的写还活着。守护线程随进程消亡，
-        关停上限对**进程退出**真实有界；结果经 call_soon_threadsafe 回事件循环（循环已关即丢弃）。"""
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-
-        def _deliver(setter, value) -> None:
-            if not future.done():
-                setter(value)
-
-        def _runner() -> None:
-            try:
-                result = fn(*args)
-            except BaseException as e:  # noqa: BLE001 —— 异常原样回传给 await 方
-                with contextlib.suppress(RuntimeError):  # 循环已关：进程正在退出，结果无处交付
-                    loop.call_soon_threadsafe(_deliver, future.set_exception, e)
-            else:
-                with contextlib.suppress(RuntimeError):
-                    loop.call_soon_threadsafe(_deliver, future.set_result, result)
-
-        threading.Thread(target=_runner, name="osca-episode", daemon=True).start()
-        return await future
+        """认知平面重活（run_episode/settle）跑在**守护线程**（P1 关停语义）：统一有界执行模型见
+        osca_host.threads——默认执行器会让卡死线程阻塞 asyncio.run 收尾与进程退出。「STOPPED 后
+        无迟到副作用」由副作用强制点保证：关停逐包 revoke，迟到线程的外呼/LLM/落账在授权层全拒。"""
+        return await run_in_daemon_thread(fn, *args, name="osca-episode")
 
     async def _execute_episode(self, episode: Episode, loaded, proxy, policy) -> None:
         try:
@@ -638,7 +628,7 @@ class Host:
             return
         # 对账器（组件 7）：objective 型对象自动落 outcome case，不消耗剧集
         try:
-            for entry in await asyncio.to_thread(settle_episode, loaded, proxy, episode):
+            for entry in await self._run_in_daemon_thread(settle_episode, loaded, proxy, episode):
                 if entry["settled"]:
                     log.info(f"对账落账：{entry['object']} → {entry['case']}（现实是第二位专家，公理 A2）")
                 else:
@@ -728,7 +718,7 @@ class Host:
                 return
             if self._suspension_store is not None:
                 try:
-                    await asyncio.to_thread(self._suspension_store.delete, episode.operation_id)
+                    await run_in_daemon_thread(self._suspension_store.delete, episode.operation_id, name="osca-susp")
                 except OSError as e:
                     log.warning(f"删除挂起快照失败，保留挂起态待清扫重试（不推进假 running）：{episode_id}（{e}）")
                     return
@@ -780,7 +770,7 @@ class Host:
             store.persist(episode.operation_id, record, ticket=ticket)
 
         try:
-            await asyncio.to_thread(_stamp_and_persist)
+            await run_in_daemon_thread(_stamp_and_persist, name="osca-susp")
         except OSError as e:  # 磁盘满/权限/fd 已关等——真正退回 L1（对抗审查 minor-1：不炸成未处理 task 异常）
             log.warning(f"挂起快照落盘失败（该剧集退回 L1、不活过重载/重启）：{e}")
             # 异常可能发生在 persist 之前（指纹计算）——兜底归还在途凭据。凭据释放**幂等**（GPT 四审
@@ -820,7 +810,9 @@ class Host:
         policy = self.policies.get(package_id)
         if store is None or loaded is None or policy is None:
             return
-        records, current_stamp = await asyncio.to_thread(lambda: (store.load_all(), self._pack_stamp(loaded)))
+        records, current_stamp = await run_in_daemon_thread(
+            lambda: (store.load_all(), self._pack_stamp(loaded)), name="osca-susp"
+        )
 
         def lifecycle_stale() -> bool:
             return (
@@ -873,7 +865,7 @@ class Host:
             keep.append((episode, challenge, raw_tc, raw_tk))
         if to_delete:
             try:
-                await asyncio.to_thread(lambda: [store.delete(o) for o in to_delete])
+                await run_in_daemon_thread(lambda: [store.delete(o) for o in to_delete], name="osca-susp")
             except OSError as e:
                 # delete 现在含目录 fsync（P1）：存储故障时批量清理可失败——放弃本次重挂（快照仍在盘，
                 # 下次装载再试），绝不带着「删没删成不确定」发布重挂

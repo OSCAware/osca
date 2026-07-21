@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -30,6 +31,16 @@ from osca_host.secret_resolver import EnvVarSecretResolver, SecretResolver
 
 # scheme 允许 `_`（如 sql_readonly://）——否则含下划线的 scheme 主机名抽取落空、host=整串、egress 永远拒
 ENDPOINT_HOST = re.compile(r"^[a-z+_]+://([^/:@]+@)?([A-Za-z0-9.-]+)")
+
+
+def _executor_supports_timeout(executor: Executor) -> bool:
+    """执行器是否接收 timeout（剩余预算传导，复核 P2）。老驱动无参不传——不炸不改契约；
+    逐接口 deadline 仍由调用方（runner）强制，timeout 只是把在途单次外呼也收紧。"""
+    try:
+        params = inspect.signature(executor.execute).parameters
+    except (TypeError, ValueError):
+        return False
+    return "timeout" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _scrub_secret(node: object, secret: str) -> object:
@@ -113,8 +124,12 @@ class ConnectorProxy:
         step: str | None = None,
         episode_id: str | None = None,
         resume: bool = False,
+        timeout: float | None = None,
     ) -> Receipt:
         """按名调用。step=None 为运行时内部调用（precondition/watch 轮询）。
+
+        timeout：调用方剩余时间预算（秒，复核 P2）——转交支持 timeout 的执行器收紧单次外呼；
+        不支持的执行器照旧（deadline 由调用方逐接口强制）。
 
         params：读接口的过滤参数（str）或**写接口被写内容**（结构体，D1 params 穿透）。写接口经审批门时
         以 params 的 sha256 摘要绑定挑战（防偷梁换柱）；读执行器忽略 params、也不过写审批门。
@@ -193,7 +208,7 @@ class ConnectorProxy:
                 else self._execute_mock(endpoint, interface_ref, itf)
             )
         else:
-            payload, error = self._execute_real(endpoint, binding, itf, params, is_write)
+            payload, error = self._execute_real(endpoint, binding, itf, params, is_write, timeout=timeout)
         if error:
             return Receipt(ok=False, interface=interface_ref, binding_ref=binding_ref, error=error)
 
@@ -227,7 +242,7 @@ class ConnectorProxy:
         return {"mock_write": interface_ref, "applied": params, "landed": True}, None
 
     def _execute_real(
-        self, endpoint: str, binding: dict, itf: dict, params: object, is_write: bool
+        self, endpoint: str, binding: dict, itf: dict, params: object, is_write: bool, timeout: float | None = None
     ) -> tuple[object, str | None]:
         """真实执行器分派（W6-3）：egress → secret 前置 → 按 endpoint scheme 分派执行器。
 
@@ -277,6 +292,9 @@ class ConnectorProxy:
         executor = self.executors.get(scheme)
         if executor is None:
             return None, f"不识别的 endpoint scheme「{scheme}」——fail-closed（无对应执行器；生产驱动由部署侧注入）"
+        kwargs = {}
+        if timeout is not None and _executor_supports_timeout(executor):
+            kwargs["timeout"] = timeout  # 剩余预算传导（复核 P2）；老驱动无参不传、不炸
         try:
             payload, error = executor.execute(
                 endpoint=endpoint,
@@ -285,6 +303,7 @@ class ConnectorProxy:
                 secret=secret,
                 is_write=is_write,
                 pack_root=self.pack_root,
+                **kwargs,
             )
         except Exception:
             # 执行器不许炸穿 call()（契约：call() 恒回 Receipt）——任何执行器异常（含可插拔生产驱动的意外异常、

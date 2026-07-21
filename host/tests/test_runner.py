@@ -542,3 +542,89 @@ def test_max_minutes_enforced_after_slow_last_connector_step(loaded, policy, pro
     assert result.status == "stopped", result.stop_reason
     assert "max_minutes" in result.stop_reason
     assert episode.steps and episode.steps[-1]["status"] == "done"  # 步已执行留痕，只是不算 completed
+
+
+def test_max_minutes_blocks_second_ref_within_connector_step(loaded, policy, proxy, monkeypatch):
+    """复核 P2：一步展开多接口时,首接口耗尽预算后**第二个外呼一次都不许发起**（调用次数为 0）,
+    不是只在收尾改判 stopped。"""
+    import osca_host.runner as runner_mod
+    from osca_host.episode import Episode
+
+    class FakeTime:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    fake = FakeTime()
+    monkeypatch.setattr(runner_mod, "time", fake)
+    calls: list[str] = []
+    real_call = proxy.call
+
+    def slow_call(ref, *args, **kwargs):
+        calls.append(ref)
+        fake.now += 120.0  # 首接口吃掉 2 分钟（预算 1 分钟）
+        return real_call(ref, *args, **kwargs)
+
+    monkeypatch.setattr(proxy, "call", slow_call)
+    episode = Episode(
+        episode_id="EP-0043",
+        package_id=loaded.package_id,
+        aware_id="AW-001",
+        fired_trigger="AW-001/T3",
+        assembled_at="2026-07-21T09:00:00+08:00",
+        then="STR-001",
+        budget={"max_minutes": 1},
+        context={
+            "structure": {
+                "pipeline": [{"step": "取数", "performer": "connector", "uses": "CON-001"}]
+            },  # 裸 ID 展开 2 接口
+            "objects": {},
+            "judgments": [],
+        },
+    )
+    result = run_episode(episode, loaded, proxy, policy)
+    assert result.status == "stopped" and "不再发起下一外呼" in result.stop_reason
+    assert len(calls) == 1, calls  # 第二接口调用次数为 0
+    assert episode.steps[-1]["status"] == "stopped" and len(episode.steps[-1]["receipts"]) == 1
+
+
+def test_connector_call_receives_remaining_budget_as_timeout(loaded, policy, proxy, monkeypatch):
+    """复核 P2：可阻塞 connector 接收剩余 timeout——runner 把 max_minutes 剩余秒数传给 proxy.call。"""
+    import osca_host.runner as runner_mod
+    from osca_host.episode import Episode
+
+    class FakeTime:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+    monkeypatch.setattr(runner_mod, "time", FakeTime())
+    seen: list[object] = []
+    real_call = proxy.call
+
+    def spying_call(ref, *args, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        return real_call(ref, *args, **kwargs)
+
+    monkeypatch.setattr(proxy, "call", spying_call)
+    episode = Episode(
+        episode_id="EP-0044",
+        package_id=loaded.package_id,
+        aware_id="AW-001",
+        fired_trigger="AW-001/T3",
+        assembled_at="2026-07-21T09:00:00+08:00",
+        then="STR-001",
+        budget={"max_minutes": 2},
+        context={
+            "structure": {"pipeline": [{"step": "取数", "performer": "connector", "uses": "CON-001.拉取费用明细"}]},
+            "objects": {},
+            "judgments": [],
+        },
+    )
+    result = run_episode(episode, loaded, proxy, policy)
+    assert result.status == "completed", result.stop_reason
+    assert seen == [120.0]  # 剩余预算（2 分钟整,fake clock 未走动）已传导

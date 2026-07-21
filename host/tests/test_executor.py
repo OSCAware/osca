@@ -363,3 +363,28 @@ def test_openapi_write_non_serializable_params_refused_not_rewritten(http_addr):
     """非 JSON 可序列化的 params：显式拒绝（fail-closed），绝不静默改写后落地。"""
     payload, err = _run_http(http_addr, {"method": "POST", "path": "/write"}, object(), is_write=True)
     assert payload is None and "非 JSON 可序列化" in err
+
+
+def test_openapi_executor_bounds_urlopen_timeout_by_deadline(monkeypatch):
+    """复核 P2：openapi 单次外呼上限 = min(默认 10s, 调用方剩余预算)——预算只剩 3s 不许再吊满 10s。"""
+    import osca_host.executor as ex_mod
+
+    seen = {}
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            seen["timeout"] = timeout
+            raise OSError("到此为止（只验 timeout 传导）")
+
+    monkeypatch.setattr(ex_mod, "_OPENER", _Opener())
+    for deadline, expected in ((3.0, 3.0), (None, 10.0), (999.0, 10.0)):
+        OpenapiExecutor().execute(
+            endpoint="openapi://h.internal",
+            interface={"method": "GET", "path": "/x"},
+            params={},
+            secret=None,
+            is_write=False,
+            pack_root=Path("."),
+            timeout=deadline,
+        )
+        assert seen["timeout"] == expected, (deadline, seen)

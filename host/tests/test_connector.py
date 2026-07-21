@@ -456,3 +456,32 @@ def test_mock_fixture_symlink_loop_no_traceback(proxy, mock_dir):
     loop.symlink_to(loop.name)
     payload, err = proxy._execute_mock(f"mock://{mock_dir}", "CON-001.环", {})
     assert payload is None and err
+
+
+def test_remaining_timeout_forwarded_only_to_supporting_executor(sample_pack):
+    """复核 P2：proxy.call(timeout=…) 经签名探测转交执行器——新驱动收到剩余预算,老驱动（无
+    timeout 形参）不传也不炸（deadline 仍由调用方逐接口强制）。"""
+    _, loaded = load_for_host(sample_pack, require_bindings=False)
+    policy = PolicyInterceptor(loaded.package_id, {"egress": {"allow_domains": ["fin.internal"]}}, {})
+    seen: dict[str, object] = {}
+
+    class NewStyle:
+        def execute(self, *, endpoint, interface, params, secret, is_write, pack_root, timeout=None):
+            seen["timeout"] = timeout
+            return {"rows": []}, None
+
+    class OldStyle:
+        def execute(self, *, endpoint, interface, params, secret, is_write, pack_root):
+            seen["old_called"] = True
+            return {"rows": []}, None
+
+    bindings = {"FINANCE_DB": {"endpoint": "newproto://fin.internal/x"}}
+    proxy = ConnectorProxy(loaded, bindings, policy, executors={"newproto": NewStyle()})
+    receipt = proxy.call("CON-001.拉取费用明细", step=None, timeout=7.5)
+    assert receipt.ok and seen["timeout"] == 7.5
+
+    proxy_old = ConnectorProxy(
+        loaded, {"FINANCE_DB": {"endpoint": "oldproto://fin.internal/x"}}, policy, executors={"oldproto": OldStyle()}
+    )
+    receipt = proxy_old.call("CON-001.拉取费用明细", step=None, timeout=7.5)
+    assert receipt.ok and seen.get("old_called") is True

@@ -269,3 +269,44 @@ def test_delete_dir_fsync_failure_raises_and_releases_ticket(store, monkeypatch)
     with pytest.raises(OSError):
         s.delete("EO-dff")
     assert s._ops == {}
+
+
+def test_persist_dir_fsync_failure_reclaims_renamed_snapshot(store, monkeypatch):
+    """复核 P2（durability-unknown）：rename 成功、目录 fsync 失败——已落名快照必须被收回，
+    否则「退回 L1、不活过重启」是谎话（load_all 会把它当可恢复快照重挂）。"""
+    s, tmp = store
+    calls = {"dir": 0}
+    real_fsync = os.fsync
+
+    def fail_first_dir_fsync(fd):
+        if fd == s._fd:
+            calls["dir"] += 1
+            if calls["dir"] == 1:
+                raise OSError("模拟目录 fsync 失败（rename 已成）")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_first_dir_fsync)
+    with pytest.raises(OSError):
+        s.persist("EO-du", {"operation_id": "EO-du"})
+    assert not (tmp / "susp-EO-du.json").exists()  # 已落名文件被收回
+    assert s.load_all() == []  # 下一次读盘不会复活该快照
+    assert s._ops == {}  # 凭据已归还、注册表回收
+
+
+def test_persist_persistent_storage_fault_still_no_resurrection(store, monkeypatch):
+    """收回路径自身也失败（存储彻底坏）：仍上抛留痕;本用例同时钉住既有行为——只要 unlink 成过,
+    load_all 不复活。"""
+    s, tmp = store
+    real_fsync = os.fsync
+
+    def always_fail_dir_fsync(fd):
+        if fd == s._fd:
+            raise OSError("持续存储故障")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", always_fail_dir_fsync)
+    with pytest.raises(OSError):
+        s.persist("EO-df", {"operation_id": "EO-df"})
+    assert not (tmp / "susp-EO-df.json").exists()  # unlink 成功即收回（fsync 失败不阻止收回）
+    assert s.load_all() == []
+    assert s._ops == {}

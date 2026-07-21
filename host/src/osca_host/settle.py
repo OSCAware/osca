@@ -64,6 +64,18 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
         if not receipt.ok:
             note({"object": object_id, "settled": False, "note": f"对账取数失败：{receipt.error}"})
             continue
+        # 落账前 revoked 门（复核 P1「STOPPED 后零迟到副作用」）：取数放行后包停/关停（关停=逐包
+        # revoke）——迟到的对账线程不得再往账本落 case。取数自身已被 authorize_tool 拦，此门封
+        # 「取数成功在前、revoke 在后、落账在最后」的窗。
+        if proxy.policy.revoked:
+            note(
+                {
+                    "object": object_id,
+                    "settled": False,
+                    "note": f"包已停：{proxy.policy.revoked}——对账放弃落账（迟到副作用拒绝）",
+                }
+            )
+            continue
 
         # 入账本锁协议（Review 十一轮）+ 安全目录发布（十三轮）：目录经 lstat/O_NOFOLLOW
         # 校验后以 dir_fd 全程操作——cases/ 被换成符号链接也写不出包根；内容写满临时

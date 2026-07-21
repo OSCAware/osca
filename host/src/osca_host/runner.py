@@ -252,6 +252,12 @@ def run_episode(
     max_minutes = budget_cap("max_minutes")
     max_tokens = budget_cap("max_tokens")
 
+    def minutes_remaining() -> float | None:
+        """max_minutes 的剩余秒数（未声明 → None）。接口循环内逐个外呼前必查（复核 P2）。"""
+        if max_minutes is None:
+            return None
+        return max_minutes * 60 - (time.monotonic() - started)
+
     pipeline = (episode.context.get("structure") or {}).get("pipeline") or []
     if not pipeline:
         return _finish(episode, "failed", "structure 无 pipeline，无事可执行")
@@ -320,6 +326,13 @@ def run_episode(
             fell_back = False
             for ref_i in range(start_ref, len(refs)):
                 ref = refs[ref_i]
+                # 逐接口 deadline（复核 P2）：一步展开多个 ref 时，首个接口耗尽预算后**不得再发起**
+                # 下一个外呼——只在 pipeline 收尾改判 stopped 仍会把后续外部调用真实打出去。
+                remaining = minutes_remaining()
+                if remaining is not None and remaining <= 0:
+                    detail = f"预算硬顶：max_minutes {max_minutes} 用满——接口循环内止步，不再发起下一外呼（剧集停）"
+                    _record(episode, step_name, performer, "stopped", detail, receipts=receipts)
+                    return _finish(episode, "stopped", detail)
                 if resuming and ref_i == start_ref:
                     # 恢复重入挂起的写 ref：按 challenge_id 当前态分派（§5.2）
                     verdict = _resume_write_ref(policy, pending_cid)
@@ -331,7 +344,9 @@ def run_episode(
                         payloads[ref] = _fallback_marker(ref, f"挑战 {pending_cid} 驳回/过期/撤销，未兑现")
                         fell_back = True
                         break
-                    receipt = proxy.call(ref, write_params, step=step_name, episode_id=episode.episode_id, resume=True)
+                    receipt = proxy.call(
+                        ref, write_params, step=step_name, episode_id=episode.episode_id, resume=True, timeout=remaining
+                    )
                     if not receipt.ok and receipt.disposition == "denied":
                         # consume **未命中**（驳回/过期/撤销/竞态过期，挑战未被消费）→ 回落保守默认（不写）
                         receipts.append(asdict(receipt))
@@ -348,7 +363,10 @@ def run_episode(
                     payloads[ref] = receipt.payload
                     continue
 
-                receipt = proxy.call(ref, write_params, step=step_name, episode_id=episode.episode_id)
+                # 剩余预算传导给可阻塞 connector（复核 P2）：支持 timeout 的执行器按剩余秒数收紧外呼上限
+                receipt = proxy.call(
+                    ref, write_params, step=step_name, episode_id=episode.episode_id, timeout=remaining
+                )
                 if receipt.disposition == "pending":  # 首次命中审批门 → 挂起等批（非失败）
                     return _suspend_episode(
                         episode, index, ref_i, payloads, receipts, write_params, artifacts, receipt.challenge_id

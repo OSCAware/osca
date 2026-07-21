@@ -24,6 +24,7 @@ from datetime import datetime
 from osca_cli.triggers import parse_duration, parse_schedule
 
 from osca_host.expr import evaluate_emit_when
+from osca_host.threads import run_in_daemon_thread
 
 log = logging.getLogger("osca-host")
 
@@ -189,12 +190,13 @@ class TriggerTable:
             if poll is None:
                 log.info(f"轮询 tick {watcher.key}（{uses}）：poller 未注入，只计 tick（第 {watcher.ticks} 次）")
                 continue
-            # 取数下线程（GPT Review P1）：poll 经 Connector 代理可能做真实网络取数（urllib timeout 10s）——
-            # 在事件循环上同步调它会压住控制通道（status/stop/审批）整整一次外呼的时长。
+            # 取数下**守护线程**（GPT Review P1 + 复核 P1 统一有界执行）：poll 经 Connector 代理可能做
+            # 真实网络取数——在事件循环上同步调会压住控制通道；进默认执行器则卡死的 poll 会阻塞
+            # asyncio.run 收尾与进程退出。
             # 逐轮异常边界（P1）：一次瞬时异常（网络抖动/代理内部错）不许永久杀死共享 watcher 的循环
             # 任务（watcher 显示存在、实际已死）——记录后继续下一轮；CancelledError（撤防/关停）照常传播。
             try:
-                new_state = await asyncio.to_thread(poll, uses)
+                new_state = await run_in_daemon_thread(poll, uses, name="osca-poll")
             except Exception:
                 log.exception(f"轮询 {watcher.key}（{uses}）本轮异常，跳过继续（第 {watcher.ticks} 次；watcher 存活）")
                 continue

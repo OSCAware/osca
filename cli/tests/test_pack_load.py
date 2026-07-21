@@ -385,25 +385,115 @@ def test_load_zip_ignores_smuggled_cache_members(make_pkg, base, tmp_path):
     assert (root / "indexes" / "judgments.index.yaml").is_file()  # 受支持缓存按已校验内容重建
 
 
-def test_pack_reads_each_file_once_no_toctou(make_pkg, base, tmp_path, monkeypatch):
-    """P2：checksum 与归档必须基于同一次读取的同一份字节——每个进包文件只读一次盘,
-    并发修改不可能产出「摘要是旧内容、归档是新内容」的自校验必败交付件。"""
-    from collections import Counter
+def test_pack_checksum_archive_and_name_share_one_snapshot(make_pkg, base, tmp_path, monkeypatch):
+    """复核 P3 口径修正：锚定的不变量是「checksum、归档内容、交付件名（package_id）出自同一份
+    字节快照」——模拟并发写者（每次 read_bytes 后立刻改写盘上文件、并漂移 osca.yaml 的
+    package_id），交付件仍必须自洽：名字来自快照、归档无漂移内容、装载自校验必过。"""
     from pathlib import Path as P
 
-    counts: Counter[str] = Counter()
     real = P.read_bytes
 
-    def counting(self):
-        counts[str(self)] += 1
-        return real(self)
+    def read_then_mutate(self):
+        data = real(self)
+        try:
+            if self.name == "osca.yaml":
+                self.write_bytes(data.replace(b"demo-pkg", b"drifted-pkg"))  # 快照后 manifest 漂移
+            else:
+                self.write_bytes(data + b"\n# concurrent-writer\n")
+        except OSError:
+            pass
+        return data
 
-    monkeypatch.setattr(P, "read_bytes", counting)
+    monkeypatch.setattr(P, "read_bytes", read_then_mutate)
+    monkeypatch.chdir(tmp_path)
     pkg = make_pkg(base)
-    result, zip_path = pack_package(pkg, tmp_path / "out.zip")
+    result, zip_path = pack_package(pkg)  # 无 -o：文件名按 package_id 生成
     assert result.ok, result.render("pack")
-    in_pkg = {k: v for k, v in counts.items() if k.startswith(str(pkg))}
-    assert in_pkg and all(v == 1 for v in in_pkg.values()), in_pkg  # 逐文件恰读一次
-    # 自校验闭环：产出的交付件装载完整性必过
+    assert zip_path.name == "demo-pkg.osca.zip"  # 交付件名来自快照，不随并发漂移
+    monkeypatch.undo()
+    with zipfile.ZipFile(zip_path) as zf:
+        assert b"drifted-pkg" not in zf.read("osca.yaml")  # 归档内容与名字同一快照
     load_result, _ = load_osca(zip_path, dest=tmp_path / "deploy")
-    assert load_result.ok, load_result.render("load")
+    assert load_result.ok, load_result.render("load")  # checksum 与归档同字节：自校验必过
+
+
+# ── 升级安全（复核 P1）：任一校验失败,dest 上旧版本字节完全保留 ──
+
+
+def _snapshot_tree(root):
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def test_failed_zip_upgrade_preserves_previous_deployment(make_pkg, base, tmp_path):
+    """checksum 篡改 / lint 错误 / binding 缺失——升级失败时旧部署一字节不动（先验后切换）。"""
+    zip1 = _packed(make_pkg, base, tmp_path)
+    dest = tmp_path / "deploy"
+    ok_env = tmp_path / "ok-bindings.yaml"
+    ok_env.write_text("DEMO_DB:\n  endpoint: x\n  secret_ref: KEY\n", encoding="utf-8")
+    r1, _ = load_osca(zip1, dest=dest, bindings=ok_env)
+    assert r1.ok, r1.render("load")
+    baseline = _snapshot_tree(dest)
+
+    # ① checksum 篡改：归档字节与清单不符
+    bad_sum = tmp_path / "bad-sum.osca.zip"
+    with zipfile.ZipFile(zip1) as src, zipfile.ZipFile(bad_sum, "w") as out:
+        for info in src.infolist():
+            data = src.read(info.filename)
+            if info.filename == "AGENT.md":
+                data += "（篡改）".encode()
+            out.writestr(info, data)
+    r, root = load_osca(bad_sum, dest=dest, bindings=ok_env)
+    assert not r.ok and root is None
+    assert _snapshot_tree(dest) == baseline, "checksum 失败的升级不得触碰旧部署"
+
+    # ② lint 错误：内容与清单一致但违反账本纪律（去掉 replay 断言）
+    work = tmp_path / "lint-bad"
+    with zipfile.ZipFile(zip1) as zf:
+        zf.extractall(work)
+    j = work / "judgments" / "J-0001.yaml"
+    j.write_text(j.read_text(encoding="utf-8").replace("replay:", "not_replay:"), encoding="utf-8")
+    rels = packer.package_files(work)
+    (work / CHECKSUMS_REL).write_text(packer.checksums_text(work, rels), encoding="utf-8")
+    lint_bad = tmp_path / "lint-bad.osca.zip"
+    with zipfile.ZipFile(lint_bad, "w") as out:
+        for rel in [*rels, CHECKSUMS_REL]:
+            out.writestr(rel, (work / rel).read_bytes())
+    r, root = load_osca(lint_bad, dest=dest, bindings=ok_env)
+    assert not r.ok and root is None and any("lint 未通过" in line for line in r.lines)
+    assert _snapshot_tree(dest) == baseline, "lint 失败的升级不得触碰旧部署"
+
+    # ③ binding 缺失（装载门禁在切换之前）
+    bad_env = tmp_path / "bad-bindings.yaml"
+    bad_env.write_text("OTHER:\n  endpoint: x\n", encoding="utf-8")
+    r, root = load_osca(zip1, dest=dest, bindings=bad_env)
+    assert not r.ok and root is None
+    assert _snapshot_tree(dest) == baseline, "binding 失败的升级不得触碰旧部署"
+
+    # 合法升级仍然可用（回归:先验后切换不破坏正常路径）
+    r, root = load_osca(zip1, dest=dest, bindings=ok_env)
+    assert r.ok, r.render("load")
+
+
+def test_swap_failure_restores_previous_deployment(make_pkg, base, tmp_path, monkeypatch):
+    """切换自身失败（rename 抛错）→ 旧部署必须恢复原位。"""
+    import os as os_mod
+
+    zip1 = _packed(make_pkg, base, tmp_path)
+    dest = tmp_path / "deploy"
+    r1, _ = load_osca(zip1, dest=dest)
+    assert r1.ok
+    baseline = _snapshot_tree(dest)
+
+    real_rename = os_mod.rename
+
+    def failing_rename(src, dst, **kw):
+        if str(dst) == str(dest) and ".osca-tmp-" in str(src):
+            raise OSError("模拟切换失败")
+        return real_rename(src, dst, **kw)
+
+    monkeypatch.setattr(packer.os, "rename", failing_rename)
+    r, root = load_osca(zip1, dest=dest)
+    assert not r.ok and root is None
+    assert any("发布切换失败" in line and "已恢复原位" in line for line in r.lines)
+    monkeypatch.undo()
+    assert _snapshot_tree(dest) == baseline  # 旧部署恢复原位、字节不变

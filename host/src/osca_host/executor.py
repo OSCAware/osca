@@ -44,7 +44,10 @@ def _split_endpoint(endpoint: str) -> tuple[str, str, str]:
 
 class Executor(Protocol):
     """真实执行器协议（可插拔）。secret 是 connector 解析出的凭据值（或 None）——只用于建连接/鉴权，
-    实现**绝不**把它放进回执 payload 或 error 串。返回 (payload, error)：error 非空即失败。"""
+    实现**绝不**把它放进回执 payload 或 error 串。返回 (payload, error)：error 非空即失败。
+
+    timeout（可选，复核 P2）：调用方剩余时间预算（秒）——支持的实现按它收紧单次外呼上限；
+    connector 分派用签名探测传参，老驱动不声明也不破约（deadline 由调用方逐接口强制）。"""
 
     def execute(
         self,
@@ -55,6 +58,7 @@ class Executor(Protocol):
         secret: str | None,
         is_write: bool,
         pack_root: Path,
+        timeout: float | None = None,
     ) -> tuple[object, str | None]: ...
 
 
@@ -82,7 +86,7 @@ class SqlReadonlyExecutor:
     本地 sqlite 文件（endpoint 的 path 部分），本地无鉴权、不用 secret。只读强制靠 **`mode=ro` 连接 + 授权器
     双闸**——写 SQL / ATTACH / VACUUM / 写 PRAGMA 一律拒（mode=ro 单独只护主库，不够；不靠关键字黑名单）。"""
 
-    def execute(self, *, endpoint, interface, params, secret, is_write, pack_root):
+    def execute(self, *, endpoint, interface, params, secret, is_write, pack_root, timeout=None):
         if is_write:
             # 写连接器不走 sql_readonly（只读契约）——写走写执行器 + 审批门（B.4）
             return None, "sql_readonly 执行器只读——写路径不走只读执行器（写走写执行器 + 审批门，契约 B.4）"
@@ -106,8 +110,10 @@ class SqlReadonlyExecutor:
         # 命名绑定：dict → 缺失的命名参数默认 None（可选参数省略即 NULL）；非 dict → 全 None（无注入面）
         bind = defaultdict(lambda: None, params) if isinstance(params, dict) else defaultdict(lambda: None)
         conn = None
+        # 剩余预算传导（复核 P2）：sqlite 的 timeout 是锁等待上限——收紧到剩余预算与默认 5s 的较小值
+        busy_timeout = 5.0 if timeout is None else max(0.001, min(5.0, timeout))
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)  # 只读连接（连接模式，非关键字过滤）
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=busy_timeout)  # 只读连接
             conn.set_authorizer(_readonly_authorizer)  # 第二闸：拒 ATTACH/VACUUM/写 PRAGMA（mode=ro 只护主库不够）
             conn.row_factory = sqlite3.Row
             rows = [dict(r) for r in conn.execute(sql, bind).fetchall()]  # 参数化绑定（防注入）
@@ -146,7 +152,7 @@ class OpenapiExecutor:
     `Authorization: Bearer` 头。参考适配器按 endpoint scheme 走 http（openapi://）/ https（https://）；
     生产 API 网关驱动由部署侧注入。egress 已在 connector 分派前置；本适配器额外不跟随重定向（防 SSRF）。"""
 
-    def execute(self, *, endpoint, interface, params, secret, is_write, pack_root):
+    def execute(self, *, endpoint, interface, params, secret, is_write, pack_root, timeout=None):
         method = interface.get("method")
         if not isinstance(method, str) or not method:
             method = "POST" if is_write else "GET"  # 未声明 method：写默认 POST，读默认 GET
@@ -188,8 +194,10 @@ class OpenapiExecutor:
                 return None, f"openapi {method} 写 params 非 JSON 可序列化——fail-closed（不静默改写被批内容）"
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        # 剩余预算传导（复核 P2）：单次外呼上限 = min(默认 10s, 调用方剩余预算)——预算只剩数秒时不许再吊满 10s
+        effective = 10.0 if timeout is None else max(0.001, min(10.0, timeout))
         try:
-            with _OPENER.open(req, timeout=10) as resp:
+            with _OPENER.open(req, timeout=effective) as resp:
                 # read(size) 读上限：巨响应体不触发 OOM（DoS + call() 恒回 Receipt）。注意带 size 参数**不**会对截断响应
                 # 抛 IncompleteRead，故截断由下方 Content-Length 比对显式 fail-closed（不静默把半截数据当取数结果）。
                 raw, status, declared = resp.read(_MAX_BODY + 1), resp.status, resp.getheader("Content-Length")

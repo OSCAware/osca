@@ -165,9 +165,13 @@ def pack_package(path: str | Path, output: str | Path | None = None) -> tuple[Op
     checksums = "\n".join(lines) + "\n"
     result.step(f"进包文件 {len(rels)} 个，已生成校验和清单")
 
-    # 5. 确定性写 zip
-    manifest = load_package(root).yaml_files.get("osca.yaml")
-    package_id = manifest.mapping.get("package_id", root.name) if manifest else root.name
+    # 5. 确定性写 zip。package_id 从**同一字节快照**解析（P3 口径收口）：重读实时 osca.yaml 会留
+    # 「输出文件名与归档内 manifest 并发漂移」的窗——交付件名与归档内容必须出自同一份字节。
+    try:
+        manifest_data = yaml.safe_load(blobs["osca.yaml"].decode("utf-8")) if "osca.yaml" in blobs else None
+    except (yaml.YAMLError, UnicodeDecodeError):
+        manifest_data = None  # lint 已过；防御性兜底（快照间隙不可达，仍不许炸）
+    package_id = manifest_data.get("package_id", root.name) if isinstance(manifest_data, dict) else root.name
     zip_path = Path(output) if output else Path.cwd() / f"{package_id}.osca.zip"
     if zip_path.resolve().is_relative_to(root.resolve()):
         result.fail(f"输出路径在包内：{zip_path}——下次打包会把交付件吞进自身、连续打包哈希漂移，请输出到包外")
@@ -346,12 +350,9 @@ def required_bindings(root: Path) -> set[str]:
     return required
 
 
-def _extract_to_dest(source: Path, root: Path) -> str | None:
-    """zip → 目标目录：版本化临时目录解压 + 原子切换（同一 dest 可重启 Host / unload+load 重复装载）。
-
-    目标已存在且非空时只接管**既往 osca 交付解压目录**（osca.yaml + indexes/checksums.txt 痕迹）——
-    绝不清理来历不明的用户目录；切换失败回滚旧目录。返回错误串或 None（成功）。
-    """
+def _dest_error(root: Path) -> str | None:
+    """zip 发布目标的可接管性判据（**只查不动**）：目标非空时只接管既往 osca 交付解压目录
+    （osca.yaml + indexes/checksums.txt 痕迹）——绝不清理来历不明的用户目录。"""
     if root.is_symlink():
         return f"解压目标是符号链接：{root}——拒绝（解压不得跟随链接写出目标外）"
     if root.exists():
@@ -359,25 +360,104 @@ def _extract_to_dest(source: Path, root: Path) -> str | None:
             return f"解压目标已存在且不是目录：{root}"
         if any(root.iterdir()) and not ((root / "osca.yaml").is_file() and (root / CHECKSUMS_REL).is_file()):
             return f"目标目录非空且不是既往 osca 交付解压目录：{root}——拒绝清理未知目录（用 --dest 指定其他目录）"
-    tmp = root.parent / f".{root.name}.osca-tmp-{os.getpid()}-{time.monotonic_ns()}"
+    return None
+
+
+def _swap_into_dest(tmp: Path, root: Path) -> str | None:
+    """**已通过全部校验**的临时目录原子上位（P1 升级安全）：旧目录先挪开、新目录 rename 上位、
+    成功后才删旧。任一步失败恢复旧目录并清理临时目录——升级失败绝不销毁上一版部署。"""
     old: Path | None = None
+    moved_old = False
     try:
-        tmp.parent.mkdir(parents=True, exist_ok=True)
-        tmp.mkdir(exist_ok=False)
-        with zipfile.ZipFile(source) as zf:
-            _safe_extract(zf, tmp)
         if root.exists():
             old = root.parent / f".{root.name}.osca-old-{os.getpid()}-{time.monotonic_ns()}"
             os.rename(root, old)
+            moved_old = True
         os.rename(tmp, root)
-    except (OSError, ValueError) as e:
+    except OSError as e:
+        restored = ""
+        if moved_old and not root.exists():
+            try:
+                os.rename(old, root)
+                restored = "；旧部署已恢复原位"
+            except OSError:
+                restored = f"；旧部署恢复失败，暂存于 {old}（请人工归位）"
         shutil.rmtree(tmp, ignore_errors=True)
-        if old is not None and old.exists() and not root.exists():
-            os.rename(old, root)  # 回滚：旧交付目录归位，装载失败不留半切换状态
-        return str(e) if isinstance(e, ValueError) else f"解压/切换失败：{e}"
+        return f"发布切换失败：{e}{restored}"
     if old is not None:
         shutil.rmtree(old, ignore_errors=True)
     return None
+
+
+def _validate_package_root(
+    root: Path,
+    result: OpResult,
+    *,
+    from_zip: bool,
+    bindings: str | Path | None,
+    require_bindings: bool,
+) -> bool:
+    """装载校验流水线（符号链接 → 完整性 → lint → binding 门禁 → 重建索引），全过才 True。
+
+    zip 模式在**临时目录**上整段执行（P1 升级安全）：任何一步失败时 dest 上的旧部署一字节不动。
+    """
+    # 符号链接门禁（读取/lint 之前）：链接可把包外文件读进 Episode/LLM 上下文（AGENT.md/YAML），
+    # 或把 indexes 写引出包根（rebuild_index 覆盖包外文件）。zip 解压不产生链接，此检查两态统一兜底。
+    links = load_symlink_entries(root)
+    if links:
+        shown = "、".join(links[:3]) + ("…" if len(links) > 3 else "")
+        result.fail(f"包内检测到符号链接：{shown}——装载拒绝（链接可读写包外文件；交付件不收符号链接）")
+        return False
+
+    # 完整性校验（交付件必须带清单；开发态目录可豁免）
+    if (root / CHECKSUMS_REL).is_file():
+        if not verify_checksums(root, result):
+            return False
+    elif from_zip:
+        result.fail(f"交付件缺少 {CHECKSUMS_REL}——不是 osca pack 产出的合规交付件")
+        return False
+    else:
+        result.info("开发态目录无校验和清单，跳过完整性校验（交付件不可跳过）")
+
+    # lint
+    lint_result = lint_package(root)
+    if not lint_result.ok:
+        for f in lint_result.findings:
+            result.info(f.format())
+        result.fail(f"lint 未通过（{lint_result.errors} 错误），拒绝装载")
+        return False
+    result.step(f"lint 通过（{lint_result.warnings} 警告）")
+
+    # binding 与部署环境比对（SPEC §4 层2；缺失/形状非法即报错——装载门禁，不留到首次调用才炸）
+    required = required_bindings(root)
+    if bindings is not None:
+        try:
+            env = yaml.safe_load(Path(bindings).read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as e:
+            result.fail(f"bindings 文件读取/解析失败：{e}")
+            return False
+        errors = deployment_binding_errors({} if env is None else env, required)
+        if errors:
+            for error in errors:
+                result.fail(error)
+            return False
+        result.step(f"binding 门禁通过（required {len(required)} 个均已注入且形状合法）")
+    elif required and require_bindings:
+        result.fail(
+            f"部署装载必须注入 bindings：本包 required binding {', '.join(sorted(required))} 缺失"
+            "（装载门禁 fail-closed；「无环境只校验包」请走 CLI 校验模式）"
+        )
+        return False
+    elif required:
+        result.info(
+            f"未提供 --bindings：仅完成包校验（**非部署装载**，binding 门禁未执行）；"
+            f"部署时必须注入：{', '.join(sorted(required))}"
+        )
+
+    # 重建索引（zip 模式建在临时目录里，随原子切换一并上位）
+    index_path = rebuild_index(root)
+    result.step(f"签名表已重建：{index_path.relative_to(root).as_posix()}")
+    return True
 
 
 def load_osca(
@@ -388,81 +468,47 @@ def load_osca(
     require_bindings: bool = False,
 ) -> tuple[OpResult, Path | None]:
     """装载校验。require_bindings=True（Host 部署装载）：包声明了 required bindings 却未注入
-    部署环境即失败——「无环境只校验包」是 CLI 的显式校验模式，不得称为部署装载成功。"""
+    部署环境即失败——「无环境只校验包」是 CLI 的显式校验模式，不得称为部署装载成功。
+
+    zip 模式**先验后切换**（P1 升级安全）：全部校验（符号链接/完整性/lint/binding/索引）在
+    版本化临时目录完成，全过才原子切换 dest——失败的升级绝不销毁上一版部署。
+    """
     source = Path(archive)
     result = OpResult()
 
-    # 1. 解压 or 原地
     if source.is_dir():
-        root = source
-        from_zip = False
-        result.info(f"输入为目录，原地装载校验：{root}")
-    elif source.is_file() and zipfile.is_zipfile(source):
-        root = Path(dest) if dest else Path.cwd() / source.name.removesuffix(".zip")
-        error = _extract_to_dest(source, root)
-        if error:
-            result.fail(error)
-            return result, None
-        from_zip = True
-        result.step(f"已解压到 {root}（版本化临时目录 + 原子切换，同 dest 可重启/重载）")
-    else:
+        result.info(f"输入为目录，原地装载校验：{source}")
+        ok = _validate_package_root(
+            source, result, from_zip=False, bindings=bindings, require_bindings=require_bindings
+        )
+        return (result, source) if ok else (result, None)
+
+    if not (source.is_file() and zipfile.is_zipfile(source)):
         result.fail(f"输入既不是目录也不是 zip：{archive}")
         return result, None
 
-    # 1.5 符号链接门禁（读取/lint 之前）：链接可把包外文件读进 Episode/LLM 上下文（AGENT.md/YAML），
-    # 或把 indexes 写引出包根（rebuild_index 覆盖包外文件）。zip 解压不产生链接，此检查两态统一兜底。
-    links = load_symlink_entries(root)
-    if links:
-        shown = "、".join(links[:3]) + ("…" if len(links) > 3 else "")
-        result.fail(f"包内检测到符号链接：{shown}——装载拒绝（链接可读写包外文件；交付件不收符号链接）")
+    root = Path(dest) if dest else Path.cwd() / source.name.removesuffix(".zip")
+    error = _dest_error(root)
+    if error:
+        result.fail(error)
         return result, None
-
-    # 2. 完整性校验（交付件必须带清单；开发态目录可豁免）
-    if (root / CHECKSUMS_REL).is_file():
-        if not verify_checksums(root, result):
-            return result, None
-    elif from_zip:
-        result.fail(f"交付件缺少 {CHECKSUMS_REL}——不是 osca pack 产出的合规交付件")
+    tmp = root.parent / f".{root.name}.osca-tmp-{os.getpid()}-{time.monotonic_ns()}"
+    try:
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        tmp.mkdir(exist_ok=False)
+        with zipfile.ZipFile(source) as zf:
+            _safe_extract(zf, tmp)
+    except (OSError, ValueError) as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        result.fail(str(e) if isinstance(e, ValueError) else f"解压失败：{e}")
         return result, None
-    else:
-        result.info("开发态目录无校验和清单，跳过完整性校验（交付件不可跳过）")
-
-    # 3. lint
-    lint_result = lint_package(root)
-    if not lint_result.ok:
-        for f in lint_result.findings:
-            result.info(f.format())
-        result.fail(f"lint 未通过（{lint_result.errors} 错误），拒绝装载")
+    result.step("已解压到临时目录（先验后切换：全部校验过关才动 dest）")
+    if not _validate_package_root(tmp, result, from_zip=True, bindings=bindings, require_bindings=require_bindings):
+        shutil.rmtree(tmp, ignore_errors=True)  # 校验失败：只清临时目录，dest 上的旧部署一字节不动
         return result, None
-    result.step(f"lint 通过（{lint_result.warnings} 警告）")
-
-    # 4. binding 与部署环境比对（SPEC §4 层2；缺失/形状非法即报错——装载门禁，不留到首次调用才炸）
-    required = required_bindings(root)
-    if bindings is not None:
-        try:
-            env = yaml.safe_load(Path(bindings).read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError) as e:
-            result.fail(f"bindings 文件读取/解析失败：{e}")
-            return result, None
-        errors = deployment_binding_errors({} if env is None else env, required)
-        if errors:
-            for error in errors:
-                result.fail(error)
-            return result, None
-        result.step(f"binding 门禁通过（required {len(required)} 个均已注入且形状合法）")
-    elif required and require_bindings:
-        result.fail(
-            f"部署装载必须注入 bindings：本包 required binding {', '.join(sorted(required))} 缺失"
-            "（装载门禁 fail-closed；「无环境只校验包」请走 CLI 校验模式）"
-        )
+    error = _swap_into_dest(tmp, root)
+    if error:
+        result.fail(error)
         return result, None
-    elif required:
-        result.info(
-            f"未提供 --bindings：仅完成包校验（**非部署装载**，binding 门禁未执行）；"
-            f"部署时必须注入：{', '.join(sorted(required))}"
-        )
-
-    # 5. 重建索引
-    index_path = rebuild_index(root)
-    result.step(f"签名表已重建：{index_path.relative_to(root).as_posix()}")
+    result.step(f"已发布到 {root}（原子切换；同 dest 可重启/重载，升级失败不销毁旧部署）")
     return result, root
