@@ -87,7 +87,12 @@ class SqlReadonlyExecutor:
         impl = interface.get("impl")
         if not isinstance(impl, str) or not impl:
             return None, "sql_readonly 接口缺 impl 固化查询（OSCA024）——不接受模型即席 SQL（公理 A6）"
-        sql_path = pack_root / impl
+        # impl 是包内 manifest 声明（不可信输入）：绝对路径 / `../` / 包内符号链接都能把读引出包根
+        # （宿主机任意可读文件被当 SQL 送执行）。resolve 后强制留在包根内（GPT Review P1 路径越界）。
+        root = pack_root.resolve()
+        sql_path = (root / impl).resolve()
+        if not sql_path.is_relative_to(root):
+            return None, f"impl 路径越界：{impl}——包内声明只可指包内文件，拒绝（不可信输入不出包根）"
         if not sql_path.is_file():
             return None, f"impl SQL 缺失：{impl}（OSCA024，声明即必须存在）"
         try:

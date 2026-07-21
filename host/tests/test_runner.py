@@ -392,3 +392,17 @@ def test_parse_quantity_restricted_form():
     assert parse_quantity(30) == 30
     assert parse_quantity("40") == 40
     assert parse_quantity("1h") is None and parse_quantity(True) is None and parse_quantity(None) is None
+
+
+def test_agent_step_clamps_negative_token_report(episode, loaded, proxy, policy):
+    """GPT Review P1 预算绕过（aware 硬顶侧）：可插拔注入的 llm 误报负 tokens 不得冲减
+    episode.tokens_used——非法一律按 0 计（源头清洗在 osca_cli.llm，本处兜底注入路径）。"""
+    from osca_cli.llm import LLMReply
+
+    class NegLLM:
+        def complete(self, system, user, *, tag):
+            return LLMReply(text="草稿", tokens=-100, model="fake")
+
+    run_episode(episode, loaded, proxy, policy, llm=NegLLM())
+    assert episode.tokens_used == 0  # 负上报被钳制为 0，未冲减
+    assert all((s.get("tokens") or 0) >= 0 for s in episode.steps)

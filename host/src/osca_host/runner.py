@@ -390,7 +390,10 @@ def run_episode(
                 _record(episode, step_name, performer, "failed", str(e))
                 return _finish(episode, "failed", str(e))
             text, redacted = policy.redact(reply.text)  # 产出注入剧集台账前脱敏
-            episode.tokens_used += reply.tokens
+            # 用量自报是不可信输入（源头 osca_cli.llm 已清洗；可插拔注入的 llm 走本处兜底）：
+            # 负数/非整数会冲减 aware 硬顶——非法一律按 0 计，绝不接受冲减（GPT Review P1 预算绕过）
+            tokens = reply.tokens if type(reply.tokens) is int and reply.tokens > 0 else 0
+            episode.tokens_used += tokens
             artifacts[_produces_key(spec, step_name)] = text
             episode.draft = text
             _record(
@@ -400,10 +403,10 @@ def run_episode(
                 "done",
                 f"LLM 产出 {len(text)} 字",
                 output=text,
-                tokens=reply.tokens,
+                tokens=tokens,
                 redacted=redacted,
             )
-            ok, reason = policy.charge_tokens(episode.episode_id, reply.tokens)  # 笼子的止损顶
+            ok, reason = policy.charge_tokens(episode.episode_id, tokens)  # 笼子的止损顶
             if not ok:
                 return _finish(episode, "stopped", f"{reason}（剧集停）")
             if max_tokens is not None and episode.tokens_used > max_tokens:

@@ -853,7 +853,7 @@ async def test_d2b_reattach_same_display_id_no_collision(running_host, sample_pa
 
     store.persist("EO-aaa", _record("EO-aaa", "CH-a"))
     store.persist("EO-bbb", _record("EO-bbb", "CH-b"))
-    host._reattach_suspensions(pid)
+    await host._reattach_suspensions(pid)
 
     suspended = [e for e in host.episodes.values() if e.status == "suspended_pending_approval"]
     assert {e.operation_id for e in suspended} == {"EO-aaa", "EO-bbb"}  # 两条都在，未互相顶掉

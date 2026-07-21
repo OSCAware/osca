@@ -83,3 +83,35 @@ def test_openai_compat_bad_shape(monkeypatch):
     monkeypatch.setattr(llm_mod.urllib.request, "urlopen", lambda r, timeout: _FakeResponse({"error": "x"}))
     with pytest.raises(LLMError, match="不是 chat/completions 形状"):
         OpenAICompatLLM("https://g/v1", "m").complete("s", "u", tag="t")
+
+
+def test_openai_compat_illegal_usage_report_falls_back_to_estimate(monkeypatch):
+    """GPT Review P1 预算绕过：网关自报 total_tokens 是不可信输入（预算硬顶的记账源）——
+    负数会冲减已用额度、非整数会炸记账；0/负数/bool/非整数/形状错乱一律回落字符估算（恒正）。"""
+    for bad_usage in (
+        {"total_tokens": -500},
+        {"total_tokens": 0},
+        {"total_tokens": "42"},
+        {"total_tokens": True},
+        {"total_tokens": 3.5},
+        {},
+        ["usage 形状错乱"],
+        None,
+    ):
+        monkeypatch.setattr(
+            llm_mod.urllib.request,
+            "urlopen",
+            lambda r, timeout, u=bad_usage: _FakeResponse({"choices": [{"message": {"content": "回答"}}], "usage": u}),
+        )
+        reply = OpenAICompatLLM("https://g/v1", "m").complete("s", "u", tag="t")
+        assert isinstance(reply.tokens, int) and reply.tokens > 0  # 非法上报不进记账，估算兜底
+
+
+def test_mock_tag_path_escape_rejected(tmp_path):
+    """GPT Review 路径越界同口径：tag 含包内声明成分（步骤名）——`../` 把固件读引出固件目录 → 拒绝；
+    合法 tag 本就带子目录（episode/成文），约束按目录包含而非禁分隔符。"""
+    fixture_dir = tmp_path / "fx"
+    fixture_dir.mkdir()
+    (tmp_path / "leak.md").write_text("包外内容", encoding="utf-8")
+    with pytest.raises(LLMError, match="越界"):
+        MockLLM(fixture_dir).complete("s", "u", tag="../leak")

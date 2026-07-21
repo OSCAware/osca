@@ -440,3 +440,11 @@ def test_executor_exception_never_crashes_call_no_leak(sample_pack):
     assert not r.ok and "执行器执行异常" in r.error  # 统一 fail-closed 回执
     blob = repr(r.__dict__) + repr(proxy.policy.audit)
     assert sentinel not in blob  # 异常内文（含连接串）绝不进回执/审计
+
+
+def test_mock_fixture_path_escape_rejected(proxy, mock_dir):
+    """GPT Review 路径越界同口径：接口名来自包内 manifest（不可信输入）——`../` 把 mock 固件读引出
+    固件目录（宿主机任意 YAML 被当取数结果注入剧集）→ 拒绝。"""
+    (mock_dir.parent / "leak.yaml").write_text("外部: true", encoding="utf-8")
+    payload, err = proxy._execute_mock(f"mock://{mock_dir}", "CON-001.../leak", {})
+    assert payload is None and "越界" in err

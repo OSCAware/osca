@@ -421,6 +421,11 @@ class PolicyInterceptor:
             return self._charge_tokens_locked(episode_id, tokens)
 
     def _charge_tokens_locked(self, episode_id: str, tokens: int) -> tuple[bool, str]:
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+            # 用量上报是不可信输入（网关/可插拔 LLM 皆可能误报）：负数会冲减已用额度、把硬顶变软。
+            # 非法上报按 0 计 + 审计留痕——记账源头在 osca_cli.llm 已清洗，这里是强制点自持的第二道闸
+            self._record("warn", "budgets", str(tokens), "tokens 用量上报非法（须非负整数）——按 0 计账，留痕")
+            tokens = 0
         used = self._tokens.get(episode_id, 0) + tokens
         self._tokens[episode_id] = used
         if self.max_tokens is not None and used > self.max_tokens:

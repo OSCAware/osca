@@ -200,7 +200,12 @@ class ConnectorProxy:
     # ── 执行器 ────────────────────────────────────────────────────────
 
     def _execute_mock(self, endpoint: str, interface_ref: str, itf: dict) -> tuple[object, str | None]:
-        fixture = Path(endpoint.removeprefix("mock://")) / f"{interface_ref.split('.', 1)[1]}.yaml"
+        # 接口名来自包内 manifest（不可信输入）：带 `../`/绝对段会把固件读引出固件目录（宿主机任意
+        # YAML 被当取数结果注入剧集）。resolve 后强制留在固件目录内（GPT Review 路径越界同口径）。
+        base = Path(endpoint.removeprefix("mock://")).resolve()
+        fixture = (base / f"{interface_ref.split('.', 1)[1]}.yaml").resolve()
+        if not fixture.is_relative_to(base):
+            return None, f"mock 固件路径越界：{interface_ref}——接口名不得把固件读引出固件目录，拒绝"
         if not fixture.is_file():
             return None, f"mock 固件缺失：{fixture}"
         return yaml.safe_load(fixture.read_text(encoding="utf-8")), None

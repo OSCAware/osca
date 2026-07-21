@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -25,7 +26,8 @@ from osca_host.expr import evaluate_emit_when
 
 log = logging.getLogger("osca-host")
 
-# poller(package_id, 接口引用) → 状态负载（dict）或 None（取数失败）
+# poller(package_id, 接口引用) → 状态负载（dict）或 None（取数失败）。
+# 轮询走 Connector 代理可能做真实网络取数——发射循环经 to_thread 调它，绝不在事件循环上阻塞（GPT Review P1）
 Poller = Callable[[str, str], object]
 
 
@@ -34,7 +36,9 @@ class Subscription:
     package_id: str
     aware_id: str
     trigger_id: str  # 全局 ID，如 AW-001/T1
-    deliver: Callable[[str], None]  # 发射回调：deliver(trigger_id) → 闸门裁决
+    # 发射回调：deliver(trigger_id) → 闸门裁决。可回协程（Host 的投递把账本刷新/precondition
+    # 取数下线程，事件循环不承载阻塞 IO）；同步回调（测试裸用）也接受。
+    deliver: Callable[[str], Awaitable[None] | None]
 
 
 @dataclass
@@ -107,8 +111,9 @@ class TriggerTable:
 
     # ── 发射 ──────────────────────────────────────────────────────────
 
-    def fire_manual(self, package_id: str, trigger_id: str) -> str | None:
-        """人工发射（操作者通道）。仅 event 触发原语可人工发射；返回错误消息或 None。"""
+    async def fire_manual(self, package_id: str, trigger_id: str) -> str | None:
+        """人工发射（操作者通道）。仅 event 触发原语可人工发射；返回错误消息或 None。
+        投递等到裁决/装配完成才返回——fire 命令的响应语义保持确定（发射即可查台账）。"""
         for watcher in self.watchers.values():
             for sub in watcher.subs:
                 if sub.package_id == package_id and sub.trigger_id == trigger_id:
@@ -116,18 +121,22 @@ class TriggerTable:
                         return f"{trigger_id} 是 {watcher.kind} 触发，仅 event 可人工发射"
                     watcher.fires += 1
                     try:
-                        sub.deliver(sub.trigger_id)
+                        result = sub.deliver(sub.trigger_id)
+                        if inspect.isawaitable(result):
+                            await result
                     except Exception as e:
                         log.exception(f"人工发射派发异常：{trigger_id}")
                         return f"发射派发异常：{e}（watcher 存活，详见 Host 日志）"
                     return None
         return f"触发原语未布防：{package_id} 的 {trigger_id}"
 
-    def _fire(self, watcher: Watcher) -> None:
+    async def _fire(self, watcher: Watcher) -> None:
         watcher.fires += 1
         for sub in list(watcher.subs):
             try:
-                sub.deliver(sub.trigger_id)
+                result = sub.deliver(sub.trigger_id)
+                if inspect.isawaitable(result):
+                    await result
             except Exception:
                 # 订阅方异常各自隔离——一个包的故障不许杀掉共享 watcher 的循环任务、不许殃及同伴
                 log.exception(f"派发异常：{sub.trigger_id}（watcher {watcher.key} 继续存活）")
@@ -151,7 +160,7 @@ class TriggerTable:
             watcher.next_fire = schedule.next_fire(now)
             log.info(f"定时器 {watcher.key} 下次触发：{watcher.next_fire.isoformat(timespec='seconds')}")
             await asyncio.sleep(max(0.0, (watcher.next_fire - now).total_seconds()))
-            self._fire(watcher)
+            await self._fire(watcher)
 
     async def _poll_loop(self, watcher: Watcher) -> None:
         every = parse_duration(watcher.spec.get("every"))
@@ -166,7 +175,9 @@ class TriggerTable:
             if self.poller is None:
                 log.info(f"轮询 tick {watcher.key}（{uses}）：poller 未注入，只计 tick（第 {watcher.ticks} 次）")
                 continue
-            new_state = self.poller(watcher.scope, uses)
+            # 取数下线程（GPT Review P1）：poller 经 Connector 代理可能做真实网络取数（urllib timeout 10s）——
+            # 在事件循环上同步调它会压住控制通道（status/stop/审批）整整一次外呼的时长
+            new_state = await asyncio.to_thread(self.poller, watcher.scope, uses)
             if new_state is None:
                 log.warning(f"轮询 {watcher.key}（{uses}）取数失败，本轮不发射（第 {watcher.ticks} 次）")
                 continue
@@ -186,7 +197,7 @@ class TriggerTable:
                 should_fire = old_state != new_state  # 无 emit_when：状态变化即发射
             if should_fire:
                 log.info(f"轮询 {watcher.key}（{uses}）emit 条件命中，发射")
-                self._fire(watcher)
+                await self._fire(watcher)
 
     # ── 快照 ──────────────────────────────────────────────────────────
 

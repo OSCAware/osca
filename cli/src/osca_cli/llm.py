@@ -75,8 +75,13 @@ class OpenAICompatLLM:
             text = payload["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError) as e:
             raise LLMError(f"LLM 网关响应不是 chat/completions 形状（{tag}）：{payload}") from e
-        tokens = (payload.get("usage") or {}).get("total_tokens") or _estimate_tokens(system, user, text)
-        return LLMReply(text=text, tokens=int(tokens), model=str(payload.get("model", self.model)))
+        # 用量自报是不可信输入（预算硬顶的记账源）：负数会冲减已用额度、非整数会炸记账——
+        # 缺失/0/负数/bool/非整数一律回落字符估算，绝不把非法上报放进硬预算（GPT Review P1 预算绕过）
+        usage = payload.get("usage")
+        tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens <= 0:
+            tokens = _estimate_tokens(system, user, text)
+        return LLMReply(text=text, tokens=tokens, model=str(payload.get("model", self.model)))
 
 
 class MockLLM:
@@ -89,7 +94,12 @@ class MockLLM:
 
     def complete(self, system: str, user: str, *, tag: str) -> LLMReply:
         self.calls.append(tag)
-        fixture = self.fixture_dir / f"{tag}.md"
+        # tag 含包内声明的步骤名等成分（不可信输入）：`../` 会把固件读引出固件目录——resolve 后
+        # 强制留在目录内（合法 tag 本就带子目录分层，约束按目录包含而非禁分隔符）
+        base = self.fixture_dir.resolve()
+        fixture = (base / f"{tag}.md").resolve()
+        if not fixture.is_relative_to(base):
+            raise LLMError(f"mock LLM 固件路径越界：{tag}——tag 不得把固件读引出固件目录")
         if not fixture.is_file():
             raise LLMError(f"mock LLM 固件缺失：{fixture}")
         text = fixture.read_text(encoding="utf-8")

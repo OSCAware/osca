@@ -738,3 +738,17 @@ def test_replay_health_stamp_dirty_stamp_race_rejected(tmp_path, monkeypatch):
 
     monkeypatch.setattr(policy_mod, "ledger_stamp", lambda root: "a" * 40)
     assert policy_mod.replay_health(tmp_path)["replay_green"] == 1  # 稳定一致才采信
+
+
+def test_charge_tokens_illegal_report_counts_zero_not_negative():
+    """GPT Review P1 预算绕过第二道闸：负数/bool/非整数用量上报不得冲减已用额度——按 0 计 + 审计留痕
+    （记账源头在 osca_cli.llm 已清洗，强制点自持，不信任可插拔 LLM 自律）。"""
+    p = make({**POLICY, "budgets": {"per_episode": {"max_tokens": 100}}})
+    assert p.charge_tokens("EP-1", 80)[0]
+    assert p.charge_tokens("EP-1", -1000)[0]  # 负上报按 0 计——不冲减
+    assert p.episode_budget_used("EP-1") == (0, 80)
+    assert p.charge_tokens("EP-1", True)[0]  # bool 不算数
+    assert p.episode_budget_used("EP-1") == (0, 80)
+    ok, reason = p.charge_tokens("EP-1", 30)  # 真用量照记，超顶即拒（止损顶语义不变）
+    assert not ok and "预算硬顶" in reason
+    assert any("用量上报非法" in a["reason"] for a in p.audit if a["decision"] == "warn")

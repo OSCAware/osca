@@ -23,11 +23,11 @@ async def test_fire_isolates_subscriber_exceptions():
 
     watcher = table.subscribe("event", {"source": "op"}, Subscription("p1", "AW-001", "AW-001/T3", bad))
     table.subscribe("event", {"source": "op"}, Subscription("p2", "AW-001", "AW-001/T3", hits.append))
-    table._fire(watcher)
+    await table._fire(watcher)
     assert hits == ["AW-001/T3"]  # 同伴照常收到派发
     assert table.watchers  # watcher 存活
 
-    error = table.fire_manual("p1", "AW-001/T3")  # 人工发射路径：异常转人话错误，不穿透控制通道
+    error = await table.fire_manual("p1", "AW-001/T3")  # 人工发射路径：异常转人话错误，不穿透控制通道
     assert error is not None and "派发异常" in error
     table.shutdown()
 
@@ -96,12 +96,12 @@ async def test_fire_manual_event_only():
     table.subscribe("event", {"source": "控制台"}, sub("p1", "AW-001", "AW-001/T3", hits))
     table.subscribe("schedule", SCHEDULE_SPEC, sub("p1", "AW-001", "AW-001/T1", hits))
 
-    assert table.fire_manual("p1", "AW-001/T3") is None
+    assert await table.fire_manual("p1", "AW-001/T3") is None
     assert hits == ["AW-001/T3"]
 
-    error = table.fire_manual("p1", "AW-001/T1")
+    error = await table.fire_manual("p1", "AW-001/T1")
     assert error and "仅 event 可人工发射" in error
-    assert table.fire_manual("p1", "AW-001/T9") is not None  # 未布防
+    assert await table.fire_manual("p1", "AW-001/T9") is not None  # 未布防
     table.shutdown()
 
 

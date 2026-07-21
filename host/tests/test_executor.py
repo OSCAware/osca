@@ -307,3 +307,32 @@ def test_openapi_truncated_response_fails_closed_not_partial(tmp_path):
         assert payload is None and "截断" in err  # 半截 JSON 虽可解析，仍拒（取数完整性）
     finally:
         s.close()
+
+
+def test_sql_readonly_impl_path_escape_rejected(tmp_path):
+    """GPT Review P1 路径越界：impl 是包内 manifest 声明（不可信输入）——`../` 与绝对路径把读引出
+    包根（宿主机任意可读文件被当 SQL 送执行）→ 一律拒绝，不出包根。"""
+    db = _make_fee_db(tmp_path)
+    outside = tmp_path / "outside.sql"
+    outside.write_text("SELECT 1 AS x", encoding="utf-8")
+    pack = tmp_path / "pack"
+    pack.mkdir()
+
+    rows, err = _run_sql(db, "../outside.sql", {}, pack_root=pack)
+    assert rows is None and "越界" in err  # 相对逃逸
+
+    rows, err = _run_sql(db, str(outside), {}, pack_root=pack)
+    assert rows is None and "越界" in err  # 绝对路径逃逸
+
+
+def test_sql_readonly_impl_symlink_escape_rejected(tmp_path):
+    """包内符号链接指向包外 SQL：resolve 后落在包根之外 → 同样拒绝（链接不是白手套）。"""
+    db = _make_fee_db(tmp_path)
+    outside = tmp_path / "outside.sql"
+    outside.write_text("SELECT 1 AS x", encoding="utf-8")
+    pack = tmp_path / "pack"
+    (pack / "sql").mkdir(parents=True)
+    (pack / "sql" / "linked.sql").symlink_to(outside)
+
+    rows, err = _run_sql(db, "sql/linked.sql", {}, pack_root=pack)
+    assert rows is None and "越界" in err
