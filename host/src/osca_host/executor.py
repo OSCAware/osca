@@ -222,6 +222,11 @@ class OpenapiExecutor:
                 chunks: list[bytes] = []
                 got = 0
                 while got <= _MAX_BODY:
+                    is_closed = getattr(resp, "isclosed", None)
+                    if is_closed is not None and is_closed():
+                        # 响应已读尽并关闭（3.12 起读满 Content-Length 即关连接）——收束，
+                        # 不再对已关 socket 设超时/发起下一次 read（误判成 fail-closed）
+                        break
                     if deadline is not None:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
