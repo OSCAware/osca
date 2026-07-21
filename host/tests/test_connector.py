@@ -543,3 +543,25 @@ def test_supports_keyword_timeout_judges_parameter_kinds():
     supported, why = supports_keyword_timeout(positional_only)
     assert supported is False and "positional-only" in why
     assert supports_keyword_timeout(no_timeout)[0] is False
+
+
+def test_supports_keyword_timeout_positional_only_beats_kwargs():
+    """四轮复核 P3：显式 positional-only timeout **优先于** **kwargs 判不支持——
+    `f(timeout, /, **kw)` 传 timeout= 仍 TypeError;`f(timeout=None, /, **kw)` 值落 kw、
+    形参拿默认值,语义上并未接收预算。两形态皆 fail-closed。"""
+    from osca_host.timeouts import supports_keyword_timeout
+
+    def required_pos_only_with_kwargs(timeout, /, **kwargs):
+        pass
+
+    def defaulted_pos_only_with_kwargs(timeout=None, /, **kwargs):
+        pass
+
+    def kwargs_only(**kwargs):
+        pass
+
+    supported, why = supports_keyword_timeout(required_pos_only_with_kwargs)
+    assert supported is False and "positional-only" in why
+    supported, why = supports_keyword_timeout(defaulted_pos_only_with_kwargs)
+    assert supported is False and "positional-only" in why
+    assert supports_keyword_timeout(kwargs_only)[0] is True  # 无显式 timeout 形参时 **kwargs 兜收合法

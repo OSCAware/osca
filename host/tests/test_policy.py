@@ -773,3 +773,39 @@ def test_redact_recurses_into_tuple():
     assert isinstance(redacted["联系"], tuple)  # 形状保留
     flat = str(redacted)
     assert "13812345678" not in flat and "13898765432" not in flat and "13811112222" not in flat
+
+
+def test_revoke_bounded_when_final_commit_hangs():
+    """四轮复核 P1：终局提交悬挂于存储时 revoke 必须**有界**返回（短事务预约:I/O 在锁外,
+    revoke 只有界等待在途计数）——不许把 revoke/关停一起卡死。"""
+    import time as time_mod
+
+    policy = PolicyInterceptor("p", {}, {})
+    policy.final_commit_grace = 0.2
+    ok, _ = policy.begin_final_commit()  # 模拟:预约后发布 I/O 永久卡死(不 end)
+    assert ok
+    started = time_mod.monotonic()
+    policy.revoke("关停（测试:提交悬挂）")
+    elapsed = time_mod.monotonic() - started
+    assert policy.revoked and elapsed < 2.0  # grace 0.2s + 调度余量,绝非无界
+    assert any("悬挂" in a["reason"] for a in policy.audit)  # 悬挂明标,不静默
+    ok, deny = policy.begin_final_commit()  # revoke 返回后零新提交开始
+    assert not ok and "包已停" in deny
+    policy.end_final_commit()  # 悬挂线程迟到归还:不炸、计数不为负
+
+
+def test_revoke_waits_briefly_for_inflight_commit_to_finish():
+    """在途提交在 grace 内收尾:revoke 等到归零才返回——「先于 revoke 返回完成」的正常路径。"""
+    import threading
+    import time as time_mod
+
+    policy = PolicyInterceptor("p", {}, {})
+    policy.final_commit_grace = 5.0
+    ok, _ = policy.begin_final_commit()
+    assert ok
+    threading.Timer(0.1, policy.end_final_commit).start()
+    started = time_mod.monotonic()
+    policy.revoke("关停（测试:提交及时收尾）")
+    elapsed = time_mod.monotonic() - started
+    assert 0.05 < elapsed < 3.0  # 等到了 end(≈0.1s),而非立即返回或吊满 grace
+    assert not any("悬挂" in a["reason"] for a in policy.audit)

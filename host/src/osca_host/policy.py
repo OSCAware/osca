@@ -30,6 +30,7 @@ import json
 import math
 import re
 import threading
+import time
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -202,6 +203,11 @@ class PolicyInterceptor:
         self._policy = policy  # kill switch 重算用（账本计数变了，条件不变）
         self._warned_conditions: set[str] = set()  # 不可求值条件只警告一次，重算不刷屏
         self._gate = threading.Lock()  # 授权/撤销的线性化边界：permit 与 revoke/kill 发布不许交错
+        # 终局提交短事务协议（四轮复核 P1）：gate 内只做**纯内存**预约/归还，不可逆发布的
+        # 文件 I/O 全在锁外——卡死的 fsync/link 绝不把 revoke/关停一起卡死（有界关停语义）
+        self._commit_cv = threading.Condition(self._gate)
+        self._final_commits_inflight = 0
+        self.final_commit_grace = 2.0  # revoke 等在途终局提交收尾的上限（秒）；超时明标悬挂，不无界等
         state, reason = self._eval_kill_switch(policy, ledger_stats)
         # 装载时无先前安全状态可保留：unavailable 以「未触发 + 警告留痕」起步——
         # kill 状态是账本与档案的可再评估信号，重启即重评；持久化停机名单归部署侧运维面（诚实标注）
@@ -338,23 +344,45 @@ class PolicyInterceptor:
     # ── 包停触达认知平面（三级停之三：撤销后在途剧集步间即停、调用全拒） ──
 
     def revoke(self, reason: str) -> None:
-        with self._gate:  # 与 authorize_llm/commit_if_active 同一线性化边界：revoke 返回后不再有新 permit/新提交
+        """撤销 + 终局提交栅栏（四轮复核 P1）：gate 内置位 revoked（此后 begin_final_commit 一律拒）,
+        再**有界**等待在途终局提交收尾（cv.wait 释放锁,不死锁）。语义：revoke 返回后不再有任何
+        **新开始**的终局提交;已开始的提交要么在 grace 内先于 revoke 返回完成,要么被明标为
+        「悬挂于存储」（存储卡死边界——线程不可强杀,无界等待会把 revoke/关停一起卡死,不做）。"""
+        deadline = time.monotonic() + self.final_commit_grace
+        with self._gate:
             self.revoked = reason
+            while self._final_commits_inflight > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._commit_cv.wait(remaining)
+            hung = self._final_commits_inflight
         self._record("deny", None, self.package_id, f"包停/撤销：{reason}——在途剧集步间即停，后续调用全部拒绝")
+        if hung:
+            self._record(
+                "warn",
+                None,
+                self.package_id,
+                f"revoke 时 {hung} 个终局提交仍悬挂于存储（有界等待 {self.final_commit_grace:.0f}s 超时）——"
+                "其发布可能迟到落地（存储卡死边界，明标；修复存储后核对账本）",
+            )
 
-    def commit_if_active(self, commit):
-        """终局提交屏障（复核 P1）：在授权锁（_gate）内复核未撤销后执行**不可逆发布动作**（如
-        outcome case 的 link 落名）——与 revoke() 共用同一线性化边界。语义保证：revoke() 返回后
-        不可能再有任何新提交完成（并发中的提交要么先于 revoke 返回完成、要么在此被拒）。
-
-        锁外的「先查 revoked 再发布」只是快路径，关不住「过检后阻塞、revoke、恢复提交」的窗——
-        终局动作必须在锁内。返回 (True, commit() 的返回值) 或 (False, 拒绝原因)。
-        """
+    def begin_final_commit(self) -> tuple[bool, str]:
+        """终局提交预约（四轮复核 P1 短事务协议）：gate 内**纯内存**登记在途提交——revoked 后新预约
+        一律拒绝。不可逆发布的文件 I/O 在锁外执行,完成后 end_final_commit 归还。与 revoke 的
+        栅栏配合：revoke 返回后零新提交开始;在途提交由 revoke 有界等待收尾。"""
         with self._gate:
             if self.revoked:
                 self._record("deny", None, self.package_id, f"终局提交拒绝：包已停（{self.revoked}）")
                 return False, f"包已停：{self.revoked}"
-            return True, commit()
+            self._final_commits_inflight += 1
+            return True, ""
+
+    def end_final_commit(self) -> None:
+        """归还终局提交预约（与 begin 配对,finally 里调）。"""
+        with self._gate:
+            self._final_commits_inflight = max(0, self._final_commits_inflight - 1)
+            self._commit_cv.notify_all()
 
     # ── 工具白名单（默认拒绝） ─────────────────────────────────────────
 

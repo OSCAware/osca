@@ -37,6 +37,11 @@ EXCLUDE_NAMES = {".DS_Store"}
 FORBIDDEN_NAMES = {"bindings.yaml"}  # 真实 binding，永不进包
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)  # 固定时间戳 → 可复现打包
 
+
+class LoadAborted(Exception):
+    """装载作废令牌在写边界命中（四轮复核 P1）——调用方转稳定装载失败，不是异常路径。"""
+
+
 # zip bomb 防护上限（.osca 包是纯文本 Markdown/YAML，正常包远小于这些数）
 MAX_ZIP_MEMBERS = 2000
 MAX_MEMBER_BYTES = 50 * 1024 * 1024  # 单成员解压上限
@@ -292,10 +297,12 @@ def signature_entries(pkg) -> list[dict]:
     return sorted(entries, key=lambda e: e["judgment_id"] or "")
 
 
-def rebuild_index(root: Path, pkg=None) -> Path:
+def rebuild_index(root: Path, pkg=None, *, abort: Callable[[], str | None] | None = None) -> Path:
     """重建判断签名表（检索契约 §7 第 1 段的硬过滤输入）。索引是缓存，坏了随时重建（公理 A4）。
 
     pkg 可传入已解析的 OscaPackage 复用（调用方刚解析过时省一次全包解析）。
+    abort（四轮复核 P1）：作废令牌在**写入边界内**（目录 fd 已开、发布之前）复核——
+    「检查通过后、写入之前作废」的窗由此关死；命中抛 LoadAborted，零发布。
     """
     pkg = pkg if pkg is not None else load_package(root)
     index = {
@@ -307,6 +314,8 @@ def rebuild_index(root: Path, pkg=None) -> Path:
     # 安全目录发布（与 settle 落账同一机制）：fd 锚定包根 + O_NOFOLLOW 打开 indexes/——
     # indexes 或索引文件被预置成符号链接时在此拒绝，索引写入永远出不了包根
     with open_ledger_dir(root, "indexes") as fd:
+        if abort is not None and (why := abort()):
+            raise LoadAborted(why)
         publish_file_in_dir(fd, "judgments.index.yaml", data, overwrite=True)
     return root / "indexes" / "judgments.index.yaml"
 
@@ -382,15 +391,20 @@ def _swap_lock(root: Path):
         os.close(fd)
 
 
-def _swap_into_dest(tmp: Path, root: Path) -> str | None:
+def _swap_into_dest(tmp: Path, root: Path, abort: Callable[[], str | None] | None = None) -> str | None:
     """**已通过全部校验**的临时目录原子上位（P1 升级安全）：跨进程 flock 内挪旧 → 上位 → 删旧。
 
     上位失败的恢复纪律（复核 P1）：若 root 已被锁外闯入者占用，先把未知内容**隔离**到
     quarantine 再把旧部署归位——绝不静默把错误内容留在 dest、也绝不丢弃合法旧部署。
+    abort（四轮复核 P1）：flock 等待可以无限长——锁前的作废检查关不住「等锁期间 STOPPED、
+    释放后迟到切换」；**取得锁之后、第一次 rename 之前**必须复核。
     """
     old: Path | None = None
     try:
         with _swap_lock(root):
+            if abort is not None and (why := abort()):
+                shutil.rmtree(tmp, ignore_errors=True)
+                return f"装载已作废：{why}——取得切换锁后复核止步，dest 未被触碰（迟到切换零副作用）"
             # 锁内重查可接管性：_dest_error 首查与拿锁之间 dest 可能被并发换成用户内容——
             # 锁内不过判据就放弃，绝不把来历不明的目录挪走再删掉
             error = _dest_error(root)
@@ -492,13 +506,18 @@ def _validate_package_root(
         )
 
     # 装载作废令牌（复核 P1）：rebuild_index 是本流水线里**第一处磁盘写**（目录模式直接写真实
-    # 包目录）——被取消/关停/换代作废的迟到 load worker 在写之前复核，作废即止步零写入
+    # 包目录）——迟到 load worker 在写之前复核；写入边界内（fd 已开、发布前）由 rebuild_index
+    # 再复核一次（四轮复核 P1：检查与写入之间无线性化屏障的窗关死），命中即 LoadAborted 零发布
     if abort is not None and (why := abort()):
         result.fail(f"装载已作废：{why}——校验止步，不写入索引（迟到 load 零磁盘副作用）")
         return False
 
     # 重建索引（zip 模式建在临时目录里，随原子切换一并上位）
-    index_path = rebuild_index(root)
+    try:
+        index_path = rebuild_index(root, abort=abort)
+    except LoadAborted as e:
+        result.fail(f"装载已作废：{e}——索引写入边界复核止步（零发布）")
+        return False
     result.step(f"签名表已重建：{index_path.relative_to(root).as_posix()}")
     return True
 
@@ -556,12 +575,12 @@ def load_osca(
     ):
         shutil.rmtree(tmp, ignore_errors=True)  # 校验失败：只清临时目录，dest 上的旧部署一字节不动
         return result, None
-    # 切换前复核作废令牌（复核 P1）：STOPPED/换代后的迟到 worker 到此为止——dest 一字节不动
+    # 切换前复核作废令牌（复核 P1，快路径——真正的屏障在 _swap_into_dest 取得 flock 之后）
     if abort is not None and (why := abort()):
         shutil.rmtree(tmp, ignore_errors=True)
         result.fail(f"装载已作废：{why}——切换取消，dest 未被触碰（迟到 load 零磁盘副作用）")
         return result, None
-    error = _swap_into_dest(tmp, root)
+    error = _swap_into_dest(tmp, root, abort=abort)
     if error:
         result.fail(error)
         return result, None

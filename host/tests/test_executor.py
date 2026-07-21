@@ -456,4 +456,49 @@ def test_openapi_total_deadline_bounds_slow_dribble_response():
         s.close()
     elapsed = time_mod.monotonic() - started
     assert payload is None and err is not None  # 总 deadline/超时截停
-    assert elapsed < 3.0  # 远小于滴漏完整发完所需的 ~5s
+    # 收紧上界（四轮复核 P2）：deadline 0.4s + 小调度余量——不是「< 3s」这类宽松断言;
+    # 每次 read 前 socket timeout 已压到 remaining,不存在再吊满整个旧 per-op timeout 的余地
+    assert elapsed < 1.0, elapsed
+
+
+def test_openapi_per_read_socket_timeout_tightened_to_remaining():
+    """四轮复核 P2：deadline 前启动的一次 read 不得再吊满旧 per-op timeout——首字节 0.15s 到达
+    后服务器停顿,timeout=0.25:旧实现耗时 ≈ 0.15+0.25;收紧后 ≈ deadline+小误差。"""
+    import socket
+    import threading
+    import time as time_mod
+
+    def serve(sock):
+        conn, _ = sock.accept()
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Type: application/json\r\n\r\n")
+        try:
+            time_mod.sleep(0.15)
+            conn.sendall(b"x")  # 首字节后停顿:后续 read 在 deadline 前启动、旧 timeout 未收紧则吊满
+            time_mod.sleep(5)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(1)
+    threading.Thread(target=serve, args=(s,), daemon=True).start()
+    host, port = s.getsockname()
+    started = time_mod.monotonic()
+    try:
+        payload, err = OpenapiExecutor().execute(
+            endpoint=f"openapi://{host}:{port}",
+            interface={"method": "GET", "path": "/stall"},
+            params={},
+            secret=None,
+            is_write=False,
+            pack_root=Path("."),
+            timeout=0.25,
+        )
+    finally:
+        s.close()
+    elapsed = time_mod.monotonic() - started
+    assert payload is None and err is not None
+    assert elapsed < 0.85, elapsed  # ≈ deadline(0.25)+余量;绝非 0.15+完整旧 timeout 的 0.4s 起步再加连接层重试

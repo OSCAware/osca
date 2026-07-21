@@ -566,3 +566,66 @@ def test_swap_failure_with_concurrent_root_quarantines_and_restores(make_pkg, ba
     assert _snapshot_tree(dest) == baseline  # 旧部署归位、字节不变
     (quarantined,) = list(tmp_path.glob(f".{dest.name}.osca-quarantine-*"))
     assert (quarantined / "闯入者.txt").read_text(encoding="utf-8") == "并发内容"  # 闯入内容被隔离留证
+
+
+def test_abort_rechecked_after_swap_lock_acquired(make_pkg, base, tmp_path, monkeypatch):
+    """四轮复核 P1：flock 等待可无限长——worker 通过锁前 abort 检查后等锁,期间 STOPPED;
+    取得锁后必须复核作废令牌,释放锁也不得迟到切换 dest。"""
+    import fcntl as fcntl_mod
+    import os as os_mod
+    import threading
+
+    zip1 = _packed(make_pkg, base, tmp_path)
+    dest = tmp_path / "deploy"
+    lock_path = tmp_path / f".{dest.name}.osca-swap.lock"
+    lock_path.touch()
+    holder_fd = os_mod.open(lock_path, os_mod.O_RDWR)
+    fcntl_mod.flock(holder_fd, fcntl_mod.LOCK_EX)  # 另一进程持锁
+    aborted = {"flag": False}
+
+    def abort():
+        return "Host 已 STOPPED（测试）" if aborted["flag"] else None
+
+    attempting = threading.Event()
+    real_flock = fcntl_mod.flock
+
+    def spy(fd, op):
+        if op == fcntl_mod.LOCK_EX and fd != holder_fd:
+            attempting.set()  # worker 已通过锁前检查、到达锁等待点
+        return real_flock(fd, op)
+
+    monkeypatch.setattr(packer.fcntl, "flock", spy)
+    box: dict = {}
+    worker = threading.Thread(target=lambda: box.update(r=load_osca(zip1, dest=dest, abort=abort)), daemon=True)
+    worker.start()
+    assert attempting.wait(10)
+    aborted["flag"] = True  # 等锁期间 Host STOPPED
+    real_flock(holder_fd, fcntl_mod.LOCK_UN)  # 释放锁:旧 worker 此刻才拿到锁
+    worker.join(10)
+    os_mod.close(holder_fd)
+    assert not worker.is_alive()
+    result, root = box["r"]
+    assert not result.ok and root is None
+    assert any("取得切换锁后复核" in line for line in result.lines)
+    assert not dest.exists()  # STOPPED 后零切换
+    assert not list(tmp_path.glob(f".{dest.name}.osca-tmp-*"))  # 临时目录已清理
+
+
+def test_dir_mode_abort_at_index_write_boundary(make_pkg, base, monkeypatch):
+    """四轮复核 P1：目录模式的 abort 检查与 rebuild_index 实际写入之间加线性化屏障——
+    fd 已开、发布之前作废(模拟 STOPPED)即 LoadAborted,索引零发布。"""
+    from osca_cli import packer as packer_mod
+
+    pkg = make_pkg(base)
+    state = {"armed": False}
+    real_open = packer_mod.open_ledger_dir
+
+    def flip_then_open(root, name):
+        state["armed"] = True  # 锁前检查之后、写入之前才作废
+        return real_open(root, name)
+
+    monkeypatch.setattr(packer_mod, "open_ledger_dir", flip_then_open)
+    result, root = load_osca(pkg, abort=lambda: "Host 已 STOPPED（测试）" if state["armed"] else None)
+    assert not result.ok and root is None
+    assert any("索引写入边界复核止步" in line for line in result.lines)
+    assert not (pkg / "indexes" / "judgments.index.yaml").exists()  # 零发布

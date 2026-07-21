@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import sqlite3
@@ -208,13 +209,23 @@ class OpenapiExecutor:
         try:
             with _OPENER.open(req, timeout=per_op) as resp:
                 status, declared = resp.status, resp.getheader("Content-Length")
+                # 底层 socket（CPython：HTTPResponse.fp 是 socket makefile 的 BufferedReader，
+                # raw 是 SocketIO）——每次 read 前把 socket timeout 收紧到 remaining（四轮复核 P2）：
+                # 只在块间查 deadline 时，deadline 前启动的一次 read 仍可吊满旧 per-op timeout。
+                sock = getattr(getattr(resp, "fp", None), "raw", None)
+                sock = getattr(sock, "_sock", None)
                 # 分块读 + 读上限：巨响应体不触发 OOM（DoS + call() 恒回 Receipt）。截断不在此判——
                 # 由下方 Content-Length 比对显式 fail-closed（不静默把半截数据当取数结果）。
                 chunks: list[bytes] = []
                 got = 0
                 while got <= _MAX_BODY:
-                    if deadline is not None and time.monotonic() > deadline:
-                        return None, f"openapi {method} 总 deadline 用尽（响应读取中止）——fail-closed"
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return None, f"openapi {method} 总 deadline 用尽（响应读取中止）——fail-closed"
+                        if sock is not None:
+                            with contextlib.suppress(OSError):
+                                sock.settimeout(max(0.001, min(per_op, remaining)))
                     chunk = resp.read1(min(65536, _MAX_BODY + 1 - got))
                     if not chunk:
                         break

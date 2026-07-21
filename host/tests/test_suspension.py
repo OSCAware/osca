@@ -341,3 +341,48 @@ def test_reclaim_unlink_failure_enters_storage_fault(store, monkeypatch):
     assert s.persist("EO-next", {"operation_id": "EO-next"}) is False  # 故障态拒绝新持久化
     assert not (tmp / "susp-EO-next.json").exists()
     assert s._ops == {}  # 凭据仍 exactly-once 归还
+
+
+def test_storage_fault_marker_survives_restart(store, monkeypatch, tmp_path):
+    """四轮复核 P2：故障态落盘 FAULT_MARKER——重启（同目录新建 store）后故障态仍在,孤本不复活;
+    运维删除标记后方可恢复。"""
+    from osca_host.suspension import FAULT_MARKER, SuspensionStore
+
+    s, tmp = store
+    real_fsync, real_unlink = os.fsync, os.unlink
+
+    def fail_dir_fsync(fd):
+        if fd == s._fd:
+            raise OSError("目录 fsync 失败")
+        return real_fsync(fd)
+
+    def fail_susp_unlink(name, *args, **kwargs):
+        if str(name).startswith("susp-") and str(name).endswith(".json"):
+            raise OSError("unlink 失败")
+        return real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", fail_dir_fsync)
+    monkeypatch.setattr(os, "unlink", fail_susp_unlink)
+    with pytest.raises(OSError):
+        s.persist("EO-orphan", {"operation_id": "EO-orphan"})
+    monkeypatch.undo()
+    assert s.storage_fault is not None
+    assert (tmp / "susp-EO-orphan.json").exists()  # 孤本在盘
+    assert (tmp / FAULT_MARKER).exists()  # 故障标记已落盘
+
+    fd2 = os.open(str(tmp), os.O_RDONLY | os.O_DIRECTORY)  # 等价进程重启:同目录新建 store
+    try:
+        fresh = SuspensionStore(fd2)
+        assert fresh.storage_fault is not None and "遗留存储故障标记" in fresh.storage_fault
+        assert fresh.load_all() == []  # 重启不洗白:孤本不复活
+        assert fresh.persist("EO-again", {"operation_id": "EO-again"}) is False
+    finally:
+        os.close(fd2)
+
+    (tmp / FAULT_MARKER).unlink()  # 运维修复存储并显式清除标记
+    fd3 = os.open(str(tmp), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        healthy = SuspensionStore(fd3)
+        assert healthy.storage_fault is None  # 显式确认后方可恢复
+    finally:
+        os.close(fd3)

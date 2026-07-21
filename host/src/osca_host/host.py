@@ -257,11 +257,16 @@ class Host:
         def _abort() -> str | None:
             """线程安全的装载作废令牌（复核 P1）：load worker 在守护线程里跑——被取消的 coroutine
             拦不住线程继续执行,STOPPED/换代之后的迟到 worker 必须在磁盘写副作用（索引重建/dest
-            切换）之前自行止步。GIL 下读这两个字段是原子的;stop/unload 都先推进它们再走后续。"""
+            切换）之前自行止步。GIL 下读这些字段是原子的;stop/unload 都先推进它们再走后续。
+            unload tombstone 一并纳入（四轮复核 P1）：worker 在解析出 package_id 之前不知道
+            自己属谁——本次装载开始后发生的**任何** unload 都保守作废（fail-closed:宁可让无关
+            装载重试,不让被 tombstone 的包把磁盘副作用做完）。"""
             if self.state is not HostState.RUNNING:
                 return f"Host 已 {self.state.name}"
             if self._deployment_generations.get(deployment_id) != generation:
                 return "load generation 已失效（unload/关停/新一代 load）"
+            if self._last_unload_operation > operation:
+                return "本次装载开始后已有 unload tombstone（保守作废,可重试）"
             return None
 
         def _build():

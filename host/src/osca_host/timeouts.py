@@ -12,16 +12,22 @@ import inspect
 
 
 def supports_keyword_timeout(fn) -> tuple[bool, str]:
-    """fn 能否以 `timeout=` 关键字接收剩余时间预算。返回 (支持?, 不支持的人话原因)。"""
+    """fn 能否以 `timeout=` 关键字接收剩余时间预算。返回 (支持?, 不支持的人话原因)。
+
+    positional-only 的 timeout **优先于 **kwargs 判不支持**（四轮复核 P3）：
+    `def f(timeout, /, **kw)` 传 `timeout=1` 仍 TypeError（必需位置参数缺失）；
+    `def f(timeout=None, /, **kw)` 虽可调用，但值落进 kw、真正的 timeout 形参拿到默认值——
+    语义上并未接收预算。两种形态都判不支持，fail-closed。
+    """
     try:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False, "签名不可内省"
     p = params.get("timeout")
+    if p is not None and p.kind is inspect.Parameter.POSITIONAL_ONLY:
+        return False, "timeout 形参为 positional-only（不可按关键字传递；**kwargs 兜收也接不到该形参）"
     if p is not None and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
         return True, ""
     if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()):
         return True, ""
-    if p is not None:  # 形参名叫 timeout 但 positional-only——按关键字传必 TypeError，判不支持
-        return False, "timeout 形参为 positional-only（不可按关键字传递）"
     return False, "未声明 timeout 参数（也无 **kwargs）"

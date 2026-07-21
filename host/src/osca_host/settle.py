@@ -112,17 +112,18 @@ def settle_episode(loaded: LoadedPackage, proxy: ConnectorProxy, episode: Episod
             while True:
                 case["case_id"] = case_id
                 payload = yaml.safe_dump(case, allow_unicode=True, sort_keys=False).encode("utf-8")
-                # 终局提交屏障（复核 P1）：不可逆的发布动作在 policy._gate 内执行——与 revoke()
-                # 同一线性化边界，revoke 返回后不可能再有新 case 可见（锁外预检关不住
-                # 「过检后阻塞于 ledger lock、期间 revoke、恢复后落账」的窗）
-                active, published = proxy.policy.commit_if_active(
-                    lambda name=f"{case_id}.yaml", data=payload: publish_file_in_dir(
-                        cases_fd, name, data, overwrite=False
-                    )
-                )
+                # 终局提交预约（三轮/四轮复核 P1）：begin 在 policy._gate 内**纯内存**登记——revoke 后
+                # 新预约一律拒（关「过检后阻塞于 ledger lock、期间 revoke、恢复后落账」的窗）；发布
+                # I/O 本身在锁外（卡死的 fsync/link 不许把 revoke/关停一起卡死），revoke 以有界等待
+                # 收尾在途提交、超时明标悬挂。
+                active, deny = proxy.policy.begin_final_commit()
                 if not active:
-                    aborted = str(published)  # 拒绝原因
+                    aborted = deny
                     break
+                try:
+                    published = publish_file_in_dir(cases_fd, f"{case_id}.yaml", payload, overwrite=False)
+                finally:
+                    proxy.policy.end_final_commit()
                 if published:
                     break
                 n += 1  # 无覆盖发布：撞号顺移重试（编号随内容重写保持一致），绝不截断他人内容

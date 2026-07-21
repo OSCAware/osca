@@ -1633,10 +1633,10 @@ async def test_late_load_worker_never_mutates_dest_after_stopped(sock_path, samp
     entered, release, worker_done = threading.Event(), threading.Event(), threading.Event()
     real_rebuild = packer_mod.rebuild_index
 
-    def gated_rebuild(root, pkg=None):
+    def gated_rebuild(root, pkg=None, **kwargs):
         entered.set()
         release.wait(10)  # 卡在校验流水线末步（切换之前）
-        return real_rebuild(root, pkg)
+        return real_rebuild(root, pkg, **kwargs)
 
     real_lfh = host_mod.load_for_host
 
@@ -1667,3 +1667,28 @@ async def test_late_load_worker_never_mutates_dest_after_stopped(sock_path, samp
     assert not list(tmp_path.glob(f".{dest.name}.osca-tmp-*"))  # 临时目录亦清理
     with contextlib.suppress(Exception):
         await asyncio.wait_for(load_task, timeout=5)
+
+
+async def test_stopped_within_bound_when_final_commit_hangs(running_host, sample_pack, deploy):
+    """四轮复核 P1：settle 的发布 I/O 永久悬挂(在途终局提交不归还)时,Host 仍在承诺时限内
+    到达 STOPPED——revoke 不再持锁做文件 I/O,只有界等待在途提交。"""
+    import time as time_mod
+
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    policy = host.policies[pid]
+    policy.final_commit_grace = 0.2
+    ok, _ = policy.begin_final_commit()  # 模拟:对账发布卡死在 fsync/link(永不归还)
+    assert ok
+    host._episode_shutdown_timeout = 0.2
+    started = time_mod.monotonic()
+    host._stop.set()
+    for _ in range(200):
+        if host.state.name == "STOPPED":
+            break
+        await asyncio.sleep(0.05)
+    elapsed = time_mod.monotonic() - started
+    assert host.state.name == "STOPPED"
+    assert elapsed < 8.0  # 有界关停:悬挂提交明标后放行,不无界等待
+    policy.end_final_commit()  # 收尾,不留悬挂计数

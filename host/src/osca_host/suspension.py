@@ -31,6 +31,7 @@ log = logging.getLogger("osca-host")
 
 PREFIX = "susp-"
 SUFFIX = ".json"
+FAULT_MARKER = "storage-fault.marker"  # 持久故障标记（四轮复核 P2）：活过重启，运维修复后手工删除
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
@@ -90,15 +91,48 @@ class SuspensionStore:
         self._ops: dict[str, _OpState] = {}  # 仅在途 operation 有条目（凭据归零即回收）
         # 显式存储故障态（复核 P2）：非 None 即持久层降级——「退回 L1」的承诺（快照不活过重启）
         # 已无法兑现（收回失败=盘上留孤本 / 删除耐久性未知=崩溃后可复活）。降级后 persist 拒绝、
-        # load_all 拒绝重挂，要求运维修复存储后重启 Host（进程内一旦降级不自动恢复——诚实口径）。
+        # load_all 拒绝重挂。读写经 _registry 锁（fault 迁移与 persist/load_all 共享同一存储级
+        # gate，无并发穿越）；**落盘 FAULT_MARKER 活过重启**（四轮复核 P2）——运维修复存储并
+        # 删除标记后方可恢复重挂，重启不洗白孤本。
         self.storage_fault: str | None = None
+        try:
+            fd = os.open(FAULT_MARKER, os.O_RDONLY | _NOFOLLOW, dir_fd=dir_fd)
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
+                reason = f.read().strip() or "（原因未记录）"
+            self.storage_fault = f"上次运行遗留存储故障标记：{reason}（运维修复存储并删除 {FAULT_MARKER} 后方可恢复）"
+            log.error(f"挂起持久层带故障标记启动——persist/重挂停用：{self.storage_fault}")
+        except FileNotFoundError:
+            pass
+        except OSError as e:  # 标记在但读不了——同样按故障态处理（fail-closed）
+            self.storage_fault = f"存储故障标记读取失败（{e}）——按故障态处理"
+            log.error(self.storage_fault)
+
+    def _fault(self) -> str | None:
+        with self._registry:
+            return self.storage_fault
 
     def _enter_storage_fault(self, why: str) -> None:
-        if self.storage_fault is None:
+        with self._registry:
+            if self.storage_fault is not None:
+                return
             self.storage_fault = why
-            log.error(
-                f"挂起持久层进入存储故障态（fail-closed 降级）：{why}——后续持久化与重挂全部停用，请修复存储后重启 Host"
-            )
+        log.error(
+            f"挂起持久层进入存储故障态（fail-closed 降级）：{why}——后续持久化与重挂全部停用，"
+            f"请修复存储并删除 {FAULT_MARKER} 后重启 Host"
+        )
+        # 标记落盘（best-effort——存储本身在坏，写不进也已有内存态兜住本进程；写得进则活过重启，
+        # 关掉「重启新建 store 洗白孤本」的窗）。锁外执行：故障盘上的 I/O 不许攥着注册锁。
+        try:
+            fd = os.open(FAULT_MARKER, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW, 0o600, dir_fd=self._fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(why)
+                f.flush()
+                with contextlib.suppress(OSError):
+                    os.fsync(f.fileno())
+            with contextlib.suppress(OSError):
+                os.fsync(self._fd)
+        except OSError:
+            log.error("存储故障标记落盘失败——标记仅本进程内存生效（存储已坏到写不进标记；重启前务必修复存储）")
 
     def _name(self, operation_id: str) -> str:
         return f"{PREFIX}{operation_id}{SUFFIX}"
@@ -160,7 +194,7 @@ class SuspensionStore:
             ticket.status = _CLAIMED
         st = ticket.state
         try:
-            if self.storage_fault:
+            if self._fault():
                 log.warning(f"挂起持久层处于存储故障态，拒绝持久化（不再谎称退回 L1）：{operation_id}")
                 return False
             try:
@@ -171,6 +205,10 @@ class SuspensionStore:
             with st.lock:
                 with self._registry:
                     invalidated = st.delete_gen != ticket.token
+                    fault = self.storage_fault  # 与 fault 迁移共享存储级 gate（四轮复核 P2：无并发穿越窗）
+                if fault:
+                    log.warning(f"挂起持久层已进入存储故障态（写前复核），拒绝持久化：{operation_id}")
+                    return False
                 if invalidated:
                     log.info(f"挂起快照落盘前已被恢复作废（决定竞态），放弃写盘：{operation_id}")
                     return False
@@ -238,8 +276,8 @@ class SuspensionStore:
         存储故障态下**拒绝重挂**（复核 P2）：故障期间盘上内容不可信（收回失败的孤本/删除耐久性
         未知的残影），读回重挂可能兑现本应作废的写——fail-closed 空表，要求运维修复。
         """
-        if self.storage_fault:
-            log.error(f"挂起持久层存储故障态，拒绝重挂：{self.storage_fault}")
+        if fault := self._fault():
+            log.error(f"挂起持久层存储故障态，拒绝重挂：{fault}")
             return []
         out: list[dict] = []
         try:
