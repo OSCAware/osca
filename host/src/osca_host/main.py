@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--bindings", help="部署环境 bindings.yaml，装载时比对")
     p_run.add_argument(
         "--deployments",
-        help="部署清单 deployments.yaml：deployment_id → {path[, bindings, dest]}——控制通道 load 只收 ID",
+        help="部署清单 deployments.yaml：deployment_id → {path[, bindings, dest, egress_extra]}——控制通道 load 只收 ID",
     )
 
     sub.add_parser("status", help="注册表快照：已装载的包 / Aware / watcher 槽位")
@@ -102,8 +102,8 @@ def _load_deployments(path: str) -> dict[str, dict]:
     deployments: dict[str, dict] = {}
     for did, spec in data.items():
         did = clean_text(did, f"部署 ID {did!r}", max_len=200)
-        if not isinstance(spec, dict) or "path" not in spec or set(spec) - {"path", "bindings", "dest"}:
-            raise ValueError(f"部署 {did} 须是 {{path[, bindings, dest]}}（path 必填，不收其他键）")
+        if not isinstance(spec, dict) or "path" not in spec or set(spec) - {"path", "bindings", "dest", "egress_extra"}:
+            raise ValueError(f"部署 {did} 须是 {{path[, bindings, dest, egress_extra]}}（path 必填，不收其他键）")
         clean: dict = {}
         for key in ("path", "bindings", "dest"):
             if key not in spec:
@@ -112,6 +112,13 @@ def _load_deployments(path: str) -> dict[str, dict]:
                 raise ValueError(f"部署 {did} 的 {key} 不接受 null；不使用可选字段时请省略")
             value = Path(clean_text(spec[key], f"部署 {did} 的 {key}"))
             clean[key] = str(value if value.is_absolute() else base / value)
+        # egress_extra（M7-W4）：部署侧注入的真实 egress host 列表（并入 policy egress_allow）——须非空字符串列表，
+        # 恶形硬拒（同 path/bindings/dest 严格验型，deploy 清单错即拒启动 fail-closed）；host 非路径，不按 base 解析。
+        if "egress_extra" in spec:
+            raw = spec["egress_extra"]
+            if not isinstance(raw, list) or any(not isinstance(h, str) or not h.strip() for h in raw):
+                raise ValueError(f"部署 {did} 的 egress_extra 须是非空字符串列表（egress 允许的 host）")
+            clean["egress_extra"] = [h.strip() for h in raw]
         deployments[did] = clean
     return deployments
 

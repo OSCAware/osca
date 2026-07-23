@@ -55,6 +55,34 @@ def test_deployments_reject_falsy_non_mapping_top_level(tmp_path, text):
         _load_deployments(str(path))
 
 
+def test_deployments_egress_extra_valid_parsed(tmp_path):
+    """M7-W4：egress_extra 合法（非空字符串列表）→ 解析并入 clean（host 不按 base 解析路径）。"""
+    path = tmp_path / "deployments.yaml"
+    path.write_text(
+        'demo:\n  path: /var/lib/packs/demo.osca\n  egress_extra: ["127.0.0.1", "gw.internal"]\n',
+        encoding="utf-8",
+    )
+    d = _load_deployments(str(path))
+    assert d["demo"]["egress_extra"] == ["127.0.0.1", "gw.internal"]
+    assert d["demo"]["path"].endswith("/var/lib/packs/demo.osca")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        'd:\n  path: /p\n  egress_extra: "127.0.0.1"\n',  # 非 list
+        "d:\n  path: /p\n  egress_extra: [1, 2]\n",  # 含非字符串
+        'd:\n  path: /p\n  egress_extra: [""]\n',  # 空串
+        "d:\n  path: /p\n  egress_extra: []\n  other: 1\n",  # 未知键（回归：白名单仍拒 egress_extra 以外的其它键）
+    ],
+)
+def test_deployments_reject_malformed_egress_extra_or_unknown_key(tmp_path, bad):
+    path = tmp_path / "deployments.yaml"
+    path.write_text(bad, encoding="utf-8")
+    with pytest.raises(ValueError):
+        _load_deployments(str(path))
+
+
 def test_client_rejects_lax_principal_token_file_before_connecting(tmp_path, monkeypatch):
     token_file = tmp_path / "operator.token"
     token_file.write_text("operator-owned-token", encoding="utf-8")
