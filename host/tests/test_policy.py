@@ -159,6 +159,28 @@ def test_interceptor_fails_closed_on_broken_safety_config():
     assert p4.kill_tripped and "配置错误" in p4.kill_reason  # when 非字符串 → 停机
     p5 = make(policy={**POLICY, "data": "oops"})  # 父段本身非法——不得压成 {} 与「未声明」混同
     assert set(p5.redact_categories) == set(REDACTORS)
+
+
+def test_egress_extra_deploy_side_injection():
+    """M7-W4：部署侧 egress_extra 并入 egress_allow——egress 真实 host 环境特定，同 binding 不入包。"""
+    p = PolicyInterceptor(
+        "demo", {"egress": {"allow_domains": ["dispatch.internal.example"]}}, HEALTHY, egress_extra=["127.0.0.1"]
+    )
+    assert p.authorize_egress("127.0.0.1")[0]  # 注入的真实 host 放行（仿真后端回环）
+    assert p.authorize_egress("dispatch.internal.example")[0]  # 包内语义占位仍在（不覆盖，只增补）
+    assert not p.authorize_egress("evil.com")[0]  # 未声明仍默认全禁
+
+
+def test_egress_extra_fail_closed_on_malformed():
+    """非 list / 含非字符串 / 空串一律弃用不并（fail-closed，绝不静默放宽 egress）。"""
+    base = {"egress": {"allow_domains": ["ok.internal"]}}
+    p1 = PolicyInterceptor("demo", base, HEALTHY, egress_extra="127.0.0.1")  # 字符串非 list
+    assert not p1.authorize_egress("127.0.0.1")[0] and not p1.authorize_egress("1")[0]  # 整体弃用，不逐字符并入
+    p2 = PolicyInterceptor("demo", base, HEALTHY, egress_extra=["10.0.0.1", "", 42, "  "])  # 混合坏叶子
+    assert p2.authorize_egress("10.0.0.1")[0]  # 合法叶子并入
+    assert not p2.authorize_egress("")[0] and not p2.authorize_egress("42")[0]  # 空串/非字符串弃用
+    p3 = PolicyInterceptor("demo", base, HEALTHY, egress_extra=None)  # None → 无增补
+    assert p3.authorize_egress("ok.internal")[0] and not p3.authorize_egress("127.0.0.1")[0]
     p6 = make(policy={**POLICY, "kill_switch": [{"when": "   "}]})  # 空白 when 与 lint 谓词对齐
     assert p6.kill_tripped and "配置错误" in p6.kill_reason
 

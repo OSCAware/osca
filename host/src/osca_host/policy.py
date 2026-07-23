@@ -69,7 +69,13 @@ AUDIT_TAIL = 20  # status 里只带最近这些条
 
 class PolicyInterceptor:
     def __init__(
-        self, package_id: str, policy: dict, ledger_stats: dict[str, int], *, challenges: ChallengeStore | None = None
+        self,
+        package_id: str,
+        policy: dict,
+        ledger_stats: dict[str, int],
+        *,
+        challenges: ChallengeStore | None = None,
+        egress_extra: list[str] | None = None,
     ):
         self.package_id = package_id
         self.audit: list[dict] = []
@@ -160,6 +166,17 @@ class PolicyInterceptor:
             shape_warn("egress.allow_domains", domains, "字符串列表")
             domains = []
         self.egress_allow: set[str] = set(domains or [])
+        # 部署侧 egress 增补（M7-W4）：egress 允许的**真实 host** 是环境特定的（仿真=127.0.0.1，生产=真网关 host），
+        # 本就该像 binding 一样部署侧注入、不烤进公共包 policy——deployment spec 的 egress_extra 在此并入 egress_allow。
+        # 校验同 allow_domains（须非空字符串列表）：非 list / 含非字符串 / 空串一律弃用不并（fail-closed，不放宽）。
+        if egress_extra is not None and not isinstance(egress_extra, list):
+            shape_warn("egress_extra", egress_extra, "字符串列表")
+            egress_extra = []
+        for entry in egress_extra or []:
+            if isinstance(entry, str) and entry.strip():
+                self.egress_allow.add(entry.strip())
+            else:
+                shape_warn("egress_extra", entry, "非空字符串 host")
 
         # 脱敏：配置非法（父段/形状/混合元素/未知类别）→ 保守启用全部已知类别——宁可多脱，不可泄露。
         # 父段 data 本身非法不得压成 {}——那会与合法的「未声明 redact」混同，退化成 fail-open

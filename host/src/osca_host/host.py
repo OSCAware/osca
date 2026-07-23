@@ -278,7 +278,8 @@ class Host:
             return await self._load(spec, deployment_id, generation, operation)
 
     async def _load(self, spec: dict, deployment_id: str, generation: int, operation: int) -> dict:
-        """装载一个部署条目：{path[, bindings, dest]}——路径只来自服务端部署清单。
+        """装载一个部署条目：{path[, bindings, dest, egress_extra]}——路径只来自服务端部署清单。
+        egress_extra（M7-W4，可选字符串列表）：部署侧注入的真实 egress host，并入包 policy 的 egress_allow。
 
         重活（读盘/解压/lint/索引重建、binding 读取、git 戳探测）整段进线程，
         **锁外**执行——慢 load 不许压住 status/stop；_cmd_lock 只罩短暂的发布段
@@ -337,7 +338,14 @@ class Host:
         pid = loaded.package_id
         try:
             policy_file = loaded.pack.yaml_files.get("policy.yaml")
-            policy = PolicyInterceptor(pid, policy_file.mapping if policy_file else {}, ledger_stats(loaded.pack))
+            # egress_extra（M7-W4）：部署侧注入的真实 egress host（环境特定，同 binding 不入包）——
+            # 并入 egress_allow；PolicyInterceptor 自校验（非法叶子弃用不放宽，fail-closed）。
+            policy = PolicyInterceptor(
+                pid,
+                policy_file.mapping if policy_file else {},
+                ledger_stats(loaded.pack),
+                egress_extra=spec.get("egress_extra"),
+            )
             proxy = ConnectorProxy(loaded, pkg_bindings, policy)
             # precondition 绑**本代** proxy（跨代不外呼，GPT 三审 P1）——旧 Gate 的求值恒走旧代理，
             # unload 后旧 policy 已 revoke，授权层必拒
