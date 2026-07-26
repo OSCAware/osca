@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from osca_cli.triggers import parse_duration, parse_schedule, validate_gate, validate_trigger
 
 # ── 时长语法 ──
@@ -30,6 +32,13 @@ def test_schedule_monthly():
     sched, errors = parse_schedule({"every": "month", "day": 9, "time": "09:00"})
     assert errors == []
     assert (sched.every, sched.day, sched.time) == ("month", 9, "09:00")
+
+
+@pytest.mark.parametrize("day", [True, False])
+def test_monthly_schedule_rejects_boolean_day(day):
+    schedule, errors = parse_schedule({"every": "month", "day": day, "time": "09:00"})
+    assert schedule is None
+    assert errors
 
 
 def test_schedule_free_text_rejected():
