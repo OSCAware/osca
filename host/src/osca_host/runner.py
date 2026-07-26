@@ -22,7 +22,6 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import asdict
-from datetime import datetime
 
 import yaml
 from osca_cli.llm import LLMError, estimate_tokens, resolve_llm
@@ -30,6 +29,7 @@ from osca_cli.triggers import AWARE_BUDGET_KEYS, PERFORMERS, parse_performer
 
 from osca_host.connector import ConnectorProxy
 from osca_host.episode import Episode
+from osca_host.lifecycle import finish_episode_state
 from osca_host.loader import LoadedPackage
 from osca_host.policy import PolicyInterceptor, parse_quantity
 from osca_host.timeouts import supports_keyword_timeout
@@ -162,10 +162,7 @@ def _record(episode: Episode, step: str, performer: str, status: str, detail: st
 
 
 def _finish(episode: Episode, status: str, reason: str | None = None) -> Episode:
-    episode.status = status
-    episode.stop_reason = reason
-    episode.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    return episode
+    return finish_episode_state(episode, status, reason)
 
 
 def _suspend_episode(
