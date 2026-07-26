@@ -32,6 +32,7 @@
 
 **Interfaces:**
 - Produces: `SnapshotError`, `PackageSnapshot.capture(root, *, max_member_bytes, max_total_bytes)`, `load_package(root, snapshot=None)`, `lint_snapshot(snapshot, package: str | None = None)`.
+- Produces: `PackageSnapshot.with_root(root) -> PackageSnapshot`, preserving bytes, directories and fingerprint while rebinding the root after a zip directory rename.
 - Produces: `OscaPackage.exists()`, `OscaPackage.has_directory()`, `OscaPackage.is_file()`, `OscaPackage.iter_text_files()` backed by snapshot bytes.
 - Consumes: existing YAML bounds, `REQUIRED_FILES`, `SKIP_DIRS`, lint `run_all`.
 
@@ -272,6 +273,7 @@ def test_zip_snapshot_is_captured_before_dest_switch(make_pkg, base, tmp_path, m
     monkeypatch.setattr(packer, "_swap_into_dest", mutate_after_swap)
     result, root, snapshot = packer.load_osca_snapshot(archive, dest=dest)
     assert result.ok and root == dest
+    assert snapshot.root == dest
     assert snapshot.read_text("AGENT.md") != "post-swap"
 ```
 
@@ -285,9 +287,11 @@ Expected: directory test observes the second read; zip handoff Interface is miss
 
 Refactor `_validate_package_root` to accept or return the exact captured snapshot used by integrity, lint and binding checks. For zip, capture the extracted temporary directory and carry that object across `_swap_into_dest`; never recapture `dest`. Implement `load_osca` as a two-value compatibility Adapter over `load_osca_snapshot`.
 
+After a successful zip swap, call `snapshot.with_root(dest)` before returning it. Snapshot consumers use only relative-path byte/directory Interfaces; `load_package(dest, snapshot=snapshot)` supplies the live deployment root for mutable ledger paths. No consumer may perform I/O through the dead pre-rename temporary path.
+
 - [ ] **Step 4: Parse Host structures from the returned snapshot**
 
-`load_for_host` must call `load_osca_snapshot`, then `load_package(root, snapshot=snapshot)`. Remove the historical second live-directory parse.
+`load_for_host` must call `load_osca_snapshot`, then `load_package(root, snapshot=snapshot)`. Remove the historical second live-directory parse. Assert in the zip regression that `snapshot.root == dest`.
 
 - [ ] **Step 5: Pin the package generation during Episode assembly**
 
@@ -321,6 +325,8 @@ return Episode(
 
 Keep the field in `dump()` for L2 persistence; `summary()` need not expose it.
 
+The dataclass snippet shows field placement only. Add exactly `package_fingerprint: str = ""` to the existing Episode; do not rewrite or delete `operation_id`, `status`, `steps`, `resume`, `tokens_used`, settlements or any other field. The empty default preserves deserialization of old L2 Episode dictionaries.
+
 - [ ] **Step 6: Replace `_pack_stamp` disk hashing**
 
 `Host._pack_stamp(loaded)` returns `loaded.pack.snapshot.fingerprint`. `_persist_suspension` writes `episode.package_fingerprint`, not the current registry package. Reattach compares the record stamp with the newly loaded snapshot stamp and logs a precise generation mismatch.
@@ -337,7 +343,23 @@ await host._persist_suspension(episode, policy)
 assert stored["version_stamp"] == g1_fingerprint
 ```
 
-- [ ] **Step 8: Run CLI and Host load/suspension tests**
+- [ ] **Step 8: Migrate ledger refresh to the snapshot generation**
+
+Inside `_refresh_ledger` and its existing `ledger_lock`, call `PackageSnapshot.capture(loaded.root)`, then `load_package(loaded.root, snapshot=fresh_snapshot)`. Run lint, rebuild the generated index and evaluate kill-switch input from that same `fresh` package. Only after every step succeeds assign `loaded.pack = fresh` and publish the paired kill-switch state; on any failure retain the old package generation.
+
+Add this regression:
+
+```python
+def test_refresh_publishes_snapshot_generation_used_by_next_episode(host, loaded, policy):
+    old_fingerprint = loaded.pack.snapshot.fingerprint
+    (loaded.root / "AGENT.md").write_text("refreshed generation", encoding="utf-8")
+    assert host._refresh_ledger(loaded, policy)
+    episode = assemble("EP-refresh", loaded, loaded.awares[0], loaded.awares[0].triggers[0].trigger_id)
+    assert episode.package_fingerprint == loaded.pack.snapshot.fingerprint
+    assert episode.package_fingerprint != old_fingerprint
+```
+
+- [ ] **Step 9: Run CLI and Host load/suspension tests**
 
 Run: `cd cli && uv run pytest tests/test_pack_load.py -q`
 
@@ -345,7 +367,7 @@ Run: `cd host && uv run pytest tests/test_loader.py tests/test_episode.py tests/
 
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add cli/src/osca_cli/packer.py host/src/osca_host/loader.py host/src/osca_host/host.py host/src/osca_host/episode.py cli/tests host/tests
@@ -366,6 +388,7 @@ git commit -m "fix(host): bind loads and suspensions to package generations"
 
 **Interfaces:**
 - Produces: `finish_episode_state(episode, status, reason=None) -> Episode`.
+- Produces: `EpisodeLifecycle.suspend(episode, challenge_id) -> Episode`.
 - Produces: `EpisodeLifecycle.finish(episode, status=None, reason=None, policy=None) -> Episode`.
 - Produces: `EpisodeLifecycle.evict(episode_id, policy=None) -> Episode | None`.
 - Produces: `PolicyInterceptor.release_episode(episode_id) -> None`.
@@ -565,7 +588,7 @@ git commit -m "fix(host): isolate shared watcher subscribers"
 ```python
 @pytest.mark.parametrize("day", [True, False])
 def test_monthly_schedule_rejects_boolean_day(day):
-    schedule, errors = parse_schedule({"every": "month", "day": day, "at": "09:00"})
+    schedule, errors = parse_schedule({"every": "month", "day": day, "time": "09:00"})
     assert schedule is None
     assert errors
 ```
@@ -582,7 +605,7 @@ Use `type(day) is int and 1 <= day <= 31`, preserving all other parser behavior.
 
 - [ ] **Step 4: Correct documentation**
 
-Change both CLI README rule counts from 22 to 25. Add a CHANGELOG entry covering immutable package snapshots, Episode-generation suspension stamps, intentional rejection of incompatible stored L2 snapshots, bounded lifecycle state and isolated watcher dispatch.
+Change both CLI README rule counts from 22 to 25. Add a CHANGELOG entry covering immutable package snapshots, Episode-generation suspension stamps, intentional rejection of incompatible stored L2 snapshots, bounded lifecycle state and isolated watcher dispatch. Explicitly state both symlink tightenings: standalone lint now rejects package symlinks, and root `indexes/` symlinks are no longer exempt in lint/pack.
 
 - [ ] **Step 5: Run focused tests and confirm GREEN**
 
@@ -641,7 +664,7 @@ Expected: lock resolves successfully without unrelated dependency upgrades.
 
 - [ ] **Step 6: Inspect the final diff**
 
-Run: `git diff --check && git status --short && git diff --stat HEAD~7`
+Run: `git diff --check && git status --short && git diff --stat main...HEAD`
 
 Expected: no whitespace errors; only approved source, tests and docs are changed.
 
