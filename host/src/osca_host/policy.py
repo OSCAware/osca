@@ -715,7 +715,10 @@ class PolicyInterceptor:
         overflow = len(self.audit) - AUDIT_RETENTION
         if overflow > 0:
             del self.audit[:overflow]
-        audit_log.info("policy audit", extra={"osca_audit": record})
+        audit_log.info(
+            json.dumps(record, ensure_ascii=False),
+            extra={"osca_audit": record},
+        )
 
     def snapshot(self) -> dict:
         return {

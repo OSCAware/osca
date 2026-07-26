@@ -10,7 +10,7 @@ import contextlib
 import copy
 
 import pytest
-from osca_cli.package import load_package
+from osca_cli.package import PackageSnapshot, load_package
 
 from osca_host.authz import Principal
 from osca_host.control import send_command
@@ -76,6 +76,23 @@ async def test_full_lifecycle(running_host, sample_pack):
     assert response["ok"]
     response = await _send({"cmd": "status"}, host)
     assert response["packages"] == []
+
+
+async def test_load_with_bindings_reuses_the_validated_snapshot(running_host, sample_pack, monkeypatch):
+    original = PackageSnapshot.capture.__func__
+    captures = 0
+
+    def counted_capture(cls, root, **kwargs):
+        nonlocal captures
+        captures += 1
+        return original(cls, root, **kwargs)
+
+    monkeypatch.setattr(PackageSnapshot, "capture", classmethod(counted_capture))
+
+    response = await _load_pack(running_host, sample_pack)
+
+    assert response["ok"], response
+    assert captures == 1
 
 
 async def test_load_invalid_pack_rejected(running_host, tmp_path):

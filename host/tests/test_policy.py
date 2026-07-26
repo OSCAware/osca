@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import logging
+
 import pytest
 
 from osca_host.policy import PolicyInterceptor
@@ -652,6 +655,18 @@ def test_audit_is_bounded_and_keeps_newest_entries():
     assert len(policy.audit) == 1000
     assert policy.audit[0]["subject"] == "25"
     assert policy.snapshot()["audit_tail"] == policy.audit[-20:]
+
+
+def test_audit_log_message_contains_the_structured_record(caplog):
+    policy = PolicyInterceptor("pkg", {}, {})
+
+    with caplog.at_level(logging.INFO, logger="osca-host.audit"):
+        policy._record("allow", "step", "subject", "reason")
+
+    record = caplog.records[-1]
+    expected = policy.audit[-1]
+    assert json.loads(record.getMessage()) == expected
+    assert record.osca_audit == expected
 
 
 def test_ratio_zero_denominator_three_state():

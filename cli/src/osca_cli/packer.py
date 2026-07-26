@@ -94,7 +94,7 @@ def package_files(root: Path) -> list[str]:
     """进包文件清单（排除缓存、版本库、系统垃圾文件），排序保证确定性。
 
     符号链接一律不入清单——跟随链接会把包外（宿主机）文件当成包内容；
-    pack 对链接直接拒绝（symlink_entries），load 侧按不存在处理。
+    快照捕获与 load 门禁都会拒绝链接，文件清单自身不跟随链接。
     """
     rels = []
     for p in sorted(root.rglob("*")):
@@ -107,24 +107,12 @@ def package_files(root: Path) -> list[str]:
     return rels
 
 
-def symlink_entries(root: Path) -> list[str]:
-    """包内（排除目录之外）的符号链接清单——pack 的拒绝对象。"""
-    links = []
-    for p in sorted(root.rglob("*")):
-        if not p.is_symlink():
-            continue
-        rel = p.relative_to(root).as_posix()
-        if rel.split("/", 1)[0] not in EXCLUDE_TOP_DIRS:
-            links.append(rel)
-    return links
-
-
 def load_symlink_entries(root: Path) -> list[str]:
     """装载门禁的符号链接清单：包内**全部**符号链接（含 indexes/，仅豁免 .git 版本库内部）。
 
-    与 pack 侧 symlink_entries 的差别：load 连排除目录也不放过——`indexes` 被换成包外目录
-    链接时 rebuild_index 会把索引写出包根；`AGENT.md`/YAML 是链接时包外文件会被读进
-    Episode/LLM 上下文。os.walk 不跟随目录链接：链接本身按条目拒绝，不进入其目标扫描。
+    load 连排除目录也不放过——`indexes` 被换成包外目录链接时 rebuild_index 会把索引写出包根；
+    `AGENT.md`/YAML 是链接时包外文件会被读进 Episode/LLM 上下文。os.walk 不跟随目录链接：
+    链接本身按条目拒绝，不进入其目标扫描。
     """
     links: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):

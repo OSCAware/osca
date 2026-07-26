@@ -44,7 +44,7 @@
 - Preserves: `SnapshotError` public type and the normal-file snapshot/fingerprint contract.
 - Produces: stable `SnapshotError("包内不是普通文件：<relpath>")` for FIFO and other opened non-regular entries.
 
-- [ ] **Step 1: Add a failing FIFO subprocess regression**
+- [x] **Step 1: Add a failing FIFO subprocess regression**
 
 Add imports:
 
@@ -86,7 +86,7 @@ def test_snapshot_rejects_fifo_without_blocking(tmp_path):
 
 This test catches removal of `O_NONBLOCK`, removal of the post-open regular-file check, and accidental re-wrapping of `SnapshotError`.
 
-- [ ] **Step 2: Run the test and confirm RED**
+- [x] **Step 2: Run the test and confirm RED**
 
 Run:
 
@@ -97,7 +97,7 @@ uv run pytest tests/test_pack_load.py::test_snapshot_rejects_fifo_without_blocki
 
 Expected: FAIL after approximately one second with `subprocess.TimeoutExpired`, because the child blocks in `os.open()`.
 
-- [ ] **Step 3: Implement non-blocking open and exception layering**
+- [x] **Step 3: Implement non-blocking open and exception layering**
 
 Change the open flags and exception order:
 
@@ -121,7 +121,7 @@ except SnapshotError:
 
 Do not add an `lstat()`-only precheck: the opened descriptor remains the authoritative object identity and `O_NONBLOCK` closes the precheck/open FIFO race.
 
-- [ ] **Step 4: Run focused snapshot, lint, and pack tests and confirm GREEN**
+- [x] **Step 4: Run focused snapshot, lint, and pack tests and confirm GREEN**
 
 Run:
 
@@ -132,7 +132,7 @@ uv run pytest tests/test_pack_load.py tests/test_lint.py -q
 
 Expected: PASS, including the FIFO test, snapshot size limits, symlink rejection, lint snapshot use, and deterministic packaging.
 
-- [ ] **Step 5: Commit Task 1**
+- [x] **Step 5: Commit Task 1**
 
 ```bash
 git add cli/src/osca_cli/package.py cli/tests/test_pack_load.py
@@ -152,7 +152,7 @@ git commit -m "fix(cli): reject FIFO snapshots without blocking"
 - Preserves: `policy.audit`, `snapshot()["audit_tail"]`, logger name `osca-host.audit`, and `LogRecord.osca_audit`.
 - Produces: `LogRecord.getMessage()` containing one JSON object equivalent to `LogRecord.osca_audit`.
 
-- [ ] **Step 1: Add the failing audit-message regression**
+- [x] **Step 1: Add the failing audit-message regression**
 
 Add imports:
 
@@ -178,7 +178,7 @@ def test_audit_log_message_contains_the_structured_record(caplog):
 
 The literal record inputs make the expectation independent of the logging implementation. The two assertions protect the default formatter and existing structured formatter contract.
 
-- [ ] **Step 2: Run the test and confirm RED**
+- [x] **Step 2: Run the test and confirm RED**
 
 Run:
 
@@ -189,7 +189,7 @@ uv run pytest tests/test_policy.py::test_audit_log_message_contains_the_structur
 
 Expected: FAIL with `json.decoder.JSONDecodeError`, because the message is currently `policy audit`.
 
-- [ ] **Step 3: Emit JSON while retaining the structured extra**
+- [x] **Step 3: Emit JSON while retaining the structured extra**
 
 Replace the audit log call with:
 
@@ -202,7 +202,7 @@ audit_log.info(
 
 Do not add fields or log the policy configuration, inputs, bindings, or secrets.
 
-- [ ] **Step 4: Run policy tests and confirm GREEN**
+- [x] **Step 4: Run policy tests and confirm GREEN**
 
 Run:
 
@@ -213,7 +213,7 @@ uv run pytest tests/test_policy.py -q
 
 Expected: PASS; bounded retention remains `1000`, the status tail remains the newest `20`, and the new message is parseable JSON.
 
-- [ ] **Step 5: Commit Task 2**
+- [x] **Step 5: Commit Task 2**
 
 ```bash
 git add host/src/osca_host/policy.py host/tests/test_policy.py
@@ -234,7 +234,7 @@ git commit -m "fix(host): include policy audit fields in logs"
 - Preserves: deployment binding validation errors and Host control response shape.
 - Produces: exactly one `PackageSnapshot.capture()` during a normal directory Host load with bindings.
 
-- [ ] **Step 1: Add a failing single-capture Host regression**
+- [x] **Step 1: Add a failing single-capture Host regression**
 
 Change the test import to:
 
@@ -264,7 +264,7 @@ async def test_load_with_bindings_reuses_the_validated_snapshot(running_host, sa
 
 The test exercises the real Host load path and counts the package boundary operation rather than mocking `required_bindings()`.
 
-- [ ] **Step 2: Run the test and confirm RED**
+- [x] **Step 2: Run the test and confirm RED**
 
 Run:
 
@@ -275,7 +275,7 @@ uv run pytest tests/test_control.py::test_load_with_bindings_reuses_the_validate
 
 Expected: FAIL with `assert 2 == 1`, because Host recaptures through `required_bindings(loaded.root)`.
 
-- [ ] **Step 3: Pass the validated package to `required_bindings`**
+- [x] **Step 3: Pass the validated package to `required_bindings`**
 
 Change:
 
@@ -289,7 +289,7 @@ to:
 errors = deployment_binding_errors(pkg_bindings, required_bindings(loaded.root, loaded.pack))
 ```
 
-- [ ] **Step 4: Run focused Host load tests and confirm GREEN**
+- [x] **Step 4: Run focused Host load tests and confirm GREEN**
 
 Run:
 
@@ -300,7 +300,7 @@ uv run pytest tests/test_control.py::test_load_with_bindings_reuses_the_validate
 
 Expected: PASS with one capture and unchanged loader compatibility.
 
-- [ ] **Step 5: Commit Task 3**
+- [x] **Step 5: Commit Task 3**
 
 ```bash
 git add host/src/osca_host/host.py host/tests/test_control.py
@@ -320,7 +320,7 @@ git commit -m "fix(host): reuse validated package for bindings"
 - Preserves: `_register_suspension(...) -> bool`, challenge decision recheck, resume scheduling, budget retention, and L2 persistence decision.
 - Removes: private, unreferenced `symlink_entries(root: Path) -> list[str]`.
 
-- [ ] **Step 1: Establish the green refactor baseline**
+- [x] **Step 1: Establish the green refactor baseline**
 
 Run:
 
@@ -333,7 +333,7 @@ uv run pytest tests/test_pack_load.py -q
 
 Expected: PASS before the refactor.
 
-- [ ] **Step 2: Route suspension registration through the lifecycle module**
+- [x] **Step 2: Route suspension registration through the lifecycle module**
 
 In `Host._register_suspension()`, replace:
 
@@ -349,7 +349,7 @@ self._episode_lifecycle.suspend(episode, cid)
 
 Keep both validation branches before this call and keep the challenge state recheck after it.
 
-- [ ] **Step 3: Remove obsolete symlink scanning code**
+- [x] **Step 3: Remove obsolete symlink scanning code**
 
 Delete `symlink_entries()` from `cli/src/osca_cli/packer.py`. In `package_files()` change the comment:
 
@@ -365,7 +365,7 @@ to:
 
 Do not change `load_symlink_entries()`, `PackageSnapshot.capture()`, or their root `indexes/` semantics.
 
-- [ ] **Step 4: Run lifecycle, control, and pack regression suites**
+- [x] **Step 4: Run lifecycle, control, and pack regression suites**
 
 Run:
 
@@ -378,7 +378,7 @@ uv run pytest tests/test_pack_load.py -q
 
 Expected: PASS; suspend/approve/resume, lost-wakeup self-healing, budget retention, symlink rejection, and deterministic pack behavior remain unchanged.
 
-- [ ] **Step 5: Confirm the dead symbol is gone**
+- [x] **Step 5: Confirm the dead symbol is gone**
 
 Run:
 
@@ -388,7 +388,7 @@ rg -n "symlink_entries" cli host
 
 Expected: only `load_symlink_entries` references remain; there is no standalone `def symlink_entries`.
 
-- [ ] **Step 6: Commit Task 4**
+- [x] **Step 6: Commit Task 4**
 
 ```bash
 git add host/src/osca_host/host.py cli/src/osca_cli/packer.py
@@ -408,7 +408,7 @@ git commit -m "refactor: finish snapshot and lifecycle consolidation"
 - Consumes: all previous task commits.
 - Produces: fresh evidence for CLI, Host, samples, downstream lock compatibility, and synchronized Git refs.
 
-- [ ] **Step 1: Run all CLI tests and quality checks**
+- [x] **Step 1: Run all CLI tests and quality checks**
 
 Run:
 
@@ -421,7 +421,7 @@ uv run ruff format --check .
 
 Expected: `212 + 1` or more tests pass after adding the FIFO regression; ruff exits `0`.
 
-- [ ] **Step 2: Run all Host tests and quality checks**
+- [x] **Step 2: Run all Host tests and quality checks**
 
 Run:
 
@@ -434,7 +434,7 @@ uv run ruff format --check .
 
 Expected: `428 + 2` or more tests pass after adding audit and single-capture regressions; the existing root-only cross-UID probe may remain skipped; ruff exits `0`.
 
-- [ ] **Step 3: Lint both official samples**
+- [x] **Step 3: Lint both official samples**
 
 Run:
 
@@ -446,7 +446,7 @@ uv run osca lint ../examples/oper-diagnosis.osca
 
 Expected: each reports 25 rules, 0 errors, and 0 warnings.
 
-- [ ] **Step 4: Mark the design and plan complete**
+- [x] **Step 4: Mark the design and plan complete**
 
 Change the design status to:
 
@@ -456,7 +456,7 @@ Change the design status to:
 
 Mark every executed plan checkbox `[x]`. Do not alter technical requirements while recording completion.
 
-- [ ] **Step 5: Commit completion records**
+- [x] **Step 5: Commit completion records**
 
 ```bash
 git add docs/superpowers/specs/2026-07-26-osca-post-review-hardening-design.md docs/superpowers/plans/2026-07-26-osca-post-review-hardening-plan.md

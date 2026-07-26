@@ -317,7 +317,7 @@ class Host:
                 # 换成非法形状不得静默带病发布（与 CLI 同一判据，单一真理源）
                 if spec.get("bindings"):
                     pkg_bindings = yaml.safe_load(Path(str(spec["bindings"])).read_text(encoding="utf-8")) or {}
-                    errors = deployment_binding_errors(pkg_bindings, required_bindings(loaded.root))
+                    errors = deployment_binding_errors(pkg_bindings, required_bindings(loaded.root, loaded.pack))
                     if errors:
                         for line in errors:
                             result.fail(line)
@@ -724,7 +724,7 @@ class Host:
             episode.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
             log.error(f"剧集 {episode.episode_id} 挂起时已不在台账——拒绝登记恢复")
             return False
-        self._suspensions[cid] = episode.episode_id
+        self._episode_lifecycle.suspend(episode, cid)
         log.info(f"剧集 {episode.episode_id} 挂起等批（挑战 {cid}）")
         ch = policy.get_challenge(cid)
         if ch is None or ch.state != "pending":  # 决定已先到（丢唤醒窗）→ 就地自愈恢复（马上恢复，不落盘）

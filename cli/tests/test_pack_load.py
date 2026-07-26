@@ -1,5 +1,8 @@
 """osca pack / load 的行为测试：门禁、确定性、防篡改、binding 比对、索引重建。"""
 
+import os
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -25,6 +28,33 @@ def test_snapshot_rejects_member_and_total_size_limits(make_pkg, base):
         PackageSnapshot.capture(pkg, max_member_bytes=64, max_total_bytes=256)
     with pytest.raises(SnapshotError, match="总字节"):
         PackageSnapshot.capture(pkg, max_member_bytes=128, max_total_bytes=64)
+
+
+def test_snapshot_rejects_fifo_without_blocking(tmp_path):
+    fifo = tmp_path / "blocked.fifo"
+    os.mkfifo(fifo)
+    script = (
+        "from pathlib import Path; "
+        "from osca_cli.package import PackageSnapshot, SnapshotError; "
+        "import sys; "
+        "\ntry:\n"
+        " PackageSnapshot.capture(Path(sys.argv[1]))\n"
+        "except SnapshotError as exc:\n"
+        " print(str(exc))\n"
+        "else:\n"
+        " raise SystemExit('FIFO was accepted')\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=1,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "包内不是普通文件：blocked.fifo"
 
 
 def test_pack_creates_zip_with_checksums(make_pkg, base, tmp_path):
