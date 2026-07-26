@@ -463,7 +463,7 @@ git add docs/superpowers/specs/2026-07-26-osca-post-review-hardening-design.md d
 git commit -m "docs: mark post-review hardening complete"
 ```
 
-- [ ] **Step 6: Merge the isolated branch into local `main`**
+- [x] **Step 6: Merge the isolated branch into local `main`**
 
 From the primary checkout:
 
@@ -473,7 +473,7 @@ git merge --no-ff codex/osca-post-review-hardening
 
 Expected: a merge commit with only the approved source, tests, and completion records.
 
-- [ ] **Step 7: Push OSCA `main` and verify GitHub/ECS refs**
+- [x] **Step 7: Push OSCA `main` and verify GitHub/ECS refs**
 
 Run:
 
@@ -486,7 +486,7 @@ git ls-remote ecs refs/heads/main
 
 Expected: all three SHA values are identical and the ECS deployment hook finishes successfully.
 
-- [ ] **Step 8: Refresh and verify downstream oscapipe**
+- [x] **Step 8: Refresh and verify downstream oscapipe**
 
 From `/Users/lay/Documents/Git/oscapipe`, require a clean `main`, then run:
 
@@ -498,7 +498,7 @@ uv run ruff check .
 
 Expected: `uv.lock` points at the new OSCA SHA, all 380 or more tests pass, and ruff check exits `0`. Do not include the two known unrelated formatter drifts in `mockups/m8_appliance/app.py` and `src/oscapipe/creator/coldstart.py`.
 
-- [ ] **Step 9: Commit and synchronize oscapipe only if the lock changed**
+- [x] **Step 9: Commit and synchronize oscapipe only if the lock changed**
 
 ```bash
 git add uv.lock
@@ -512,7 +512,7 @@ git ls-remote ecs refs/heads/main
 
 Expected: the three oscapipe SHA values are identical; ECS reports the OSCA lock revision is consistent and its smoke checks pass.
 
-- [ ] **Step 10: Remove the worktree and verify both primary repositories are clean**
+- [x] **Step 10: Remove the worktree and verify both primary repositories are clean**
 
 Run from the OSCA primary checkout:
 
