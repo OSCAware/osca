@@ -32,6 +32,48 @@ async def test_fire_isolates_subscriber_exceptions():
     table.shutdown()
 
 
+async def test_slow_subscriber_does_not_block_fast_or_next_fire():
+    release = asyncio.Event()
+    fast_called = asyncio.Event()
+
+    async def slow(trigger_id):
+        await release.wait()
+
+    async def fast(trigger_id):
+        fast_called.set()
+
+    table = TriggerTable()
+    watcher = table.subscribe("event", {"source": "op"}, Subscription("slow", "AW-1", "AW-1/T1", slow))
+    table.subscribe("event", {"source": "op"}, Subscription("fast", "AW-2", "AW-2/T1", fast))
+
+    await asyncio.wait_for(table._fire(watcher), timeout=0.1)
+    await asyncio.wait_for(fast_called.wait(), timeout=0.1)
+    await asyncio.wait_for(table._fire(watcher), timeout=0.1)
+
+    release.set()
+    table.shutdown()
+
+
+async def test_busy_lane_coalesces_repeated_ticks_with_log(caplog):
+    release = asyncio.Event()
+
+    async def blocked(trigger_id):
+        await release.wait()
+
+    table = TriggerTable()
+    watcher = table.subscribe("event", {"source": "op"}, Subscription("pkg", "AW-1", "AW-1/T1", blocked))
+    with caplog.at_level("INFO", logger="osca-host"):
+        await table._fire(watcher)
+        await table._fire(watcher)
+        await table._fire(watcher)
+
+    lane = next(iter(table._lanes.values()))
+    assert lane.pending is True and lane.coalesced == 1
+    assert watcher.key in caplog.text and "累计合并 1" in caplog.text
+    release.set()
+    table.shutdown()
+
+
 async def test_arm_failure_leaves_no_empty_watcher(monkeypatch):
     """_arm 失败必须撤掉刚建的 watcher——零订阅的僵尸槽位会永久占住去重键。"""
     import pytest
