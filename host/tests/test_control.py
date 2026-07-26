@@ -794,7 +794,7 @@ async def test_d2b_reattach_survives_reload_then_approve_lands(running_host, sam
     assert [r for r in host._suspension_store.load_all() if r["operation_id"] == opid] == []  # 恢复调度即删盘
 
 
-async def test_d2b_reattach_discards_on_version_mismatch(running_host, sample_pack, deploy_w5):
+async def test_d2b_reattach_discards_on_version_mismatch(running_host, sample_pack, deploy_w5, caplog):
     """包版本漂移：挂起后改包源文件（含**未提交**改动——版本戳按实际字节内容指纹，不靠 git tree OID）→
     重挂时戳不符 → 丢弃不兑现 + 删盘（fail-closed，§2.4 / GPT 外审 P1）。"""
     host = running_host
@@ -815,6 +815,7 @@ async def test_d2b_reattach_discards_on_version_mismatch(running_host, sample_pa
 
     assert not any(e.operation_id == opid and e.status == "suspended_pending_approval" for e in host.episodes.values())
     assert [r for r in host._suspension_store.load_all() if r["operation_id"] == opid] == []  # 快照被丢弃删除
+    assert "指纹算法/内容代际不匹配" in caplog.text
 
 
 async def test_d2b_reattach_same_display_id_no_collision(running_host, sample_pack, deploy_w5):

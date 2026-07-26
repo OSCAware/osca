@@ -902,7 +902,7 @@ class Host:
                 continue
             if record.get("version_stamp") != current_stamp:
                 # 版本戳不符（含旧快照 None vs 现非 None）→ 包已改版 / 不可证同版 → fail-closed 丢弃（§2.4）
-                log.warning(f"挂起快照与当前包版本不符（包已改版），丢弃不重挂：{opid}")
+                log.warning(f"挂起快照指纹算法/内容代际不匹配，旧挂起快照已拒绝并丢弃：{opid}")
                 to_delete.append(opid)
                 continue
             raw_tc, raw_tk = record.get("tool_calls", 0), record.get("tokens", 0)
