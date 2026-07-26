@@ -61,6 +61,14 @@ class Watcher:
     next_fire: datetime | None = None
 
 
+@dataclass
+class _DispatchLane:
+    sub: Subscription
+    task: asyncio.Task | None = None
+    pending: bool = False
+    coalesced: int = 0
+
+
 def _canonical_key(kind: str, spec: dict, scope: str) -> str:
     payload = json.dumps({"kind": kind, "spec": spec, "scope": scope}, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
@@ -70,6 +78,7 @@ class TriggerTable:
     def __init__(self, poller: Poller | None = None) -> None:
         self.watchers: dict[str, Watcher] = {}
         self.poller = poller  # 未注入时轮询只计 tick（W4 前的行为，测试仍可裸用）
+        self._lanes: dict[tuple[str, str, str, str], _DispatchLane] = {}
 
     # ── 布防与撤防 ────────────────────────────────────────────────────
 
@@ -103,6 +112,10 @@ class TriggerTable:
                 continue
             watcher.subs = keep
             removed.extend(s.trigger_id for s in drop)
+            for sub in drop:
+                lane = self._lanes.pop(self._lane_key(watcher, sub), None)
+                if lane is not None and lane.task is not None:
+                    lane.task.cancel()
             if not keep:
                 if watcher.task:
                     watcher.task.cancel()
@@ -113,6 +126,10 @@ class TriggerTable:
         for watcher in self.watchers.values():
             if watcher.task:
                 watcher.task.cancel()
+        for lane in self._lanes.values():
+            if lane.task:
+                lane.task.cancel()
+        self._lanes.clear()
         self.watchers.clear()
 
     # ── 发射 ──────────────────────────────────────────────────────────
@@ -142,13 +159,40 @@ class TriggerTable:
     async def _fire(self, watcher: Watcher) -> None:
         watcher.fires += 1
         for sub in list(watcher.subs):
-            try:
-                result = sub.deliver(sub.trigger_id)
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                # 订阅方异常各自隔离——一个包的故障不许杀掉共享 watcher 的循环任务、不许殃及同伴
-                log.exception(f"派发异常：{sub.trigger_id}（watcher {watcher.key} 继续存活）")
+            self._submit(watcher, sub)
+        await asyncio.sleep(0)
+
+    @staticmethod
+    def _lane_key(watcher: Watcher, sub: Subscription) -> tuple[str, str, str, str]:
+        return watcher.key, sub.package_id, sub.aware_id, sub.trigger_id
+
+    def _submit(self, watcher: Watcher, sub: Subscription) -> None:
+        key = self._lane_key(watcher, sub)
+        lane = self._lanes.setdefault(key, _DispatchLane(sub))
+        if lane.task is not None and not lane.task.done():
+            if lane.pending:
+                lane.coalesced += 1
+                log.info(f"派发合并：watcher {watcher.key} / {sub.trigger_id} 累计合并 {lane.coalesced}")
+            else:
+                lane.pending = True
+            return
+        lane.task = asyncio.create_task(self._drain_lane(watcher, lane))
+
+    async def _drain_lane(self, watcher: Watcher, lane: _DispatchLane) -> None:
+        sub = lane.sub
+        try:
+            while True:
+                try:
+                    result = sub.deliver(sub.trigger_id)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    log.exception(f"派发异常：{sub.trigger_id}（watcher {watcher.key} 继续存活）")
+                if not lane.pending:
+                    return
+                lane.pending = False
+        finally:
+            lane.task = None
 
     # ── watcher 编译（装载时；语法已过 lint，此处解析必须成功） ──────
 

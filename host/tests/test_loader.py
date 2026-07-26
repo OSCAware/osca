@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import yaml
+from osca_cli import packer
+
 from osca_host.loader import load_for_host
 
 
@@ -12,6 +15,26 @@ def test_load_sample_pack(sample_pack):
     assert loaded.package_id == "demo-group-oper-diagnosis"
     assert loaded.format_version == "0.3"
     assert loaded.root == sample_pack
+
+
+def test_load_for_host_parses_the_validated_directory_snapshot(sample_pack, monkeypatch):
+    original = packer._validate_package_root
+
+    def validate_then_mutate(*args, **kwargs):
+        ok = original(*args, **kwargs)
+        if ok:
+            manifest_path = sample_pack / "osca.yaml"
+            manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+            manifest["package_id"] = "post-gate-mutation"
+            manifest_path.write_text(yaml.safe_dump(manifest, allow_unicode=True), encoding="utf-8")
+        return ok
+
+    monkeypatch.setattr(packer, "_validate_package_root", validate_then_mutate)
+
+    result, loaded = load_for_host(sample_pack, require_bindings=False)
+
+    assert result.ok
+    assert loaded.package_id == "demo-group-oper-diagnosis"
 
 
 def test_awares_parsed(sample_pack):

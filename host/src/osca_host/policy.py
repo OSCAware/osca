@@ -52,6 +52,7 @@ from osca_host.challenge import (  # W3 审批：绑定挑战替换旧无绑定 
 __all__ = ["PolicyInterceptor", "REDACTORS", "ledger_stats", "parse_quantity", "replay_health"]
 
 log = logging.getLogger("osca-host")
+audit_log = logging.getLogger("osca-host.audit")
 
 # 边界用数字负向断言而非 \b：中文与数字同属正则「单词字符」，
 # 「手机号13812345678」这类紧邻写法在 \b 下无边界、会整条漏掉（Review 八轮实测）
@@ -65,6 +66,7 @@ REPLAY_RED = re.compile(r".*回放红灯率\s*>\s*([\d.]+)\s*%.*")
 UNEVALUABLE = "条件不可机器求值，不生效（受限形式：overruled/confirmed > X ｜ 回放红灯率 > X%）"
 
 AUDIT_TAIL = 20  # status 里只带最近这些条
+AUDIT_RETENTION = 1000
 
 
 class PolicyInterceptor:
@@ -635,6 +637,12 @@ class PolicyInterceptor:
             if tokens:
                 self._tokens[episode_id] = tokens
 
+    def release_episode(self, episode_id: str) -> None:
+        """剧集终态释放短命预算计数；幂等，挂起剧集不得调用。"""
+        with self._gate:
+            self._tool_calls.pop(episode_id, None)
+            self._tokens.pop(episode_id, None)
+
     def decide_challenge(self, challenge_id: str, *, by_name: str, by_role: str, approve: bool) -> tuple[bool, str]:
         """控制通道审批人批/驳一张挑战（绑 challenge_id）。角色/冒名/一次性防护在 ChallengeStore.decide。"""
         ok, detail = self._challenges.decide(challenge_id, by_name=by_name, by_role=by_role, approve=approve)
@@ -696,15 +704,18 @@ class PolicyInterceptor:
         return False, reason
 
     def _record(self, decision, step, subject, reason) -> None:
-        self.audit.append(
-            {
-                "at": datetime.now().astimezone().isoformat(timespec="seconds"),
-                "decision": decision,
-                "step": step,
-                "subject": subject,
-                "reason": reason,
-            }
-        )
+        record = {
+            "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "decision": decision,
+            "step": step,
+            "subject": subject,
+            "reason": reason,
+        }
+        self.audit.append(record)
+        overflow = len(self.audit) - AUDIT_RETENTION
+        if overflow > 0:
+            del self.audit[:overflow]
+        audit_log.info("policy audit", extra={"osca_audit": record})
 
     def snapshot(self) -> dict:
         return {

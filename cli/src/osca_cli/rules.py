@@ -19,7 +19,6 @@ from osca_cli.package import (
     OscaPackage,
     YamlFile,
     referenced_ids,
-    resolve_in_root,
 )
 from osca_cli.triggers import (
     AWARE_BUDGET_KEYS,
@@ -63,7 +62,7 @@ def osca002_layout(pkg: OscaPackage) -> list[Finding]:
     """OSCA002 标准目录布局（SPEC §0；空目录 git 不保留，缺失记警告）。"""
     findings = []
     for dirname in TYPED_DIRS:
-        if not (pkg.root / dirname).is_dir():
+        if not pkg.has_directory(dirname):
             findings.append(_warn("OSCA002", ".", f"缺少标准目录 {dirname}/"))
     return findings
 
@@ -95,10 +94,10 @@ def osca004_manifest(pkg: OscaPackage) -> list[Finding]:
     if isinstance(entry, str):
         # entry 是包内声明（不可信输入，P2）：绝对路径/`../`/链接逃逸可把 entry 指到包外文件——
         # 与 impl/固件同一受限路径判据（resolve_in_root），越界即错，不因包外恰好存在而放行
-        resolved = resolve_in_root(pkg.root, entry)
+        resolved = pkg.declared_relpath(entry)
         if resolved is None:
             findings.append(_err("OSCA004", "osca.yaml", f"entry 越出包根：{entry}——绝对路径/../链接逃逸一律拒绝"))
-        elif not resolved.is_file():
+        elif not pkg.is_file(resolved):
             findings.append(_err("OSCA004", "osca.yaml", f"entry 指向的文件不存在：{entry}"))
     requires = m.get("requires")
     if requires is not None and not isinstance(requires, dict):
@@ -265,12 +264,12 @@ def osca024_impl_paths(pkg: OscaPackage) -> list[Finding]:
             impl = itf.get("impl") if isinstance(itf, dict) else None
             if not isinstance(impl, str):
                 continue
-            resolved = resolve_in_root(pkg.root, impl)
+            resolved = pkg.declared_relpath(impl)
             if resolved is None:
                 findings.append(
                     _err("OSCA024", f.relpath, f"impl 路径越界：{impl}——包内声明只可指包内文件（运行时同判据必拒）")
                 )
-            elif not resolved.is_file():
+            elif not pkg.is_file(resolved):
                 findings.append(_warn("OSCA024", f.relpath, f"impl 指向的文件不存在：{impl}"))
     return findings
 
@@ -896,13 +895,9 @@ def _domain_allowed(host: str) -> bool:
 def osca050_secrets(pkg: OscaPackage) -> list[Finding]:
     """OSCA050 零密钥、零连接串；https 文档链接仅白名单域放行（铁律；扫描包内全部文本文件）。"""
     findings = []
-    for path in sorted(pkg.root.rglob("*")):
-        if not path.is_file():
+    for rel, text in pkg.iter_text_files():
+        if rel.split("/", 1)[0] in SCAN_SKIP_DIRS or rel.rsplit("/", 1)[-1] in SCAN_SKIP_NAMES:
             continue
-        rel = path.relative_to(pkg.root).as_posix()
-        if rel.split("/", 1)[0] in SCAN_SKIP_DIRS or path.name in SCAN_SKIP_NAMES:
-            continue
-        text = path.read_text(encoding="utf-8", errors="ignore")
         for lineno, line in enumerate(text.splitlines(), start=1):
             for pattern, label in SECRET_PATTERNS:
                 if pattern.search(line):

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from osca_cli.package import OscaPackage, load_package
-from osca_cli.packer import OpResult, load_osca
+from osca_cli.packer import OpResult, load_osca_snapshot
 from osca_cli.triggers import declared_triggers
 
 from osca_host import __version__
@@ -137,11 +137,13 @@ def load_for_host(
     abort（复核 P1）：线程安全的装载作废令牌——关停/换代后的迟到 load worker 在任何磁盘写
     副作用（索引重建/dest 切换）之前止步。
     """
-    result, root = load_osca(source, dest=dest, bindings=bindings, require_bindings=require_bindings, abort=abort)
-    if not result.ok or root is None:
+    result, root, snapshot = load_osca_snapshot(
+        source, dest=dest, bindings=bindings, require_bindings=require_bindings, abort=abort
+    )
+    if not result.ok or root is None or snapshot is None:
         return result, None
 
-    pack = load_package(root)
+    pack = load_package(root, snapshot=snapshot)
     manifest = pack.yaml_files.get("osca.yaml")
     m = manifest.mapping if manifest else {}
     if not _check_runtime_contract(m, result):

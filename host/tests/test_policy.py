@@ -633,6 +633,27 @@ def test_llm_permit_leaves_audit_trace():
     assert any("LLM 调用授权" in a["reason"] and a["decision"] == "allow" for a in p.audit)
 
 
+def test_release_episode_budget_is_idempotent():
+    policy = PolicyInterceptor("pkg", {}, {})
+    policy._tool_calls["EP-1"] = 2
+    policy._tokens["EP-1"] = 80
+
+    policy.release_episode("EP-1")
+    policy.release_episode("EP-1")
+
+    assert policy.episode_budget_used("EP-1") == (0, 0)
+
+
+def test_audit_is_bounded_and_keeps_newest_entries():
+    policy = PolicyInterceptor("pkg", {}, {})
+    for index in range(1025):
+        policy._record("allow", "step", str(index), "test")
+
+    assert len(policy.audit) == 1000
+    assert policy.audit[0]["subject"] == "25"
+    assert policy.snapshot()["audit_tail"] == policy.audit[-20:]
+
+
 def test_ratio_zero_denominator_three_state():
     """比值条件的零分母（十一轮）：0/0 不可判不解除既有红灯；有推翻零确认保守停机。"""
     p = make(stats={"confirmed": 1, "overruled": 1})  # 1/1 > 0.3 → 触发

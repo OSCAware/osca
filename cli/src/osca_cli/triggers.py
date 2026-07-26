@@ -134,7 +134,7 @@ def parse_schedule(spec: object) -> tuple[Schedule | None, list[str]]:
         errors.append(f'schedule.time={time_} 须为 24 小时制 HH:MM（如 "09:00"）')
 
     day = spec.get("day")
-    if every == "month" and not (isinstance(day, int) and 1 <= day <= 31):
+    if every == "month" and not (type(day) is int and 1 <= day <= 31):
         errors.append(f"schedule.day={day} 须为 1..31 的整数（every: month）")
     elif every == "week" and day not in WEEKDAYS:
         errors.append(f"schedule.day={day} 须为 {'/'.join(WEEKDAYS)} 之一（every: week）")

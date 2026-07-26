@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import logging
 import os
 import signal
@@ -37,6 +36,7 @@ from osca_host.control import ControlServer, admin_token_path, principals_path
 from osca_host.episode import Episode, assemble
 from osca_host.expr import parse_precondition
 from osca_host.gate import Gate
+from osca_host.lifecycle import EpisodeLifecycle
 from osca_host.loader import load_for_host
 from osca_host.policy import REPLAY_RED, PolicyInterceptor, ledger_stats
 from osca_host.registry import Registry, RegistryError
@@ -99,6 +99,7 @@ class Host:
         self._episode_seq = 0
         self._episode_tasks: set[asyncio.Task] = set()  # 在跑剧集（认知平面，独立线程）
         self._suspensions: dict[str, str] = {}  # challenge_id → episode_id：挂起等批的写剧集（可恢复剧集，D2a）
+        self._episode_lifecycle = EpisodeLifecycle(self.episodes, self._suspensions)
         self._resuming: set[str] = set()  # episode_id：恢复在途（删盘在线程，防同剧集双恢复；GPT 三审 P2）
         # 挂起快照磁盘持久层（D2b·L2）：run() 里锚定运行目录后建；未建（如单元测试直连）时挂起仅 L1（进程内）
         self._suspension_store: SuspensionStore | None = None
@@ -674,16 +675,17 @@ class Host:
             await self._run_in_daemon_thread(run_episode, episode, loaded, proxy, policy)
         except Exception:
             # 执行器内部错误不许让剧集永远停在 running——终态入台账，异常进日志
-            episode.status = "failed"
-            episode.stop_reason = "执行器内部错误（见 Host 日志）"
-            episode.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            self._episode_lifecycle.finish(episode, "failed", "执行器内部错误（见 Host 日志）", policy=policy)
             log.exception(f"剧集 {episode.episode_id} 执行器内部错误")
         if episode.status == "suspended_pending_approval":
             # 挂起等批（可恢复剧集）：登记 + 登记侧自愈（§3.5）；**不落终态、不对账**——等 approve/deny/清扫触发恢复。
             # 登记（状态变更）留在事件循环；L2 持久的磁盘重活（全包指纹 + fsync）由 _persist_suspension 下线程
             if self._register_suspension(episode, loaded, proxy, policy):
                 await self._persist_suspension(episode, policy)
+            elif episode.status in ("completed", "stopped", "failed"):
+                self._episode_lifecycle.finish(episode, policy=policy)
             return
+        self._episode_lifecycle.finish(episode, policy=policy)
         tail = f"（{episode.stop_reason}）" if episode.stop_reason else ""
         log.info(f"剧集 {episode.episode_id} 终态 {episode.status}{tail}：tokens {episode.tokens_used}")
         if episode.status != "completed":
@@ -818,7 +820,6 @@ class Host:
         ch = policy.get_challenge(cid) if cid else None
         if store is None or ch is None:
             return
-        loaded = self.registry.packages.get(episode.package_id)
         tool_calls, tokens = policy.episode_budget_used(episode.episode_id)
         record = {
             "operation_id": episode.operation_id,
@@ -827,12 +828,11 @@ class Host:
             "challenge": asdict(ch),
             "tool_calls": tool_calls,
             "tokens": tokens,
-            "version_stamp": None,  # 线程内补算（全包指纹是磁盘重活）
+            "version_stamp": episode.package_fingerprint,
         }
         ticket = store.begin_persist(episode.operation_id)  # 事件循环侧领票——先于任何可能的 delete 观察点
 
         def _stamp_and_persist() -> None:
-            record["version_stamp"] = self._pack_stamp(loaded) if loaded is not None else None
             store.persist(episode.operation_id, record, ticket=ticket)
 
         try:
@@ -845,24 +845,8 @@ class Host:
 
     @staticmethod
     def _pack_stamp(loaded) -> str:
-        """包版本戳 = **源文件内容指纹**（sha256 of 排序后的「相对路径 + 字节」），排除 `.git/`（版本控制内部）
-        与 `indexes/`（装载重建的缓存，与包身份无关）。
-
-        为何不用 git tree OID：OID 只反映 **已提交** 内容——直接改 policy.yaml/pipeline/connector 而不提交，
-        HEAD tree 不变，旧快照会重挂到新运行语义（GPT 外审 P1）。内容指纹按**实际工作树字节**计，未提交改动
-        照样变戳。重挂时严格比对，任一漂移即 fail-closed 丢弃（§2.4）。持久/重挂皆低频（挂起时 / 装载时），
-        小包成本可忽略。"""
-        root = loaded.root
-        h = hashlib.sha256()
-        for p in sorted(root.rglob("*")):
-            parts = p.relative_to(root).parts
-            if p.is_dir() or ".git" in parts or "indexes" in parts:
-                continue
-            h.update(p.relative_to(root).as_posix().encode("utf-8") + b"\0")
-            with contextlib.suppress(OSError):
-                h.update(p.read_bytes())
-            h.update(b"\0")
-        return "fp:" + h.hexdigest()
+        """返回当前已发布包快照的内容指纹；不重读磁盘、不吞读取错误。"""
+        return loaded.pack.snapshot.fingerprint
 
     async def _reattach_suspensions(self, package_id: str) -> None:
         """package 装载后重挂其持久化的挂起剧集（L2）：读盘 → 版本戳/结构校验 → 重建剧集 + 挑战 + 计数 →
@@ -918,7 +902,7 @@ class Host:
                 continue
             if record.get("version_stamp") != current_stamp:
                 # 版本戳不符（含旧快照 None vs 现非 None）→ 包已改版 / 不可证同版 → fail-closed 丢弃（§2.4）
-                log.warning(f"挂起快照与当前包版本不符（包已改版），丢弃不重挂：{opid}")
+                log.warning(f"挂起快照指纹算法/内容代际不匹配，旧挂起快照已拒绝并丢弃：{opid}")
                 to_delete.append(opid)
                 continue
             raw_tc, raw_tk = record.get("tool_calls", 0), record.get("tokens", 0)
@@ -979,7 +963,9 @@ class Host:
             )
             if victim is None:
                 return  # 无终态可淘汰（全在途/挂起）——宁可超顶，不丢在途/已批写
-            del self.episodes[victim]
+            episode = self.episodes[victim]
+            policy = self.policies.get(episode.package_id)
+            self._episode_lifecycle.evict(victim, policy=policy)
 
     def _sweep_suspensions(self) -> None:
         """惰性清扫（§5.4）：凡挂起剧集其挑战已离开 pending（approved/denied/expired/revoked/已清出）→ 调度一次
@@ -1001,18 +987,13 @@ class Host:
     def _stop_suspended_episodes(self, package_id: str | None, reason: str) -> None:
         """把挂起等批的剧集迁 stopped 并清出 _suspensions（§3.4 包停/关停）——package_id=None 为全体（关停）。
         诚实标注：L1 不持久，挂起态随包/进程消亡、重启不恢复（活过重载/重启是 L2 的事）。"""
-        now = datetime.now().astimezone().isoformat(timespec="seconds")
         for episode in self.episodes.values():
             if episode.status != "suspended_pending_approval":
                 continue
             if package_id is not None and episode.package_id != package_id:
                 continue
-            episode.status = "stopped"
-            episode.stop_reason = reason
-            episode.finished_at = now
-            cid = episode.resume.get("challenge_id") if episode.resume else None
-            if cid is not None:
-                self._suspensions.pop(cid, None)
+            policy = self.policies.get(episode.package_id)
+            self._episode_lifecycle.finish(episode, "stopped", reason, policy=policy)
 
     def _sync_slots(self, package_id: str) -> None:
         """注册表槽位状态跟随布防事实：armed（已挂 watcher/待人工发射）或 disabled。"""
