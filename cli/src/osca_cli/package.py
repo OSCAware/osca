@@ -101,11 +101,16 @@ class PackageSnapshot:
                     if rel.split("/", 1)[0] == "indexes" or name in EXCLUDE_NAMES:
                         continue
                     try:
-                        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                        fd = os.open(
+                            path,
+                            os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                        )
                         with os.fdopen(fd, "rb") as stream:
                             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                                 raise SnapshotError(f"包内不是普通文件：{rel}")
                             data = stream.read(max_member_bytes + 1)
+                    except SnapshotError:
+                        raise
                     except OSError as exc:
                         raise SnapshotError(f"包文件读取失败：{rel}（{type(exc).__name__}）") from exc
                     if len(data) > max_member_bytes:
