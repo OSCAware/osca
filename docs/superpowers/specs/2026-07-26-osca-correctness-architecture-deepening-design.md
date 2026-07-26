@@ -2,7 +2,7 @@
 
 **日期：** 2026-07-26
 
-**状态：** 已获方向确认，待书面规格复核
+**状态：** 已复核，待实施
 
 **兼容性约束：** 保持现有 CLI、Host 对外行为与 `.osca` 包格式兼容
 
@@ -37,7 +37,8 @@
 
 ### 2.2 非目标
 
-- 不改变 CLI 命令、参数、退出码或人类可读输出的既有语义。
+- 不改变 CLI 命令、参数、退出码或人类可读输出的既有语义；唯一安全收紧是 `osca lint`
+  对符号链接目录明确返回稳定失败，不再透过链接读取内容。
 - 不改变 Host 控制协议、Episode 状态名或 `.osca.zip` 内容格式。
 - 不引入新的第三方运行时依赖。
 - 不把账本目录改成只读；`cases/` 等运行期账本仍可按现有事务规则写入。
@@ -98,6 +99,12 @@ snapshot.fingerprint(...)
 4. 枚举或读取中出现文件消失、权限错误、特殊文件等情况，整次捕获失败。
 5. 相对路径必须规范化且留在包根内。
 6. 快照对象发布后不可变；排序只影响输出顺序，不影响内容。
+7. 目录捕获复用 zip 路径的 `MAX_MEMBER_BYTES` 与 `MAX_TOTAL_BYTES`：单文件或总字节数超限时
+   稳定失败，避免开发目录中的误放 dump 形成 OOM 面。
+
+`osca lint` 当前会透过符号链接读取 YAML 和扫描文本，而 `pack`/`load` 会拒绝符号链接。快照
+接入后明确统一为拒绝：lint Adapter 把 `SnapshotError` 转成与 pack 同风格、带链接相对路径的
+稳定失败信息。这是有意的安全语义收紧，并用回归测试固定，不让异常 traceback 或偶然文案成为接口。
 
 目录文件系统本身不提供通用原子快照。本 Module 的安全保证不是“源目录瞬间静止”，而是：
 
@@ -141,7 +148,10 @@ PackageSnapshot.capture
       +--> LoadedPackage package generation fingerprint
 ```
 
-装载门禁和运行时结构不再分别调用 `load_package(root)`。zip 装载在校验、解压完成后同样捕获一次解压目录快照。
+装载门禁和运行时结构不再分别调用 `load_package(root)`。zip 装载在临时目录完成完整性、lint、
+binding 和索引校验后，必须在原子切换 `dest` **之前**从该临时目录捕获快照。切换成功后，
+`LoadedPackage.root` 仍指向 `dest`，而内部解析直接消费切换前捕获并随装载结果传递的同一份
+快照；不得在切换后重新遍历 `dest`，否则会重新打开本设计要消除的读盘窗口。
 
 账本刷新仍在现有 `ledger_lock` 内执行；刷新成功时创建一份新快照，完成 lint、索引计算与 kill-switch 计算后，再原子替换 `loaded.pack` 和对应版本指纹。失败时保留旧代。
 
@@ -173,7 +183,26 @@ sha256(sorted(relative_path + NUL + bytes + NUL))
 
 任何应计入指纹的文件无法读取时，快照捕获已经失败，不存在“忽略错误继续算戳”的路径。
 
-持久化挂起剧集记录当前 `loaded.pack` 所属快照的指纹。重挂时，以新装载代的快照指纹比较；不相等即按现有语义 fail-closed 丢弃旧快照。
+指纹在 `PackageSnapshot` 构造时预计算。剧集装配时，把**装配所消费的那一代**
+`loaded.pack.snapshot.fingerprint` 钉到 Episode 的内部字段，例如 `package_fingerprint`。
+该字段随 Episode dump 进入 L2 快照。persist 必须直接写 Episode 已钉住的指纹，不得再次读取
+`loaded.pack`：后者可能已被同包另一触发器的账本刷新从 G1 换成 G2，而当前剧集的上下文、payload
+和 `write_params` 仍来自 G1。
+
+重挂时，以新装载代的快照指纹与 Episode 钉住的指纹比较；不相等即按现有语义 fail-closed
+丢弃旧快照。这样版本戳准确表示剧集实际装配并执行的内容代际，而不是落盘时碰巧在注册表中的代际。
+
+### 4.8 升级迁移行为
+
+新旧指纹口径并不完全相同：新算法会计入嵌套 `indexes/` 业务文件、排除 `.DS_Store`，且不再
+忽略读取失败。因此，升级前已经落盘、且内容受这些口径差异影响的 L2 挂起快照，在升级后的首次
+重挂中会因指纹不相等而被 fail-closed 丢弃。
+
+这是安全侧的预期行为，不做旧算法兼容回退，避免把无法证明同代的高风险写剧集重新挂起。实现必须：
+
+- 在重挂日志中明确记录“指纹算法/内容代际不匹配，旧挂起快照已拒绝”；
+- 增加旧口径快照升级后被拒绝的回归测试；
+- 在 `CHANGELOG.md` 记录这一可观察的升级行为。
 
 ## 5. Episode Lifecycle Module
 
@@ -258,6 +287,7 @@ Runner 内部的 `_finish` 通过窄 Seam 接入；Host 捕获异常、挂起登
 - watcher 的 schedule/poll 循环不被订阅执行耗时串行阻塞；
 - 同一订阅默认保持顺序，避免重入；
 - lane 已在执行时，对重复 tick 使用有界单槽 pending/coalescing，防止无限任务堆积；
+- 重复 tick 被合并时记录 watcher key、订阅标识和累计合并数，便于解释缺失的逐 tick 唤醒；
 - 每个订阅异常独立记录，不终止 watcher；
 - disable、unload 和 shutdown 会取消或收束对应 lane，不留下无主任务。
 
@@ -289,10 +319,15 @@ Python 中 `bool` 是 `int` 的子类。月度日期判断改为精确整数类�
 
 - lint 完成后修改 `AGENT.md`，归档仍只包含已 lint 的旧快照，或安全失败；绝不包含未 lint 的新秘密。
 - Host 目录 gate 后修改源文件，运行时结构仍来自 gate 使用的同一快照。
+- zip 在临时目录校验后、原子切换前捕获；切换后即使 `dest` 被并发改动，首次运行时结构也不重读。
+- 目录中单文件或总字节数超限时稳定失败，不分配无界内存。
+- `osca lint` 遇到包内符号链接时返回稳定失败信息。
 - `judgments/indexes/*.yaml` 改变会改变版本指纹。
 - 根 `indexes/` 缓存改变不会改变版本指纹。
 - 指纹所需文件读取失败会明确失败，不产生可比较的伪指纹。
 - checksum、归档内容和 package id 都来自同一份 bytes。
+- 剧集在 G1 装配、`loaded.pack` 刷新为 G2 后再挂起，持久化记录仍为 G1 指纹。
+- 旧指纹口径生成的 L2 快照升级后按预期被拒绝，并留下可诊断日志。
 - 路径逃逸、符号链接、YAML alias/深度保护等现有安全测试继续通过。
 
 ### 9.2 Episode Lifecycle
@@ -308,6 +343,7 @@ Python 中 `bool` 是 `int` 的子类。月度日期判断改为精确整数类�
 - 慢订阅不会阻止快订阅开始。
 - 慢订阅不会拖住下一次 watcher 调度。
 - 同一订阅不会并发重入，pending 有界。
+- coalescing 合并重复 tick 时有明确日志和累计数。
 - 一个订阅抛异常不影响其他订阅及后续 tick。
 - shutdown/unload 后无遗留派发任务。
 - `fire_manual` 仍等待完成并返回错误。
@@ -333,7 +369,7 @@ Python 中 `bool` 是 `int` 的子类。月度日期判断改为精确整数类�
 3. Episode Lifecycle 失败测试与 Module。
 4. 预算、挂起索引、终态路径和 audit retention 迁移。
 5. watcher 独立派发。
-6. schedule 与 README 修正。
+6. schedule、README 与 CHANGELOG 修正。
 7. 全量回归、差异审查和兼容性核对。
 
 ## 11. 验收标准
@@ -341,6 +377,7 @@ Python 中 `bool` 是 `int` 的子类。月度日期判断改为精确整数类�
 - 七项 Review 问题均有独立回归测试并通过。
 - 同一包操作中，校验与消费不再跨代读盘。
 - 挂起版本戳不漏业务文件，不吞读取错误。
+- 每个 Episode 的挂起版本戳钉在其装配代际，不受随后账本刷新换代影响。
 - 长驻运行时的 Policy 临时状态有明确上界。
 - 慢订阅不形成共享 watcher 的全局背压。
 - 现有 CLI、Host 外部契约和 `.osca` 包格式保持兼容。
