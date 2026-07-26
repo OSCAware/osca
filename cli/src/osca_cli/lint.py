@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from osca_cli.findings import Finding, Severity
-from osca_cli.package import load_package
+from osca_cli.package import PackageSnapshot, SnapshotError, load_package
 from osca_cli.rules import RULES, run_all
 
 
@@ -31,15 +31,21 @@ class LintResult:
 
 def lint_package(path: str | Path) -> LintResult:
     root = Path(path)
-    if not root.is_dir():
+    try:
+        snapshot = PackageSnapshot.capture(root)
+    except SnapshotError as exc:
         return LintResult(
             package=str(path),
-            findings=[Finding("OSCA000", Severity.ERROR, ".", f"包目录不存在：{path}")],
+            findings=[Finding("OSCA000", Severity.ERROR, ".", str(exc))],
             files_checked=0,
         )
-    pkg = load_package(root)
+    return lint_snapshot(snapshot, package=str(path))
+
+
+def lint_snapshot(snapshot: PackageSnapshot, *, package: str | None = None) -> LintResult:
+    pkg = load_package(snapshot.root, snapshot=snapshot)
     return LintResult(
-        package=str(path),
+        package=package or str(snapshot.root),
         findings=run_all(pkg),
         files_checked=len(pkg.yaml_files),
     )

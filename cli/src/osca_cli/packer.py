@@ -28,8 +28,8 @@ import yaml
 
 from osca_cli import __version__
 from osca_cli.ledger import open_ledger_dir, publish_file_in_dir
-from osca_cli.lint import lint_package
-from osca_cli.package import load_package
+from osca_cli.lint import lint_package, lint_snapshot
+from osca_cli.package import PackageSnapshot, SnapshotError, load_package
 
 CHECKSUMS_REL = "indexes/checksums.txt"
 EXCLUDE_TOP_DIRS = {"indexes", ".git"}
@@ -149,8 +149,13 @@ def pack_package(path: str | Path, output: str | Path | None = None) -> tuple[Op
     root = Path(path)
     result = OpResult()
 
-    # 1. lint 门禁
-    lint_result = lint_package(root)
+    # 1. 捕获 + lint 门禁：后续摘要/归档只消费这一代字节，不再读源目录。
+    try:
+        snapshot = PackageSnapshot.capture(root)
+    except SnapshotError as exc:
+        result.fail(str(exc))
+        return result, None
+    lint_result = lint_snapshot(snapshot, package=str(root))
     if not lint_result.ok:
         for f in lint_result.findings:
             result.info(f.format())
@@ -160,27 +165,21 @@ def pack_package(path: str | Path, output: str | Path | None = None) -> tuple[Op
 
     # 2. 真实 bindings 拦截
     for name in FORBIDDEN_NAMES:
-        if (root / name).exists():
+        if snapshot.exists(name):
             result.fail(f"检测到 {name}（真实部署绑定）——铁律：真实 binding 永不进包，请移除后再打包")
             return result, None
     result.step("零真实 binding 确认")
 
     # 3. 符号链接拦截：跟随链接会把宿主机文件打进交付件
-    links = symlink_entries(root)
-    if links:
-        shown = "、".join(links[:3]) + ("…" if len(links) > 3 else "")
-        result.fail(f"检测到符号链接：{shown}——交付件不收符号链接（防止把包外文件打进包），请替换为真实文件")
-        return result, None
     result.step("零符号链接确认")
 
     # 4. 清单与校验和——同一次读取的同一份字节既算摘要又进归档（P2 关 TOCTOU 窗：
     # 摘要后二次读盘写 zip，并发修改会产出自校验必败的交付件）
-    rels = package_files(root)
-    blobs: dict[str, bytes] = {}
+    rels = sorted(snapshot.files)
+    blobs = dict(snapshot.files)
     lines = []
     for rel in sorted(rels):
-        data = (root / rel).read_bytes()
-        blobs[rel] = data
+        data = blobs[rel]
         lines.append(f"sha256:{hashlib.sha256(data).hexdigest()}  {rel}")
     checksums = "\n".join(lines) + "\n"
     result.step(f"进包文件 {len(rels)} 个，已生成校验和清单")

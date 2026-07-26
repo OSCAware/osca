@@ -2,7 +2,8 @@
 
 from pathlib import Path
 
-from osca_cli.lint import lint_package
+from osca_cli.lint import lint_package, lint_snapshot
+from osca_cli.package import PackageSnapshot
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "oper-diagnosis.osca"
 
@@ -30,6 +31,26 @@ def test_missing_dir_is_error():
     result = lint_package("/不存在的路径/x.osca")
     assert not result.ok
     assert "OSCA000" in rules_hit(result)
+
+
+def test_lint_rejects_symlink_with_stable_finding(make_pkg, base):
+    pkg = make_pkg(base)
+    (pkg / "linked.yaml").symlink_to(pkg / "policy.yaml")
+
+    result = lint_package(pkg)
+
+    assert not result.ok
+    assert any(f.rule == "OSCA000" and "符号链接" in f.message for f in result.findings)
+
+
+def test_lint_snapshot_does_not_reread_mutated_text(make_pkg, base):
+    pkg = make_pkg(base)
+    snapshot = PackageSnapshot.capture(pkg)
+    (pkg / "AGENT.md").write_text("sk-live-secret-abcdefghijklmnop", encoding="utf-8")
+
+    result = lint_snapshot(snapshot)
+
+    assert result.ok, [f.format() for f in result.findings]
 
 
 # ── 包结构 ──
@@ -765,8 +786,7 @@ def test_osca040_performer_restricted_syntax(make_pkg, base):
 
 
 def test_osca024_symlink_loop_no_traceback(make_pkg, base):
-    """GPT 三审 P2：符号链接环让 Path.resolve 抛 RuntimeError（≤3.12）——lint 不许 traceback，
-    按 OSCA024 稳定报告（环即不可解析：越界拒 或 不存在告警，取决于解释器版本，两者都收敛）。"""
+    """快照门禁统一拒绝符号链接（含链接环），lint 稳定收敛到 OSCA000，不透 traceback。"""
     root = make_pkg(base)
     (root / "sql").mkdir(exist_ok=True)
     loop = root / "sql" / "loop.sql"
@@ -779,7 +799,7 @@ def test_osca024_symlink_loop_no_traceback(make_pkg, base):
     conn.write_text(_yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
 
     result = lint_package(root)  # 此前 RuntimeError traceback 穿透
-    assert "OSCA024" in rules_hit(result)
+    assert "OSCA000" in rules_hit(result)
 
 
 # ── OSCA050 端点形式补漏（P1）：大写协议、IP:端口、IPv6、userinfo 连接串 ──

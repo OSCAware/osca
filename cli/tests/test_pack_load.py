@@ -1,10 +1,13 @@
 """osca pack / load 的行为测试：门禁、确定性、防篡改、binding 比对、索引重建。"""
 
 import zipfile
+from pathlib import Path
 
+import pytest
 import yaml
 
 from osca_cli import packer
+from osca_cli.package import PackageSnapshot, SnapshotError
 from osca_cli.packer import (
     CHECKSUMS_REL,
     load_osca,
@@ -13,6 +16,15 @@ from osca_cli.packer import (
 )
 
 # ── pack ──
+
+
+def test_snapshot_rejects_member_and_total_size_limits(make_pkg, base):
+    pkg = make_pkg(base)
+    (pkg / "large.txt").write_bytes(b"x" * 65)
+    with pytest.raises(SnapshotError, match="单文件"):
+        PackageSnapshot.capture(pkg, max_member_bytes=64, max_total_bytes=256)
+    with pytest.raises(SnapshotError, match="总字节"):
+        PackageSnapshot.capture(pkg, max_member_bytes=128, max_total_bytes=64)
 
 
 def test_pack_creates_zip_with_checksums(make_pkg, base, tmp_path):
@@ -34,6 +46,28 @@ def test_pack_is_reproducible(make_pkg, base, tmp_path):
     _, zip1 = pack_package(pkg, tmp_path / "a.zip")
     _, zip2 = pack_package(pkg, tmp_path / "b.zip")
     assert zip1.read_bytes() == zip2.read_bytes()
+
+
+def test_pack_archives_exact_snapshot_that_passed_lint(make_pkg, base, tmp_path, monkeypatch):
+    pkg = make_pkg(base)
+    original = PackageSnapshot.capture.__func__
+    mutated = False
+
+    def capture_then_mutate(cls, root, **kwargs):
+        nonlocal mutated
+        snapshot = original(cls, root, **kwargs)
+        if Path(root) == pkg and not mutated:
+            mutated = True
+            (pkg / "AGENT.md").write_text("sk-live-secret-abcdefghijklmnop", encoding="utf-8")
+        return snapshot
+
+    monkeypatch.setattr(PackageSnapshot, "capture", classmethod(capture_then_mutate))
+
+    result, archive = pack_package(pkg, tmp_path / "out.osca.zip")
+
+    assert result.ok
+    with zipfile.ZipFile(archive) as zf:
+        assert b"sk-live-secret-abcdefghijklmnop" not in zf.read("AGENT.md")
 
 
 def test_pack_refuses_lint_errors(make_pkg, base, tmp_path):

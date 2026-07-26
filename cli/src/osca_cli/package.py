@@ -6,10 +6,15 @@ indexes/ 是机器生成的缓存（设计公理 A4），装载时跳过。
 
 from __future__ import annotations
 
+import hashlib
 import os
+import posixpath
 import re
+import stat
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 
 import yaml
 
@@ -44,6 +49,104 @@ TYPED_DIRS: dict[str, tuple[str, str]] = {
 
 REQUIRED_FILES = ["osca.yaml", "AGENT.md", "policy.yaml", "structure.yaml"]
 SKIP_DIRS = {"indexes", ".git"}
+MAX_MEMBER_BYTES = 50 * 1024 * 1024
+MAX_TOTAL_BYTES = 200 * 1024 * 1024
+EXCLUDE_NAMES = {".DS_Store"}
+
+
+class SnapshotError(OSError):
+    """包目录无法安全捕获成一代不可变内容。"""
+
+
+@dataclass(frozen=True)
+class PackageSnapshot:
+    root: Path
+    files: Mapping[str, bytes]
+    directories: frozenset[str]
+    fingerprint: str
+
+    @classmethod
+    def capture(
+        cls,
+        root: Path | str,
+        *,
+        max_member_bytes: int = MAX_MEMBER_BYTES,
+        max_total_bytes: int = MAX_TOTAL_BYTES,
+    ) -> PackageSnapshot:
+        base = Path(root)
+        if not base.is_dir():
+            raise SnapshotError(f"包目录不存在：{base}")
+        blobs: dict[str, bytes] = {}
+        directories: set[str] = set()
+        links: list[str] = []
+        total = 0
+        try:
+            for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+                current = Path(dirpath)
+                if current == base and ".git" in dirnames:
+                    dirnames.remove(".git")
+                for name in list(dirnames):
+                    path = current / name
+                    rel = path.relative_to(base).as_posix()
+                    if path.is_symlink():
+                        links.append(rel)
+                    else:
+                        directories.add(rel)
+                for name in filenames:
+                    path = current / name
+                    rel = path.relative_to(base).as_posix()
+                    if path.is_symlink():
+                        links.append(rel)
+                        continue
+                    if rel.split("/", 1)[0] == "indexes" or name in EXCLUDE_NAMES:
+                        continue
+                    try:
+                        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                        with os.fdopen(fd, "rb") as stream:
+                            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                                raise SnapshotError(f"包内不是普通文件：{rel}")
+                            data = stream.read(max_member_bytes + 1)
+                    except OSError as exc:
+                        raise SnapshotError(f"包文件读取失败：{rel}（{type(exc).__name__}）") from exc
+                    if len(data) > max_member_bytes:
+                        raise SnapshotError(f"单文件 {rel} 超上限 {max_member_bytes} 字节")
+                    total += len(data)
+                    if total > max_total_bytes:
+                        raise SnapshotError(f"包总字节超上限 {max_total_bytes}")
+                    blobs[rel] = data
+        except SnapshotError:
+            raise
+        except OSError as exc:
+            raise SnapshotError(f"包目录遍历失败（{type(exc).__name__}）") from exc
+        if links:
+            shown = "、".join(sorted(links)[:3]) + ("…" if len(links) > 3 else "")
+            raise SnapshotError(f"检测到符号链接：{shown}——包内容不跟随链接")
+        digest = hashlib.sha256()
+        for rel, data in sorted(blobs.items()):
+            digest.update(rel.encode("utf-8") + b"\0" + data + b"\0")
+        return cls(base, MappingProxyType(blobs), frozenset(directories), f"fp:{digest.hexdigest()}")
+
+    def with_root(self, root: Path | str) -> PackageSnapshot:
+        return PackageSnapshot(Path(root), self.files, self.directories, self.fingerprint)
+
+    def exists(self, relpath: str) -> bool:
+        return relpath in self.files
+
+    def is_file(self, relpath: str) -> bool:
+        return relpath in self.files
+
+    def has_directory(self, relpath: str) -> bool:
+        return relpath.rstrip("/") in self.directories
+
+    def read_bytes(self, relpath: str) -> bytes:
+        return self.files[relpath]
+
+    def read_text(self, relpath: str, *, encoding: str = "utf-8", errors: str = "strict") -> str:
+        return self.read_bytes(relpath).decode(encoding, errors)
+
+    def iter_text_files(self) -> Iterator[tuple[str, str]]:
+        for rel, data in sorted(self.files.items()):
+            yield rel, data.decode("utf-8", "ignore")
 
 
 def resolve_in_root(root: Path | str, declared: str) -> Path | None:
@@ -78,6 +181,7 @@ class YamlFile:
 @dataclass
 class OscaPackage:
     root: Path
+    snapshot: PackageSnapshot
     yaml_files: dict[str, YamlFile] = field(default_factory=dict)  # relpath → YamlFile
     declared_ids: dict[str, str] = field(default_factory=dict)  # ID → 首个声明它的 relpath
     # AGENT.md 快照（P2）：与 yaml_files 同一次装载读入——消费方（Episode 装配/回放）不再实时
@@ -85,7 +189,25 @@ class OscaPackage:
     agent_text: str = ""
 
     def exists(self, relpath: str) -> bool:
-        return (self.root / relpath).is_file()
+        return self.snapshot.exists(relpath)
+
+    def has_directory(self, relpath: str) -> bool:
+        return self.snapshot.has_directory(relpath)
+
+    def is_file(self, relpath: str) -> bool:
+        return self.snapshot.is_file(relpath)
+
+    def iter_text_files(self) -> Iterator[tuple[str, str]]:
+        return self.snapshot.iter_text_files()
+
+    def declared_relpath(self, declared: str) -> str | None:
+        """把不可信包内声明规范化成快照相对路径；绝对路径与越界返回 None。"""
+        if not declared or Path(declared).is_absolute():
+            return None
+        normalized = posixpath.normpath(declared)
+        if normalized == ".." or normalized.startswith("../"):
+            return None
+        return normalized
 
     def typed_files(self, dirname: str) -> list[YamlFile]:
         """某类型目录下的全部 YAML（含 >200 条后的子目录分层）。"""
@@ -140,15 +262,17 @@ def referenced_ids(f: YamlFile) -> set[str]:
     return ids
 
 
-def load_package(root: Path) -> OscaPackage:
-    pkg = OscaPackage(root=root)
+def load_package(root: Path, snapshot: PackageSnapshot | None = None) -> OscaPackage:
+    snapshot = snapshot or PackageSnapshot.capture(root)
+    pkg = OscaPackage(root=root, snapshot=snapshot)
 
-    for path in sorted(root.rglob("*.yaml")):
-        rel = path.relative_to(root).as_posix()
+    for rel, blob in sorted(snapshot.files.items()):
+        if not rel.endswith(".yaml"):
+            continue
         if rel.split("/", 1)[0] in SKIP_DIRS:
             continue
         try:
-            data = yaml.load(path.read_text(encoding="utf-8"), Loader=BoundedSafeLoader)
+            data = yaml.load(blob.decode("utf-8"), Loader=BoundedSafeLoader)
             pkg.yaml_files[rel] = YamlFile(relpath=rel, data=data)
         except yaml.YAMLError as e:
             pkg.yaml_files[rel] = YamlFile(relpath=rel, data=None, parse_error=str(e))
@@ -156,7 +280,7 @@ def load_package(root: Path) -> OscaPackage:
             # 超深嵌套在解析层炸递归栈——转稳定 parse_error（OSCA003 报告并拒绝），不许 traceback 穿透
             error = "YAML 嵌套过深（RecursionError）——拒绝解析"
             pkg.yaml_files[rel] = YamlFile(relpath=rel, data=None, parse_error=error)
-        except (UnicodeDecodeError, OSError) as e:
+        except UnicodeDecodeError as e:
             # 二进制伪装 .yaml（如 PNG 改名）/ 读取失败：不许 traceback 穿透 lint/pack/load——
             # 一律转 parse_error，由 OSCA003 稳定报告并拒绝（GPT Review P2）
             error = f"文件读取/解码失败（{type(e).__name__}）"
@@ -165,10 +289,8 @@ def load_package(root: Path) -> OscaPackage:
     # AGENT.md 与 YAML 同一次装载读入（P2 同代快照）。O_NOFOLLOW：装载门禁已拒链接，这里是
     # 运行中被换成链接（账本刷新路径）的第二道闸——读不到按缺失处理（OSCA001 报缺失）
     try:
-        fd = os.open(root / "AGENT.md", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        with os.fdopen(fd, "r", encoding="utf-8") as fh:
-            pkg.agent_text = fh.read()
-    except (OSError, UnicodeDecodeError, ValueError):
+        pkg.agent_text = snapshot.read_text("AGENT.md")
+    except (KeyError, UnicodeDecodeError, ValueError):
         pkg.agent_text = ""
 
     # 收集声明的 ID（文件内 ID 字段优先；用于引用解析与唯一性检查）
