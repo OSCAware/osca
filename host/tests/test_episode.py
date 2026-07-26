@@ -51,6 +51,10 @@ def test_context_sections(episode):
     assert [j["judgment_id"] for j in ctx["judgments"]] == ["J-0417", "J-0423"]
 
 
+def test_episode_pins_package_snapshot_generation(episode, loaded):
+    assert episode.package_fingerprint == loaded.pack.snapshot.fingerprint
+
+
 def test_policy_never_in_context(episode):
     """公理 A5：policy.yaml 是笼子，模型永不读——上下文里不得出现。"""
     assert "policy" not in episode.context

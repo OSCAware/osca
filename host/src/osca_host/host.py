@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import logging
 import os
 import signal
@@ -818,7 +817,6 @@ class Host:
         ch = policy.get_challenge(cid) if cid else None
         if store is None or ch is None:
             return
-        loaded = self.registry.packages.get(episode.package_id)
         tool_calls, tokens = policy.episode_budget_used(episode.episode_id)
         record = {
             "operation_id": episode.operation_id,
@@ -827,12 +825,11 @@ class Host:
             "challenge": asdict(ch),
             "tool_calls": tool_calls,
             "tokens": tokens,
-            "version_stamp": None,  # 线程内补算（全包指纹是磁盘重活）
+            "version_stamp": episode.package_fingerprint,
         }
         ticket = store.begin_persist(episode.operation_id)  # 事件循环侧领票——先于任何可能的 delete 观察点
 
         def _stamp_and_persist() -> None:
-            record["version_stamp"] = self._pack_stamp(loaded) if loaded is not None else None
             store.persist(episode.operation_id, record, ticket=ticket)
 
         try:
@@ -845,24 +842,8 @@ class Host:
 
     @staticmethod
     def _pack_stamp(loaded) -> str:
-        """包版本戳 = **源文件内容指纹**（sha256 of 排序后的「相对路径 + 字节」），排除 `.git/`（版本控制内部）
-        与 `indexes/`（装载重建的缓存，与包身份无关）。
-
-        为何不用 git tree OID：OID 只反映 **已提交** 内容——直接改 policy.yaml/pipeline/connector 而不提交，
-        HEAD tree 不变，旧快照会重挂到新运行语义（GPT 外审 P1）。内容指纹按**实际工作树字节**计，未提交改动
-        照样变戳。重挂时严格比对，任一漂移即 fail-closed 丢弃（§2.4）。持久/重挂皆低频（挂起时 / 装载时），
-        小包成本可忽略。"""
-        root = loaded.root
-        h = hashlib.sha256()
-        for p in sorted(root.rglob("*")):
-            parts = p.relative_to(root).parts
-            if p.is_dir() or ".git" in parts or "indexes" in parts:
-                continue
-            h.update(p.relative_to(root).as_posix().encode("utf-8") + b"\0")
-            with contextlib.suppress(OSError):
-                h.update(p.read_bytes())
-            h.update(b"\0")
-        return "fp:" + h.hexdigest()
+        """返回当前已发布包快照的内容指纹；不重读磁盘、不吞读取错误。"""
+        return loaded.pack.snapshot.fingerprint
 
     async def _reattach_suspensions(self, package_id: str) -> None:
         """package 装载后重挂其持久化的挂起剧集（L2）：读盘 → 版本戳/结构校验 → 重建剧集 + 挑战 + 计数 →

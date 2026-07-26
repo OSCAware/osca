@@ -42,6 +42,7 @@ class Episode:
     then: str | None
     budget: dict
     context: dict = field(repr=False)
+    package_fingerprint: str = ""  # 装配时钉住的包代际；L2 挂起不得在 persist 时改取新代
     operation_id: str = ""  # 跨 Host 重启唯一的机器身份；EP-xxxx 只是短展示编号
     # ── 执行态（runner 写入）：assembled → running → suspended_pending_approval ⇄ running → completed|stopped|failed ──
     status: str = "assembled"
@@ -168,4 +169,5 @@ def assemble(episode_id: str, loaded: LoadedPackage, aware: AwareDecl, fired_tri
         then=aware.then,
         budget=aware.budget,
         context=context,
+        package_fingerprint=loaded.pack.snapshot.fingerprint,
     )

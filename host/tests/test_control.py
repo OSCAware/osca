@@ -10,6 +10,7 @@ import contextlib
 import copy
 
 import pytest
+from osca_cli.package import load_package
 
 from osca_host.authz import Principal
 from osca_host.control import send_command
@@ -874,6 +875,37 @@ async def test_d2b_reattach_same_display_id_no_collision(running_host, sample_pa
     assert host._suspensions["CH-a"] != host._suspensions["CH-b"]  # 两挑战各指自己的剧集（未错接）
 
 
+async def test_package_fingerprint_includes_nested_indexes_directory(running_host, sample_pack, deploy_w5):
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    loaded = host.registry.packages["demo-group-oper-diagnosis"]
+    before = host._pack_stamp(loaded)
+
+    nested = sample_pack / "judgments" / "indexes"
+    nested.mkdir()
+    (nested / "J-9999.yaml").write_text("judgment_id: J-9999\n", encoding="utf-8")
+    fresh = load_package(sample_pack)
+    loaded.pack = fresh
+
+    assert host._pack_stamp(loaded) != before
+
+
+async def test_refresh_publishes_generation_used_by_next_episode(running_host, sample_pack, deploy_w5):
+    host = running_host
+    await _load_pack(host, sample_pack, deploy_w5)
+    loaded = host.registry.packages["demo-group-oper-diagnosis"]
+    policy = host.policies[loaded.package_id]
+    old_fingerprint = loaded.pack.snapshot.fingerprint
+    (loaded.root / "AGENT.md").write_text("refreshed generation", encoding="utf-8")
+
+    assert host._refresh_ledger(loaded, policy)
+    aware = next(a for a in loaded.awares if a.aware_id == "AW-001")
+    episode = assemble("EP-refresh", loaded, aware, aware.triggers[0].trigger_id)
+
+    assert episode.package_fingerprint == loaded.pack.snapshot.fingerprint
+    assert episode.package_fingerprint != old_fingerprint
+
+
 async def test_d2b_delete_failure_keeps_suspended_not_fake_running(running_host, sample_pack, deploy_w5, monkeypatch):
     """删快照失败（磁盘/权限）→ 保留挂起态、不推进成永卡的假 running（GPT 外审 P1）：_suspensions 映射仍在、可重试。"""
     host = running_host
@@ -965,7 +997,7 @@ def _slow_refresh(monkeypatch):
 
 
 def _slow_stamp(monkeypatch):
-    """把 _pack_stamp 换成可控屏障版（persist / reattach 的线程重活都会经过它）。"""
+    """把 _pack_stamp 换成可控屏障版（reattach 线程读取当前代际时经过它）。"""
     import threading as _threading
 
     entered, release = _threading.Event(), _threading.Event()
@@ -977,6 +1009,22 @@ def _slow_stamp(monkeypatch):
         return original(loaded)
 
     monkeypatch.setattr(Host, "_pack_stamp", staticmethod(slow))
+    return entered, release
+
+
+def _slow_persist(host, monkeypatch):
+    """把 suspension persist 换成可控屏障版；Episode 指纹已在装配时钉住，不再借 _pack_stamp 阻塞。"""
+    import threading as _threading
+
+    entered, release = _threading.Event(), _threading.Event()
+    original = host._suspension_store.persist
+
+    def slow(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=10)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(host._suspension_store, "persist", slow)
     return entered, release
 
 
@@ -1010,7 +1058,7 @@ async def test_persist_race_with_approve_leaves_no_stale_snapshot(running_host, 
     await _load_pack(host, sample_pack, deploy_w5)
     pid = "demo-group-oper-diagnosis"
     episode, loaded, proxy, policy = _setup_write_episode(host, pid)
-    entered, release = _slow_stamp(monkeypatch)
+    entered, release = _slow_persist(host, monkeypatch)
 
     exec_task = asyncio.create_task(host._execute_episode(episode, loaded, proxy, policy))
     assert await asyncio.to_thread(entered.wait, 10)  # 挂起已登记，persist 线程正算指纹（文件未落）
@@ -1033,7 +1081,7 @@ async def test_persist_during_unload_retains_snapshot(running_host, sample_pack,
     await _load_pack(host, sample_pack, deploy_w5)
     pid = "demo-group-oper-diagnosis"
     episode, loaded, proxy, policy = _setup_write_episode(host, pid)
-    entered, release = _slow_stamp(monkeypatch)
+    entered, release = _slow_persist(host, monkeypatch)
 
     exec_task = asyncio.create_task(host._execute_episode(episode, loaded, proxy, policy))
     assert await asyncio.to_thread(entered.wait, 10)  # persist 线程在途（文件未落）

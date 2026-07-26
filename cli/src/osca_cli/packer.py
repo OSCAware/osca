@@ -28,7 +28,7 @@ import yaml
 
 from osca_cli import __version__
 from osca_cli.ledger import open_ledger_dir, publish_file_in_dir
-from osca_cli.lint import lint_package, lint_snapshot
+from osca_cli.lint import lint_snapshot
 from osca_cli.package import PackageSnapshot, SnapshotError, load_package
 
 CHECKSUMS_REL = "indexes/checksums.txt"
@@ -249,7 +249,7 @@ def _safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
 CHECKSUM_LINE = re.compile(r"sha256:([0-9a-f]{64})  (.+)")
 
 
-def verify_checksums(root: Path, result: OpResult) -> bool:
+def verify_checksums(root: Path, result: OpResult, snapshot: PackageSnapshot | None = None) -> bool:
     """校验和比对。清单自身损坏（不可读/非 UTF-8/行格式非法）→ 稳定装载失败（P2），
     不许 ValueError/traceback 穿透——清单是完整性根基，坏了不猜、不兜底。"""
     checks_path = root / CHECKSUMS_REL
@@ -268,13 +268,16 @@ def verify_checksums(root: Path, result: OpResult) -> bool:
             return False
         expected[m.group(2)] = m.group(1)
 
-    actual = set(package_files(root))
+    actual_blobs = dict(snapshot.files) if snapshot is not None else None
+    actual = set(actual_blobs) if actual_blobs is not None else set(package_files(root))
     ok = True
     for rel, digest in sorted(expected.items()):
         if rel not in actual:
             result.fail(f"完整性校验失败：清单中的 {rel} 缺失")
             ok = False
-        elif _sha256(root / rel) != digest:
+        elif (
+            hashlib.sha256(actual_blobs[rel]).hexdigest() if actual_blobs is not None else _sha256(root / rel)
+        ) != digest:
             result.fail(f"完整性校验失败：{rel} 内容与校验和不符（疑似被篡改）")
             ok = False
     for rel in sorted(actual - set(expected)):
@@ -365,8 +368,8 @@ def deployment_binding_errors(env: object, required: set[str]) -> list[str]:
     return sorted(errors)
 
 
-def required_bindings(root: Path) -> set[str]:
-    pkg = load_package(root)
+def required_bindings(root: Path, pkg=None) -> set[str]:
+    pkg = pkg if pkg is not None else load_package(root)
     required: set[str] = set()
     manifest = pkg.yaml_files.get("osca.yaml")
     if manifest:
@@ -473,7 +476,7 @@ def _validate_package_root(
     bindings: str | Path | None,
     require_bindings: bool,
     abort: Callable[[], str | None] | None = None,
-) -> bool:
+) -> PackageSnapshot | None:
     """装载校验流水线（符号链接 → 完整性 → lint → binding 门禁 → 重建索引），全过才 True。
 
     zip 模式在**临时目录**上整段执行（P1 升级安全）：任何一步失败时 dest 上的旧部署一字节不动。
@@ -484,47 +487,54 @@ def _validate_package_root(
     if links:
         shown = "、".join(links[:3]) + ("…" if len(links) > 3 else "")
         result.fail(f"包内检测到符号链接：{shown}——装载拒绝（链接可读写包外文件；交付件不收符号链接）")
-        return False
+        return None
+
+    try:
+        snapshot = PackageSnapshot.capture(root)
+    except SnapshotError as exc:
+        result.fail(str(exc))
+        return None
+    pkg = load_package(root, snapshot=snapshot)
 
     # 完整性校验（交付件必须带清单；开发态目录可豁免）
     if (root / CHECKSUMS_REL).is_file():
-        if not verify_checksums(root, result):
-            return False
+        if not verify_checksums(root, result, snapshot=snapshot):
+            return None
     elif from_zip:
         result.fail(f"交付件缺少 {CHECKSUMS_REL}——不是 osca pack 产出的合规交付件")
-        return False
+        return None
     else:
         result.info("开发态目录无校验和清单，跳过完整性校验（交付件不可跳过）")
 
     # lint
-    lint_result = lint_package(root)
+    lint_result = lint_snapshot(snapshot, package=str(root))
     if not lint_result.ok:
         for f in lint_result.findings:
             result.info(f.format())
         result.fail(f"lint 未通过（{lint_result.errors} 错误），拒绝装载")
-        return False
+        return None
     result.step(f"lint 通过（{lint_result.warnings} 警告）")
 
     # binding 与部署环境比对（SPEC §4 层2；缺失/形状非法即报错——装载门禁，不留到首次调用才炸）
-    required = required_bindings(root)
+    required = required_bindings(root, pkg)
     if bindings is not None:
         try:
             env = yaml.safe_load(Path(bindings).read_text(encoding="utf-8"))
         except (OSError, yaml.YAMLError) as e:
             result.fail(f"bindings 文件读取/解析失败：{e}")
-            return False
+            return None
         errors = deployment_binding_errors({} if env is None else env, required)
         if errors:
             for error in errors:
                 result.fail(error)
-            return False
+            return None
         result.step(f"binding 门禁通过（required {len(required)} 个均已注入且形状合法）")
     elif required and require_bindings:
         result.fail(
             f"部署装载必须注入 bindings：本包 required binding {', '.join(sorted(required))} 缺失"
             "（装载门禁 fail-closed；「无环境只校验包」请走 CLI 校验模式）"
         )
-        return False
+        return None
     elif required:
         result.info(
             f"未提供 --bindings：仅完成包校验（**非部署装载**，binding 门禁未执行）；"
@@ -536,26 +546,26 @@ def _validate_package_root(
     # 再复核一次（四轮复核 P1：检查与写入之间无线性化屏障的窗关死），命中即 LoadAborted 零发布
     if abort is not None and (why := abort()):
         result.fail(f"装载已作废：{why}——校验止步，不写入索引（迟到 load 零磁盘副作用）")
-        return False
+        return None
 
     # 重建索引（zip 模式建在临时目录里，随原子切换一并上位）
     try:
-        index_path = rebuild_index(root, abort=abort)
+        index_path = rebuild_index(root, pkg, abort=abort)
     except LoadAborted as e:
         result.fail(f"装载已作废：{e}——索引写入边界复核止步（零发布）")
-        return False
+        return None
     result.step(f"签名表已重建：{index_path.relative_to(root).as_posix()}")
-    return True
+    return snapshot
 
 
-def load_osca(
+def load_osca_snapshot(
     archive: str | Path,
     dest: str | Path | None = None,
     bindings: str | Path | None = None,
     *,
     require_bindings: bool = False,
     abort: Callable[[], str | None] | None = None,
-) -> tuple[OpResult, Path | None]:
+) -> tuple[OpResult, Path | None, PackageSnapshot | None]:
     """装载校验。require_bindings=True（Host 部署装载）：包声明了 required bindings 却未注入
     部署环境即失败——「无环境只校验包」是 CLI 的显式校验模式，不得称为部署装载成功。
 
@@ -571,20 +581,20 @@ def load_osca(
 
     if source.is_dir():
         result.info(f"输入为目录，原地装载校验：{source}")
-        ok = _validate_package_root(
+        snapshot = _validate_package_root(
             source, result, from_zip=False, bindings=bindings, require_bindings=require_bindings, abort=abort
         )
-        return (result, source) if ok else (result, None)
+        return (result, source, snapshot) if snapshot is not None else (result, None, None)
 
     if not (source.is_file() and zipfile.is_zipfile(source)):
         result.fail(f"输入既不是目录也不是 zip：{archive}")
-        return result, None
+        return result, None, None
 
     root = Path(dest) if dest else Path.cwd() / source.name.removesuffix(".zip")
     error = _dest_error(root)
     if error:
         result.fail(error)
-        return result, None
+        return result, None, None
     tmp = root.parent / f".{root.name}.osca-tmp-{os.getpid()}-{time.monotonic_ns()}"
     try:
         tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -594,21 +604,36 @@ def load_osca(
     except (OSError, ValueError) as e:
         shutil.rmtree(tmp, ignore_errors=True)
         result.fail(str(e) if isinstance(e, ValueError) else f"解压失败：{e}")
-        return result, None
+        return result, None, None
     result.step("已解压到临时目录（先验后切换：全部校验过关才动 dest）")
-    if not _validate_package_root(
+    snapshot = _validate_package_root(
         tmp, result, from_zip=True, bindings=bindings, require_bindings=require_bindings, abort=abort
-    ):
+    )
+    if snapshot is None:
         shutil.rmtree(tmp, ignore_errors=True)  # 校验失败：只清临时目录，dest 上的旧部署一字节不动
-        return result, None
+        return result, None, None
     # 切换前复核作废令牌（复核 P1，快路径——真正的屏障在 _swap_into_dest 取得 flock 之后）
     if abort is not None and (why := abort()):
         shutil.rmtree(tmp, ignore_errors=True)
         result.fail(f"装载已作废：{why}——切换取消，dest 未被触碰（迟到 load 零磁盘副作用）")
-        return result, None
+        return result, None, None
     error = _swap_into_dest(tmp, root, abort=abort)
     if error:
         result.fail(error)
-        return result, None
+        return result, None, None
     result.step(f"已发布到 {root}（原子切换；同 dest 可重启/重载，升级失败不销毁旧部署）")
+    return result, root, snapshot.with_root(root)
+
+
+def load_osca(
+    archive: str | Path,
+    dest: str | Path | None = None,
+    bindings: str | Path | None = None,
+    *,
+    require_bindings: bool = False,
+    abort: Callable[[], str | None] | None = None,
+) -> tuple[OpResult, Path | None]:
+    result, root, _snapshot = load_osca_snapshot(
+        archive, dest=dest, bindings=bindings, require_bindings=require_bindings, abort=abort
+    )
     return result, root
