@@ -724,7 +724,7 @@ class Host:
             episode.finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
             log.error(f"剧集 {episode.episode_id} 挂起时已不在台账——拒绝登记恢复")
             return False
-        self._suspensions[cid] = episode.episode_id
+        self._episode_lifecycle.suspend(episode, cid)
         log.info(f"剧集 {episode.episode_id} 挂起等批（挑战 {cid}）")
         ch = policy.get_challenge(cid)
         if ch is None or ch.state != "pending":  # 决定已先到（丢唤醒窗）→ 就地自愈恢复（马上恢复，不落盘）
