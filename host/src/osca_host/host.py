@@ -317,7 +317,7 @@ class Host:
                 # 换成非法形状不得静默带病发布（与 CLI 同一判据，单一真理源）
                 if spec.get("bindings"):
                     pkg_bindings = yaml.safe_load(Path(str(spec["bindings"])).read_text(encoding="utf-8")) or {}
-                    errors = deployment_binding_errors(pkg_bindings, required_bindings(loaded.root))
+                    errors = deployment_binding_errors(pkg_bindings, required_bindings(loaded.root, loaded.pack))
                     if errors:
                         for line in errors:
                             result.fail(line)
