@@ -46,6 +46,9 @@ next-env.d.ts
 *.osca.zip
 /deploy/
 
+# 产品形态设计图（Figma 导出）——属整机产品线，归私仓 oscapipe，公仓永不收
+/Mockup/
+
 # python (cli)
 __pycache__/
 *.py[cod]
