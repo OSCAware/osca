@@ -380,6 +380,24 @@ def test_openapi_path_join_collapses_double_slash(http_addr, ep_path, itf_path, 
         "/..%2fadmin",  # 编码斜杠 + 上跳
         "..\\admin",  # 反斜杠分隔（部分服务器按 Windows 语义等同 /）
         "/a/..%5cadmin",  # 编码反斜杠
+        # ── path-parameter（RFC 3986 `;`）：Tomcat/Jetty/Spring 一类**在归一化之前**剥掉 `;param`，剥完变回 `..`
+        "/..;/admin",
+        "/..;jsessionid=x/admin",  # 带值的 path-parameter（经典 Tomcat 形状）
+        "/..%3b/admin",  # 编码分号（小写）
+        "/..%3B/admin",  # 编码分号（大写）
+        "/%2e%2e;/admin",  # 编码点 + 分号
+        "/.%2e;a=b/admin",  # 混合编码 + 带值 path-parameter
+        "/%252e%252e;/admin",  # 双重编码 + 分号
+        "/a/..;\\admin",  # 分号 + 反斜杠分隔
+        # ── NUL 截断/抹除：按 C 字符串语义截断的后端把 `..%00x` 读成 `..`
+        "/..%00/admin",
+        "/..%00x/admin",  # NUL 后还有内容（截断语义）
+        "/.%00./admin",  # NUL 夹在两点之间（抹除语义）
+        "/..%2500/admin",  # 双重编码的 NUL
+        "/..%00;/admin",  # NUL + path-parameter 叠用
+        # ── 首尾空白：Windows 文件语义会吃掉尾随空格
+        "/..%20/admin",
+        "/%09../admin",  # 前导 tab
     ],
 )
 def test_openapi_path_traversal_fails_closed(http_addr, itf_path):
@@ -389,6 +407,23 @@ def test_openapi_path_traversal_fails_closed(http_addr, itf_path):
     也**不做归一化后放行**（归一后放行 = 替不可信输入把上跳兑现掉）。"""
     payload, err = _run_ep(f"openapi://{http_addr}/datastore/acme", {"method": "GET", "path": itf_path}, {})
     assert payload is None and "上跳" in err
+
+
+@pytest.mark.parametrize(
+    ("itf_path", "want"),
+    [
+        ("/booking;v=2", "/datastore/acme/booking;v=2"),  # 正常 matrix 参数：剥掉 `;v=2` 也不是 `..`
+        ("/..booking/x", "/datastore/acme/..booking/x"),  # `..` 只是段的前缀，整段不等于 `..`
+        ("/a..b", "/datastore/acme/a..b"),  # 段中间的两点
+        ("/.../x", "/datastore/acme/.../x"),  # 三点段：任何标准归一都不等于 `..`
+        ("/./x", "/datastore/acme/./x"),  # 单点段（当前段，不上跳）
+    ],
+)
+def test_openapi_traversal_guard_does_not_over_reject(http_addr, itf_path, want):
+    """判据收紧后**不许误伤**：只有「段规范化后等于 `..`」才拒——含 `..` 字样的正常段、matrix 参数段、
+    单点/三点段照发（服务器答了并回显 path 即证明请求真发出去了）。"""
+    payload, err = _run_ep(f"openapi://{http_addr}/datastore/acme", {"method": "GET", "path": itf_path}, {})
+    assert err is None and payload["path"] == want
 
 
 def test_openapi_traversal_from_endpoint_segment_also_rejected(http_addr):

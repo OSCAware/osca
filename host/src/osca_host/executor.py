@@ -167,13 +167,42 @@ def _anchor_path(raw: str) -> str:
     return "/" + raw.lstrip("/") if raw else ""
 
 
-def _has_traversal(path: str) -> bool:
-    """path 里有没有上跳段（`..`）——含百分号编码变体（`%2e%2e` / `%2E%2E` / `.%2e`，乃至双重编码）
-    与反斜杠分隔（`..\\`）。
+def _seg_normalizations(seg: str) -> set[str]:
+    """一段 path 在**各家后端**手里可能被归一成什么——判据只问「有没有一种归一让这段等于 `..`」。
 
-    判据故意比「某台服务器实际怎么解析」更宽：先反复百分号解码到不动点（挡 `%252e%252e` 双重编码——
-    带 decode 的代理/框架会把它还原成 `..`），再把 `\\` 也当分隔符（部分服务器/代理按 Windows 语义
-    等同 `/`），最后逐段比对 `..`。宁可多拒一条畸形路径，不可漏放一次上跳。
+    写成通用形式（枚举归一，不是一个变体打一个补丁）：每多一种「后端在比对路径前会先抹掉某种噪声」的
+    事实，就在这里加一条归一规则，`_has_traversal` 与它的调用方都不用动。当前三条：
+
+    - **`;` path-parameter（RFC 3986 §3.3）**：Tomcat/Jetty/Spring 一类在**归一化之前**剥掉 `;param`，
+      `..;` / `..;jsessionid=x` 剥完就变回 `..`（编码形 `%3b` 已在解码那步还原成 `;`）。
+    - **NUL**：按 C 字符串语义**截断**的后端把 `..%00x` 读成 `..`；也有实现是直接**抹除**控制字符，
+      那 `.%00.` 会变回 `..`。两种读法都算进来（宁可多拒）。
+    - **首尾空白**：Windows 文件语义吃掉尾随空格，`..%20` / `%09..` 落到那类后端就是 `..`。
+
+    考虑过但**不**收进来的：`...`（三点及以上纯点段）——RFC 与各家 HTTP 路由都不把它当上跳，只有
+    Win32 文件层吃尾随点，而它吃掉的是**全部**尾随点（`...` → 空，不是 `..`）；收进来纯属误伤。
+    `%c0%ae` 一类 overlong UTF-8（远古 IIS 会解成 `.`）也不收：Python 的 unquote 按 UTF-8 解得到替换字符，
+    要覆盖得另铺一套字节层解码，而本适配器打的是声明为 http/https 的数据台，不是 IIS 4/5。
+    """
+    cands = {seg, seg.split(";", 1)[0]}  # `;` 及其后的 path-parameter：剥 / 不剥
+    cands |= {c.split("\x00", 1)[0] for c in cands}  # NUL 截断（C 字符串语义）
+    cands |= {c.replace("\x00", "") for c in cands}  # NUL 抹除（另一种实现）
+    cands |= {c.strip() for c in cands}  # 首尾空白被吃掉
+    return cands
+
+
+def _has_traversal(path: str) -> bool:
+    """path 里有没有上跳段——判据是「**段规范化后等于 `..`**」，不是逐字等于 `..`。
+
+    三步：① 反复百分号解码到不动点（挡 `%2e%2e` / `%2E%2E` / `.%2e` / `..%2f` / `..%5c`，以及
+    `%252e%252e` 这类双重编码——带 decode 的代理/框架会把它还原成 `..`）；② 把 `\\` 也当分隔符
+    （部分服务器/代理按 Windows 语义等同 `/`）；③ 逐段过 `_seg_normalizations`（`;` path-parameter、
+    NUL 截断/抹除、首尾空白），任一归一形等于 `..` 即判上跳。
+
+    判据故意比「某台服务器实际怎么解析」更宽：宁可多拒一条畸形路径，不可漏放一次上跳。
+    已覆盖变体（每条都有参数化测试）：`..`、`%2e%2e`、`%2E%2E`、`.%2e`、`%252e%252e`、`..\\`、
+    `..%2f`、`..%5c`、`..;`、`..;jsessionid=x`、`..%3b`、`..%00`、`..%00x`、`.%00.`、`..%2500`、
+    `..%20`、`%09..`，以及它们的叠用形。
 
     **只判、不归一**：归一后放行 = 替不可信输入把上跳兑现掉，攻击者只要找到一台归一方式与我们不同的
     后端，缺口就重开；fail-closed 才收敛。
@@ -184,7 +213,7 @@ def _has_traversal(path: str) -> bool:
         if nxt == probe:
             break
         probe = nxt
-    return any(seg == ".." for seg in probe.replace("\\", "/").split("/"))
+    return any(".." in _seg_normalizations(seg) for seg in probe.replace("\\", "/").split("/"))
 
 
 class OpenapiExecutor:

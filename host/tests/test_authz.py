@@ -54,7 +54,8 @@ def test_role_caps_matrix_pinned():
     assert ROLE_CAPS["expert"] == {"episodes", "episode"}
     # M8-T2 整机两最小角色（红笔①-1 + M8 拍板 3）：界面进程持最小能力集，永不持 host_admin
     assert ROLE_CAPS["requester"] == {"fire", "status"}  # 员工触发桥：只发射与看快照
-    assert "episode" not in ROLE_CAPS["requester"] and "episodes" not in ROLE_CAPS["requester"]  # 读结果归桥的 expert token
+    for cap in ("episode", "episodes"):  # 读结果不归 requester，归桥自己的 expert token
+        assert cap not in ROLE_CAPS["requester"]
     assert ROLE_CAPS["deployer"] == {"load", "status"}  # App 服务层装载面：只装载与看快照
     for cap in ("unload", "stop", "enable", "disable"):  # 生命周期其余面对两新角色一律不给
         assert cap not in ROLE_CAPS["requester"] and cap not in ROLE_CAPS["deployer"]
@@ -86,8 +87,9 @@ def test_requester_role_fire_and_status_only():
     requester = Principal("员工桥", "requester")
     assert az.authorize(requester, "fire")
     assert az.authorize(requester, "status")
-    for denied in ("load", "unload", "enable", "disable", "episodes", "episode", "approve", "deny", "challenges", "stop"):
-        assert not az.authorize(requester, denied)
+    denied = ("load", "unload", "enable", "disable", "episodes", "episode", "approve", "deny", "challenges", "stop")
+    for cap in denied:
+        assert not az.authorize(requester, cap)
 
 
 def test_deployer_role_load_and_status_only():
@@ -96,8 +98,9 @@ def test_deployer_role_load_and_status_only():
     deployer = Principal("App 服务层", "deployer")
     assert az.authorize(deployer, "load")
     assert az.authorize(deployer, "status")
-    for denied in ("unload", "enable", "disable", "fire", "episodes", "episode", "approve", "deny", "challenges", "stop"):
-        assert not az.authorize(deployer, denied)
+    denied = ("unload", "enable", "disable", "fire", "episodes", "episode", "approve", "deny", "challenges", "stop")
+    for cap in denied:
+        assert not az.authorize(deployer, cap)
 
 
 def test_authorizer_register_identify_authorize():
