@@ -14,7 +14,8 @@ interfaces:
 
   - name: 下发处置工单
     method: POST               # 写 method；allowed_with_approval 连接器可合法声明（读连接器不得声明写 method）
-    path: /dispatch            # 执行器强制以 "/" 锚定；不声明 impl（impl 是 sql_readonly 固化查询用）
+    path: /dispatch            # 包内相对段（拼在 binding.endpoint 的 path 段之后）；执行器强制以 "/" 锚定、
+                               # 含 ".." 上跳即拒。不声明 impl（impl 是 sql_readonly 固化查询用）
     params: {ref: OBJ-201}     # 被写内容 schema（人类可读，喂 payload_display）
     returns: {ref: OBJ-202}    # 下发回执（工单号 + 受理状态）
 

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from osca_host.executor import OpenapiExecutor, SqlReadonlyExecutor
+from osca_host.executor import OpenapiExecutor, SqlReadonlyExecutor, _split_endpoint
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "oper-diagnosis.osca"  # 用真实样例 impl SQL
 
@@ -175,7 +175,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(n).decode("utf-8") if n else ""
-        self._json(201, {"method": "POST", "body": body, "auth": self.headers.get("Authorization")})
+        self._json(201, {"method": "POST", "path": self.path, "body": body, "auth": self.headers.get("Authorization")})
 
 
 @pytest.fixture
@@ -193,6 +193,18 @@ def http_addr():
 def _run_http(addr, interface, params, *, secret=None, is_write=False):
     return OpenapiExecutor().execute(
         endpoint=f"openapi://{addr}",
+        interface=interface,
+        params=params,
+        secret=secret,
+        is_write=is_write,
+        pack_root=Path("."),
+    )
+
+
+def _run_ep(endpoint, interface, params, *, secret=None, is_write=False):
+    """带**完整 endpoint（含 path 段）** 跑执行器——测「部署侧挂载前缀 + 包内相对段」的拼接。"""
+    return OpenapiExecutor().execute(
+        endpoint=endpoint,
         interface=interface,
         params=params,
         secret=secret,
@@ -275,6 +287,139 @@ def test_openapi_path_anchored_no_host_extension(http_addr):
     payload, err = _run_http(http_addr, {"method": "GET", "path": ".evil.com/exfil"}, {})
     assert err is None  # 请求确实打到 http_addr（netloc host）——server 响应了，说明 host 未被延展
     assert payload["path"] == "/.evil.com/exfil"  # path 锚定以 /，未污染 authority
+
+
+# ── endpoint 挂载前缀 + 包内相对 path 的拼接（造包→真写那道缝） ──────────
+
+
+def test_split_endpoint_semantics_unchanged():
+    """`_split_endpoint` 语义不动——`SqlReadonlyExecutor` 靠第 3 元取 sqlite 文件路径，改它会连带炸只读执行器。
+    openapi 分支只是**开始用**第 3 元（原来丢弃），切法本身一字未动。"""
+    assert _split_endpoint("openapi://127.0.0.1:18080") == ("openapi", "127.0.0.1:18080", "")
+    assert _split_endpoint("openapi://127.0.0.1:18080/datastore/acme") == (
+        "openapi",
+        "127.0.0.1:18080",
+        "/datastore/acme",
+    )
+    assert _split_endpoint("sql_readonly://localhost/tmp/fin.db") == ("sql_readonly", "localhost", "/tmp/fin.db")
+
+
+def test_openapi_endpoint_without_path_url_byte_identical_regression(http_addr):
+    """**向后兼容第一位**：endpoint 不带 path（今天所有既有形态——`examples/oper-dispatch.osca` 演练注入的
+    `openapi://127.0.0.1:<port>` + 接口 `path: /dispatch` 就是这个形状）→ URL 的 path **逐字不变**。
+    逐条钉死老行为：正常段、无 path 声明、GET query 拼接、无前导 `/` 的锚定、连写 `//` 不被全局归一。"""
+    payload, err = _run_ep(f"openapi://{http_addr}", {"method": "GET", "path": "/dispatch"}, {})
+    assert err is None and payload["path"] == "/dispatch"  # 无前缀、无尾斜杠、无归一副作用
+
+    payload, err = _run_ep(f"openapi://{http_addr}", {"method": "GET"}, {})
+    assert err is None and payload["path"] == "/"  # 两段皆空 → "/"（老行为）
+
+    payload, err = _run_ep(f"openapi://{http_addr}", {"method": "GET", "path": "/dispatch"}, {"q": "x"})
+    assert err is None and payload["path"] == "/dispatch?q=x"  # GET querystring 拼接未动
+
+    payload, err = _run_ep(f"openapi://{http_addr}", {"method": "GET", "path": "data/x"}, {})
+    assert err is None and payload["path"] == "/data/x"  # 无前导 / 仍被锚定成 /data/x
+
+    payload, err = _run_ep(f"openapi://{http_addr}", {"method": "GET", "path": "/a//b"}, {})
+    assert err is None and payload["path"] == "/a//b"  # 段内连写 // 逐字保留：只归一拼接缝，不做全局归一
+
+
+def test_openapi_endpoint_path_prefix_joins_interface_path(http_addr):
+    """造包→真写那道缝：endpoint 带**部署侧挂载前缀**（公司代号只活在这里）+ 包内**表相对段** → 真实路由。
+    包与登记表都不带 host / 公司代号 / 凭据。"""
+    payload, err = _run_ep(f"openapi://{http_addr}/datastore/acme", {"method": "GET", "path": "/booking"}, {})
+    assert err is None and payload["path"] == "/datastore/acme/booking"
+
+    payload, err = _run_ep(f"openapi://{http_addr}/datastore/acme", {"method": "GET", "path": "/booking"}, {"q": "x"})
+    assert err is None and payload["path"] == "/datastore/acme/booking?q=x"  # query 仍拼在拼完的 path 之后
+
+
+def test_openapi_write_path_joins_prefix(http_addr):
+    """写路径同样拼前缀（M8 数据台形状：`openapi://<主机>/datastore/<公司>` + 包内 `/booking`）。"""
+    payload, err = _run_ep(
+        f"openapi://{http_addr}/datastore/acme",
+        {"method": "POST", "path": "/booking"},
+        {"x": 1},
+        is_write=True,
+    )
+    assert err is None and payload["method"] == "POST" and payload["path"] == "/datastore/acme/booking"
+
+
+@pytest.mark.parametrize(
+    ("ep_path", "itf_path", "want"),
+    [
+        ("/datastore/acme", "/booking", "/datastore/acme/booking"),  # 两段都规整
+        ("/datastore/acme/", "/booking", "/datastore/acme/booking"),  # 左段尾斜杠 → 缝上不出 //
+        ("/datastore/acme", "booking", "/datastore/acme/booking"),  # 右段无前导斜杠 → 锚定补上
+        ("/datastore/acme/", "booking", "/datastore/acme/booking"),  # 一有一无，仍恰好一个 /
+        ("/datastore/acme/", "///booking", "/datastore/acme/booking"),  # 右段多余前导斜杠塌缩
+        ("/", "/booking", "/booking"),  # 前缀只有根 → 不出 //booking
+        ("/", "", "/"),  # 两段都退化成根
+        ("/datastore/acme", "", "/datastore/acme"),  # 接口无 path → 打挂载点本身
+        ("/datastore/acme/", "/", "/datastore/acme/"),  # 尾斜杠语义保留（但不成 //）
+    ],
+)
+def test_openapi_path_join_collapses_double_slash(http_addr, ep_path, itf_path, want):
+    """斜杠归一：拼完不许出现 `//`——`//x` 在某些服务器上是**另一个资源**（前缀路由/鉴权中间件按段匹配时
+    尤其危险），路径开头的 `//` 更会被读成 protocol-relative authority。空段要能正确塌缩。"""
+    payload, err = _run_ep(f"openapi://{http_addr}{ep_path}", {"method": "GET", "path": itf_path}, {})
+    assert err is None and payload["path"] == want
+    assert "//" not in payload["path"]
+
+
+@pytest.mark.parametrize(
+    "itf_path",
+    [
+        "/../admin",  # 裸上跳
+        "/a/../../admin",  # 中段上跳
+        "..",  # 整段就是上跳
+        "/%2e%2e/admin",  # 百分号编码（小写）
+        "/%2E%2E/admin",  # 百分号编码（大写）
+        "/.%2e/admin",  # 混合编码
+        "/%252e%252e/admin",  # 双重编码（带 decode 的代理会还原成 ..）
+        "/..%2fadmin",  # 编码斜杠 + 上跳
+        "..\\admin",  # 反斜杠分隔（部分服务器按 Windows 语义等同 /）
+        "/a/..%5cadmin",  # 编码反斜杠
+    ],
+)
+def test_openapi_path_traversal_fails_closed(http_addr, itf_path):
+    """路径穿越 fail-closed：`interface.path` 来自**包**（不可信输入），拼接一旦允许上跳，包就能从自己的
+    挂载前缀跳到同一台服务上别的 API（越权、串到别家公司的表），而 egress 白名单只看主机、拦不住。
+    **拒在外呼之前**——服务器本会回 200 并回显 path，这里拿到的是错误而非 payload，即证明请求没发出去。
+    也**不做归一化后放行**（归一后放行 = 替不可信输入把上跳兑现掉）。"""
+    payload, err = _run_ep(f"openapi://{http_addr}/datastore/acme", {"method": "GET", "path": itf_path}, {})
+    assert payload is None and "上跳" in err
+
+
+def test_openapi_traversal_from_endpoint_segment_also_rejected(http_addr):
+    """上跳由**部署侧 endpoint 前缀**贡献时同样拒——闸判**拼完的 path**，不认是哪一段带进来的。"""
+    payload, err = _run_ep(f"openapi://{http_addr}/datastore/acme/..", {"method": "GET", "path": "/booking"}, {})
+    assert payload is None and "上跳" in err
+
+
+def test_openapi_traversal_error_does_not_echo_deployment_prefix(http_addr):
+    """报错只回显**包内**声明的接口 path（包已在手），不回显部署侧挂载前缀（挂载点/公司代号属部署侧真值，
+    不进剧集台账）；且不带异常内文、不带 secret。"""
+    payload, err = _run_ep(
+        f"openapi://{http_addr}/datastore/acme",
+        {"method": "GET", "path": "/../admin"},
+        {},
+        secret="TKN-abc",
+    )
+    assert payload is None
+    assert "/../admin" in err and "acme" not in err and "TKN-abc" not in err
+
+
+def test_openapi_both_path_segments_pass_authority_gate(http_addr):
+    """authority 注入闸不因为多了一段而弱化——**两段都过**锚定：
+    ① interface 段形如 `.evil.com/x`（无前导 /）→ 被锚定到前缀之下，连接 host 不变（服务器答了即证明）；
+    ② endpoint 段前导 `//` → 塌成单斜杠，不留 protocol-relative authority 的形。"""
+    payload, err = _run_ep(f"openapi://{http_addr}/datastore/acme", {"method": "GET", "path": ".evil.com/exfil"}, {})
+    assert err is None  # 打在 http_addr 上，netloc 未被向右延展
+    assert payload["path"] == "/datastore/acme/.evil.com/exfil"
+
+    payload, err = _run_ep(f"openapi://{http_addr}//evil.com", {"method": "GET", "path": "/booking"}, {})
+    assert err is None and payload["path"] == "/evil.com/booking"  # 未留成 "//evil.com/booking"
 
 
 def test_openapi_response_body_over_cap_fails_closed(http_addr, monkeypatch):

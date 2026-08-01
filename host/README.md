@@ -157,7 +157,9 @@ W3 落地的是**机制**：绑定挑战状态机（approver / episode / payload
   名、绝不带值）；secret 前置在 egress **之后**（egress 拒则不解析凭据）。真系统 secret manager 取值归部署侧。
 - **真实执行器 ✅**（W6-3）：`_execute_real` 按 endpoint scheme 分派可插拔执行器——内置参考适配器
   sql_readonly（sqlite `mode=ro` 只读强制、包内固化 impl SQL 参数化命名绑定防注入）/ openapi（urllib，
-  method+path+params、secret 作 Bearer 头、**不跟随重定向**防 SSRF、path 强制锚定 `/` 防 host 混淆、响应体
+  method+path+params、secret 作 Bearer 头、**不跟随重定向**防 SSRF、**URL path = endpoint 的 path 段（部署侧
+  挂载前缀）+ interface 的 path 段（包内相对路由）**，两段各自强制锚定 `/` 防 host 混淆、缝上归一斜杠（不出 `//`）、
+  拼完含上跳段（`..`，含 `%2e%2e` 等编码变体与反斜杠）即 fail-closed 不归一放行、响应体
   读上限 + 截断/超限 fail-closed）；生产驱动（postgres/mysql/生产网关）由部署侧按 `Executor` 协议注入，未注册
   scheme / mcp 一律 fail-closed；执行器异常统一兜成 fail-closed 回执（`call()` 恒回 Receipt）。**诚实标注：测
   fake 后端（本地 sqlite / 本地 http.server）——生产库/生产 API 的真系统验证仍归部署侧（1.1/部署验收）。**

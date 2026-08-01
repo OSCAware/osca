@@ -649,6 +649,15 @@ Host 的 Connector 代理**按 `binding.endpoint` 的 scheme 选择执行器**�
     SQLite authorizer 双闸**——`mode=ro` 只护主库，`VACUUM INTO`/`ATTACH`/写 PRAGMA 仍能建文件，须授权器
     收窄到 SELECT/READ/FUNCTION（外审收口）。**method 与写权限一致**：读连接器（`write: forbidden`）的 HTTP
     执行器只允 GET/HEAD——写 method（POST/DELETE…）绕过审批门，一律拒（lint + 运行时双拦）。
+  - **URL path 拼接（HTTP 执行器）**：请求 path = **`binding.endpoint` 的 path 段**（部署侧挂载前缀）
+    **+ manifest 接口的 `path`**（包内相对路由）。分工是层次纪律的延续：主机、挂载点、公司/租户代号只活在
+    部署侧 endpoint 真值里，包只声明自己表内的相对段（`openapi://<主机>/datastore/<公司>` + `path: /booking`
+    → `/datastore/<公司>/booking`）。endpoint 不带 path 时行为与只有接口 path 时逐字一致（向后兼容）。三条闸：
+    ① **两段各自锚定 `/`**（非空段强制以单个 `/` 开头）——任一段都不得向右延展 netloc、也不得留下会被读成
+    protocol-relative authority 的前导 `//`；② **缝上归一斜杠**，拼接不得产出 `//`（`//x` 在部分服务器上是
+    另一个资源）；③ **拼完含上跳段（`..`，含 `%2e%2e`/`%2E%2E`/`.%2e` 等百分号编码变体、双重编码与反斜杠
+    分隔）一律 fail-closed 拒绝调用，不做归一化后放行**——接口 `path` 来自包（不可信输入），允许上跳等于让包
+    从自己的挂载前缀跳到同一台服务上别的 API，而 egress 白名单只校验主机、拦不住。
   - **secret 解析**：执行器按 `binding.secret_ref` 经可插拔 `SecretResolver` 取值；**secret 值永不进包、
     永不进日志、永不进剧集上下文**（error/audit 只带 secret_ref 名、绝不带值），取不到 / 空串 / resolver 抛错 /
     `secret_ref` 声明但空非法 一律 **fail-closed**（错误只带名）。反射型 API 若回显凭据，connector 层用本次 secret

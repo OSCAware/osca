@@ -26,7 +26,7 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 
 from osca_cli.package import resolve_in_root
 
@@ -153,10 +153,49 @@ def _host_only(netloc: str) -> str:
     return netloc.rsplit(":", 1)[0] if ":" in netloc else netloc
 
 
+def _anchor_path(raw: str) -> str:
+    """单段 path **锚定闸**：非空段一律强制以单个 `/` 开头（多余前导 `/` 塌成一个），空段回 ""。
+
+    这是 authority 注入闸（对抗审查 blocker）：一段 path 若是 `.evil.com/x` / `evil/x`，直接贴在 netloc
+    右边会**向右延展主机名**——连接被引到 egress 从未校验的主机、secret Bearer 顺手送过去；而前导 `//`
+    会让 `//evil.com/x` 被当成 protocol-relative authority（同样换主机）。锚定后这段只能是路径，注入不了 authority。
+
+    **endpoint 的 path 段与 interface 的 path 段都过这道闸**：闸不认来源、只认形状。endpoint 段虽由
+    `_split_endpoint` 切出来时就带前导 `/`，仍走同一函数——不给「这段来自部署侧所以可信」留隐含前提，
+    也不让日后换切法时悄悄漏掉一段。
+    """
+    return "/" + raw.lstrip("/") if raw else ""
+
+
+def _has_traversal(path: str) -> bool:
+    """path 里有没有上跳段（`..`）——含百分号编码变体（`%2e%2e` / `%2E%2E` / `.%2e`，乃至双重编码）
+    与反斜杠分隔（`..\\`）。
+
+    判据故意比「某台服务器实际怎么解析」更宽：先反复百分号解码到不动点（挡 `%252e%252e` 双重编码——
+    带 decode 的代理/框架会把它还原成 `..`），再把 `\\` 也当分隔符（部分服务器/代理按 Windows 语义
+    等同 `/`），最后逐段比对 `..`。宁可多拒一条畸形路径，不可漏放一次上跳。
+
+    **只判、不归一**：归一后放行 = 替不可信输入把上跳兑现掉，攻击者只要找到一台归一方式与我们不同的
+    后端，缺口就重开；fail-closed 才收敛。
+    """
+    probe = path
+    for _ in range(3):  # 有界解码到不动点：够覆盖单/双重编码，又不给畸形串留无限循环
+        nxt = unquote(probe)
+        if nxt == probe:
+            break
+        probe = nxt
+    return any(seg == ".." for seg in probe.replace("\\", "/").split("/"))
+
+
 class OpenapiExecutor:
     """openapi 参考适配器（urllib，无三方依赖）：method + path + params 从接口 manifest 取，secret 作
     `Authorization: Bearer` 头。参考适配器按 endpoint scheme 走 http（openapi://）/ https（https://）；
-    生产 API 网关驱动由部署侧注入。egress 已在 connector 分派前置；本适配器额外不跟随重定向（防 SSRF）。"""
+    生产 API 网关驱动由部署侧注入。egress 已在 connector 分派前置；本适配器额外不跟随重定向（防 SSRF）。
+
+    **URL path = endpoint 的 path 段（部署侧挂载前缀）+ interface 的 path 段（包内相对路由）**：
+    `openapi://<主机>/datastore/<公司>` + 接口 `path: /booking` → `/datastore/<公司>/booking`。
+    endpoint 不带 path 时（既有形态）URL 与老行为逐字一致。两段都过锚定闸（`_anchor_path`），
+    缝上归一斜杠，拼完含上跳段（`..`）即 fail-closed（`_has_traversal`）。"""
 
     def execute(self, *, endpoint, interface, params, secret, is_write, pack_root, timeout=None):
         method = interface.get("method")
@@ -170,7 +209,7 @@ class OpenapiExecutor:
                 None,
                 f"读路径（write: forbidden）不得用写 method {method}——绕过审批门；写须走写连接器 + 审批门（B.4）",
             )
-        ep_scheme, netloc, _ = _split_endpoint(endpoint)
+        ep_scheme, netloc, ep_path = _split_endpoint(endpoint)
         scheme = "https" if ep_scheme == "https" else "http"  # openapi:// 参考适配器映射 http；https:// 直用
         # 携带 secret 却非 https 且非本地回环（GPT 外审收口）→ fail-closed：明文外发凭据风险，生产用 https://。
         if secret and scheme != "https" and _host_only(netloc) not in _LOOPBACK:
@@ -178,10 +217,30 @@ class OpenapiExecutor:
                 None,
                 "openapi 携带 secret 却走非 https（且非本地回环）——fail-closed：凭据明文外发风险，生产须 https://",
             )
-        # path **强制以 / 开头**——否则 manifest path（如 ".evil.com/x" / "evil/x"）会向右延展 netloc、把真实连接
-        # host 引到 egress 从未校验的主机、并把 secret Bearer 送过去（对抗审查 blocker）。锚定后 path 不注入 authority。
+        # URL 的 path = **endpoint 的 path 段（部署侧挂载前缀）** + **interface 的 path 段（包内相对路由）**。
+        # 分工是刻意的：主机、公司代号、挂载点只活在部署侧 endpoint 真值里（本来就该在那），包只声明自己
+        # 表内的相对段（如 `/booking`）——包与登记表都不带 host / 公司代号 / 凭据。
+        # 两段各自过 `_anchor_path` 的 authority 闸（见该函数），再在**缝上**归一斜杠。
         raw_path = interface.get("path")
-        path = "/" + (raw_path if isinstance(raw_path, str) else "").lstrip("/")
+        itf_raw = raw_path if isinstance(raw_path, str) else ""
+        ep_seg, itf_seg = _anchor_path(ep_path), _anchor_path(itf_raw)
+        if ep_seg and itf_seg:
+            # 缝上恰好一个 `/`：左段去尾斜杠、右段已锚定以 `/` 开头。不许拼出 `//`——某些服务器把 `//x`
+            # 当另一个资源（前缀路由/鉴权中间件按段匹配时尤其危险），路径开头的 `//` 更会被读成 authority。
+            path = ep_seg.rstrip("/") + itf_seg
+        else:
+            # 空段塌缩：只有一段就用那段；两段皆空 → `/`（与老形状「endpoint 无 path + 接口无 path」逐字一致）
+            path = ep_seg or itf_seg or "/"
+        if _has_traversal(path):
+            # interface.path 来自**包**（不可信输入），endpoint 的 path 段来自部署侧。拼接一旦允许上跳，
+            # 包就能从自己的挂载前缀（如 /datastore/<公司>）跳到同一台服务上别的 API——越权、串到别家公司的
+            # 表，而 egress 白名单只看主机、根本拦不住。故 **fail-closed 拒绝调用**，不做归一化后放行。
+            # error 只回显包内声明的接口 path（包已在手），不回显部署侧前缀（挂载点属部署侧真值，不进剧集）。
+            return (
+                None,
+                f"openapi 拼接后 path 含上跳段（..）——fail-closed：包不得跳出部署侧挂载前缀"
+                f"（接口 path：{itf_raw}；此段无异常则查部署侧 endpoint 的 path 段）",
+            )
         url = f"{scheme}://{netloc}{path}"
         headers = {"Accept": "application/json"}
         if secret:
