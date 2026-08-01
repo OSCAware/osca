@@ -52,6 +52,12 @@ def test_role_caps_matrix_pinned():
         assert denied not in ROLE_CAPS["approver"]
     # M4-W1 专家端：只读交付面——episodes 摘要 + episode 全量（draft 即交付物）；写命令一律不给
     assert ROLE_CAPS["expert"] == {"episodes", "episode"}
+    # M8-T2 整机两最小角色（红笔①-1 + M8 拍板 3）：界面进程持最小能力集，永不持 host_admin
+    assert ROLE_CAPS["requester"] == {"fire", "status"}  # 员工触发桥：只发射与看快照
+    assert "episode" not in ROLE_CAPS["requester"] and "episodes" not in ROLE_CAPS["requester"]  # 读结果归桥的 expert token
+    assert ROLE_CAPS["deployer"] == {"load", "status"}  # App 服务层装载面：只装载与看快照
+    for cap in ("unload", "stop", "enable", "disable"):  # 生命周期其余面对两新角色一律不给
+        assert cap not in ROLE_CAPS["requester"] and cap not in ROLE_CAPS["deployer"]
 
 
 def test_expert_role_readonly_delivery_surface():
@@ -72,6 +78,26 @@ def test_approver_role_challenge_surface_only():
         assert az.authorize(approver, allowed)
     for denied in ("status", "load", "unload", "enable", "disable", "fire", "episodes", "episode", "stop"):
         assert not az.authorize(approver, denied)
+
+
+def test_requester_role_fire_and_status_only():
+    """requester（M8 员工触发桥）：只有 fire 与 status；剧集读面/审批面/生命周期一律被拒。"""
+    az = Authorizer()
+    requester = Principal("员工桥", "requester")
+    assert az.authorize(requester, "fire")
+    assert az.authorize(requester, "status")
+    for denied in ("load", "unload", "enable", "disable", "episodes", "episode", "approve", "deny", "challenges", "stop"):
+        assert not az.authorize(requester, denied)
+
+
+def test_deployer_role_load_and_status_only():
+    """deployer（M8 App 服务层装载面）：只有 load 与 status；卸载/启停/发射/审批/剧集面一律被拒。"""
+    az = Authorizer()
+    deployer = Principal("App 服务层", "deployer")
+    assert az.authorize(deployer, "load")
+    assert az.authorize(deployer, "status")
+    for denied in ("unload", "enable", "disable", "fire", "episodes", "episode", "approve", "deny", "challenges", "stop"):
+        assert not az.authorize(deployer, denied)
 
 
 def test_authorizer_register_identify_authorize():

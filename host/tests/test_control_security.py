@@ -200,6 +200,40 @@ async def test_role_capability_matrix_enforced(running_host):
     assert (await _send({"cmd": "status"}, host, token=approver))["error"] == "forbidden"
     assert (await _send({"cmd": "status"}, host, token=expert))["error"] == "forbidden"
 
+    # M8-T2 两最小角色：requester（员工触发桥）与 deployer（App 服务层装载面）
+    requester, deployer = "requester-token-1", "deployer-token-01"
+    host.authorizer.register(requester, Principal("员工桥", "requester"))
+    host.authorizer.register(deployer, Principal("App 服务层", "deployer"))
+    # requester：fire 到达 handler（包未注册 → ok=False 而非 forbidden）+ status 可看
+    resp = await _send({"cmd": "fire", "package_id": "p", "trigger_id": "AW-x"}, host, token=requester)
+    assert "error" not in resp and resp["ok"] is False
+    assert (await _send({"cmd": "status"}, host, token=requester))["ok"]
+    # requester 明确禁止：剧集读面（结果读取归桥的 expert token）/装载/审批/生命周期
+    for request in (
+        {"cmd": "episodes"},
+        {"cmd": "episode", "episode_id": "EP-0001"},
+        {"cmd": "load", "deployment_id": "x"},
+        {"cmd": "approve", "package_id": "p", "challenge_id": "CH-x"},
+        {"cmd": "unload", "package_id": "p"},
+        {"cmd": "stop"},
+    ):
+        assert (await _send(request, host, token=requester))["error"] == "forbidden", request
+    # deployer：load 到达 handler（部署 ID 未配置 → ok=False 而非 forbidden）+ status 可看
+    resp = await _send({"cmd": "load", "deployment_id": "x"}, host, token=deployer)
+    assert "error" not in resp and resp["ok"] is False and "未配置的部署 ID" in resp["detail"]
+    assert (await _send({"cmd": "status"}, host, token=deployer))["ok"]
+    # deployer 明确禁止：发射/卸载/启停/剧集面/审批/关停——装载面进程偷不到别的能力
+    for request in (
+        {"cmd": "fire", "package_id": "p", "trigger_id": "AW-x"},
+        {"cmd": "unload", "package_id": "p"},
+        {"cmd": "enable", "package_id": "p", "aware_id": "AW-x"},
+        {"cmd": "episodes"},
+        {"cmd": "episode", "episode_id": "EP-0001"},
+        {"cmd": "challenges", "package_id": "p"},
+        {"cmd": "stop"},
+    ):
+        assert (await _send(request, host, token=deployer))["error"] == "forbidden", request
+
 
 async def test_principals_file_issues_roles(sock_path):
     """部署者签发面：principals 文件（0600）启动时注册；权限过宽拒绝启动。"""

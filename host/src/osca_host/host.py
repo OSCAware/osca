@@ -33,6 +33,7 @@ from osca_host.authz import Authorizer, Principal, ensure_admin_token, load_prin
 from osca_host.challenge import TERMINAL_RETENTION_SECONDS, Challenge
 from osca_host.connector import ConnectorProxy
 from osca_host.control import ControlServer, admin_token_path, principals_path
+from osca_host.deployments import load_deployments
 from osca_host.episode import Episode, assemble
 from osca_host.expr import parse_precondition
 from osca_host.gate import Gate
@@ -83,6 +84,7 @@ class Host:
         socket_path: Path,
         deployments: dict[str, dict] | None = None,
         control_group: str | None = None,
+        deployments_path: Path | None = None,
     ):
         self.registry = Registry()
         # 触发表不注入表级 poller：watch 轮询走 Subscription 携带的本代 poll（_make_poll 捕获本代 proxy，
@@ -95,6 +97,10 @@ class Host:
         # 部署清单（服务端解析）：deployment_id → {path[, bindings, dest]}——控制通道只收 ID，
         # 路径类参数绝不从连接者透传（confused-deputy 文件读写面，M4 首轮 P1）
         self.deployments: dict[str, dict] = dict(deployments or {})
+        # 清单文件路径（M8-T2）：给了就在每次 load 前热重读——新发布的部署条目免重启即可装载；
+        # 重读失败 fail-safe 沿用现有清单。None（如单元测试直构 Host）＝维持启动期清单不重读。
+        self.deployments_path: Path | None = deployments_path
+        self._deployments_reload_lock = asyncio.Lock()
         self.episodes: OrderedDict[str, Episode] = OrderedDict()  # 剧集台账（近期）
         self._episode_seq = 0
         self._episode_tasks: set[asyncio.Task] = set()  # 在跑剧集（认知平面，独立线程）
@@ -140,9 +146,12 @@ class Host:
         try:
             if cmd == "load":
                 # 重活（读盘/解压/lint）在锁外线程执行——慢 load 不许压住 status/stop（W0.1 P2）
+                reload_error = await self._refresh_deployments()
                 spec = self.deployments.get(request["deployment_id"])
                 if spec is None:
                     detail = f"未配置的部署 ID：{request['deployment_id']}（部署清单归 Host 侧管理）"
+                    if reload_error:
+                        detail += f"；且部署清单重读失败、仍在用上次有效清单：{reload_error}"
                     return {"ok": False, "detail": detail}
                 return await self._request_load(request["deployment_id"], spec)
             if cmd == "fire":
@@ -232,6 +241,22 @@ class Host:
                 "其磁盘发布可能迟到落地（存储卡死边界,明标;修复存储后核对部署目录）"
             )
         self._stop.set()
+
+    async def _refresh_deployments(self) -> str | None:
+        """load 前热重读部署清单（M8-T2）：新发布的部署条目免重启即可装载。
+        清单来源仍是 Host 侧文件、服务端解析——控制通道只收 deployment_id，
+        confused-deputy 收口不破；重读失败 fail-safe：沿用上次有效清单继续服务，
+        返回失败原因供调用方拼进拒因（成功返回 None）。文件读解析在线程里跑。"""
+        if self.deployments_path is None:
+            return None
+        async with self._deployments_reload_lock:
+            try:
+                fresh = await asyncio.to_thread(load_deployments, str(self.deployments_path))
+            except (OSError, ValueError, yaml.YAMLError) as e:
+                log.warning(f"部署清单重读失败（沿用上次有效清单）：{e}")
+                return str(e)
+            self.deployments = fresh
+            return None
 
     async def _request_load(self, deployment_id: str, spec: dict) -> dict:
         """同 deployment 共享同一 generation 的在途任务；tombstone 后创建新 generation。"""
@@ -1122,6 +1147,7 @@ def run_host(
     initial_packs: list[dict] | None = None,
     deployments: dict[str, dict] | None = None,
     control_group: str | None = None,
+    deployments_path: Path | None = None,
 ) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    return asyncio.run(Host(socket_path, deployments, control_group).run(initial_packs))
+    return asyncio.run(Host(socket_path, deployments, control_group, deployments_path).run(initial_packs))

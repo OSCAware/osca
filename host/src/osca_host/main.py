@@ -18,6 +18,7 @@ import yaml
 
 from osca_host import __version__
 from osca_host.control import DEFAULT_SOCKET, send_command
+from osca_host.deployments import load_deployments
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -90,37 +91,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load_deployments(path: str) -> dict[str, dict]:
-    """部署清单严格验型：ID 与路径都须非空字符串（限长、拒控制字符），不收其他键；
-    相对路径按**清单文件所在目录**解析（不随 Host 进程 cwd 漂移）。"""
-    from osca_host.authz import clean_text
-
-    base = Path(path).resolve().parent
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("部署清单必须是 mapping：deployment_id → {path[, bindings, dest]}")
-    deployments: dict[str, dict] = {}
-    for did, spec in data.items():
-        did = clean_text(did, f"部署 ID {did!r}", max_len=200)
-        if not isinstance(spec, dict) or "path" not in spec or set(spec) - {"path", "bindings", "dest", "egress_extra"}:
-            raise ValueError(f"部署 {did} 须是 {{path[, bindings, dest, egress_extra]}}（path 必填，不收其他键）")
-        clean: dict = {}
-        for key in ("path", "bindings", "dest"):
-            if key not in spec:
-                continue
-            if spec[key] is None:
-                raise ValueError(f"部署 {did} 的 {key} 不接受 null；不使用可选字段时请省略")
-            value = Path(clean_text(spec[key], f"部署 {did} 的 {key}"))
-            clean[key] = str(value if value.is_absolute() else base / value)
-        # egress_extra（M7-W4）：部署侧注入的真实 egress host 列表（并入 policy egress_allow）——须非空字符串列表，
-        # 恶形硬拒（同 path/bindings/dest 严格验型，deploy 清单错即拒启动 fail-closed）；host 非路径，不按 base 解析。
-        if "egress_extra" in spec:
-            raw = spec["egress_extra"]
-            if not isinstance(raw, list) or any(not isinstance(h, str) or not h.strip() for h in raw):
-                raise ValueError(f"部署 {did} 的 egress_extra 须是非空字符串列表（egress 允许的 host）")
-            clean["egress_extra"] = [h.strip() for h in raw]
-        deployments[did] = clean
-    return deployments
 
 
 def _client(request: dict, socket_path: Path, token_file: Path | None) -> int:
@@ -155,14 +125,16 @@ def main(argv: list[str] | None = None) -> int:
         from osca_host.host import run_host
 
         deployments = None
+        deployments_path = None
         if args.deployments:
             try:
-                deployments = _load_deployments(args.deployments)
+                deployments = load_deployments(args.deployments)  # 启动期 fail-fast：清单错即拒启动
             except (OSError, ValueError, yaml.YAMLError) as e:
                 print(f"部署清单不可用：{e}")
                 return EXIT_FAILURE
+            deployments_path = Path(args.deployments)  # 传给 Host 供 load 前热重读（M8-T2）
         packs = [{"path": p, "bindings": args.bindings} for p in args.load]
-        return run_host(args.socket, packs, deployments, args.control_group)
+        return run_host(args.socket, packs, deployments, args.control_group, deployments_path)
 
     client = {
         "status": lambda: {"cmd": "status"},

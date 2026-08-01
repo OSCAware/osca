@@ -4,7 +4,8 @@ import pytest
 
 from osca_host import main as m
 from osca_host.authz import PROTOCOL_VERSION, validate_request
-from osca_host.main import _client, _load_deployments
+from osca_host.deployments import load_deployments as _load_deployments
+from osca_host.main import _client
 
 
 @pytest.mark.parametrize(

@@ -126,6 +126,8 @@ shasum -a 256 operator.token           # 将摘要写入 Host 侧 principals 文
 | `operator` | status / enable / disable / fire / episodes（摘要；脱敏 DTO 属 W2，当前与 admin 同构——勿授予不可信进程） | load、审批面、完整 episode、stop |
 | `approver` | challenges / approve / deny（M4-W3：绑 challenge_id 批/驳一张具体挑战；principal 名须与挑战指定审批人相符——冒名/越权/一次性/过期由挑战状态机 fail-closed。**名绑定是全局的、无包域**：同名审批人可批任何指定其名的包，challenges 覆盖任意包全部待批项、不按审批人过滤；per-principal 包域收窄归 T1/T2，之前勿在多租户 Host 上授予——与 expert 同款告示） | 其余全部（无生命周期/快照/启停/剧集面） |
 | `expert` | episodes / episode（M4-W1 专家端只读交付面——draft 即交付物；episodes 摘要当前覆盖 Host 上全部包，per-principal 包域收窄未做，勿在多租户 Host 上授予） | 其余全部 |
+| `requester` | fire / status（M8-T2 员工触发桥的最小身份：只发射与看快照；剧集结果读取归桥自己的 expert token，不给本角色） | 其余全部（无剧集读面/装卸/启停/审批） |
+| `deployer` | load / status（M8-T2 App 服务层装载面的最小身份；界面进程永不持 host_admin——信任模型 M4-W0.1 不破） | 其余全部（无卸载/启停/发射/剧集面/审批/stop） |
 
 ### M4-W3 审批挑战 + M6 真写全接通（诚实标注：审批闭环 + 真实执行器机制完成，测 fake 后端 ≠ 生产验证）
 
@@ -176,7 +178,9 @@ W3 落地的是**机制**：绑定挑战状态机（approver / episode / payload
 
 `load` 只收 `deployment_id`：包路径、bindings、解压目录一律由 Host 侧
 `--deployments` 清单解析（相对路径按清单文件所在目录解析），绝不从连接者
-透传（confused-deputy 面收口）。load 准备在线程中按 deployment 单飞，不同
+透传（confused-deputy 面收口）。清单在每次 `load` 前**热重读**（M8-T2）：
+新增的部署条目免重启即可装载；重读失败 fail-safe——沿用上次有效清单继续
+服务，拒因附失败说明。load 准备在线程中按 deployment 单飞，不同
 deployment 可并行；发布段才进入短锁并复核 lifecycle/generation/tombstone。
 `STARTING → RUNNING → DRAINING → STOPPED` 保证 stop/unload 胜过迟到 load，同时
 慢 load 期间 status 仍可快速返回。

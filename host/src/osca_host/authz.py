@@ -13,6 +13,8 @@ M4 权限矩阵：host_admin 管生命周期但**不可授予业务审批**；op
 （pending → approved|denied → consumed，绑定 approver/episode/payload digest/
 expiry + 一次性 consume）批/驳（绑 challenge_id）与看待批清单——绑定挑战替换旧
 set[action] 无绑定授予；expert 的命令随 M4-W1 专家端落地。
+M8-T2 增两最小角色：requester（员工触发桥：fire/status）与 deployer（App 服务层
+装载面：load/status）——界面进程持最小能力集，永不持 host_admin。
 """
 
 from __future__ import annotations
@@ -38,6 +40,11 @@ ROLE_CAPS: dict[str, frozenset[str]] = {
     # W3 审批 challenge：approve/deny 绑 challenge_id、challenges 看待批清单——绑定挑战替换旧无绑定 set[action]
     "approver": frozenset({"approve", "deny", "challenges"}),
     "expert": frozenset({"episodes", "episode"}),  # M4-W1 专家端：只读交付面（摘要 + 全量导出——draft 正是要交付之物）
+    # M8-T2 整机两最小角色（红笔①-1 + M8 计划拍板 3）：
+    # requester——员工触发桥的 Host 身份：只发射与看快照，无启停/装卸/剧集读（读结果归桥的 expert token）；
+    # deployer——App 服务层装载面：只装载与看快照，界面进程永不持 host_admin（信任模型 M4-W0.1 不破）。
+    "requester": frozenset({"fire", "status"}),
+    "deployer": frozenset({"load", "status"}),
 }
 
 # 命令 → 参数字段（全部必填、非空 str）。请求顶层除 v/cmd/token 与这些字段外不许有别的键

@@ -54,6 +54,45 @@ async def _load_pack(host, path, bindings=None, did="t-pack"):
     return await _send({"cmd": "load", "deployment_id": did}, host)
 
 
+async def test_load_hot_rereads_deployments_manifest(sock_path, sample_pack, tmp_path):
+    """M8-T2：--deployments 清单在每次 load 前热重读——新发布的部署条目免重启即可装载；
+    清单损坏 fail-safe：沿用上次有效清单继续服务，拒因带重读失败说明。"""
+    import yaml as _yaml
+
+    manifest = tmp_path / "deployments.yaml"
+    manifest.write_text(_yaml.safe_dump({}), encoding="utf-8")
+    host = Host(sock_path, deployments=None, deployments_path=manifest)
+    task = asyncio.create_task(host.run())
+    for _ in range(100):
+        if host.control.socket_path.exists():
+            break
+        await asyncio.sleep(0.01)
+    try:
+        # 启动时清单为空 → 未配置
+        response = await _send({"cmd": "load", "deployment_id": "fresh"}, host)
+        assert not response["ok"] and "未配置的部署 ID" in response["detail"]
+
+        # 运行期把新条目写进清单文件——免重启即可装载（M8 发布退化案的机制前提）
+        manifest.write_text(
+            _yaml.safe_dump({"fresh": {"path": str(sample_pack), "bindings": _stub_bindings(sample_pack)}}),
+            encoding="utf-8",
+        )
+        response = await _send({"cmd": "load", "deployment_id": "fresh"}, host)
+        assert response["ok"] and response["package_id"] == "demo-group-oper-diagnosis"
+
+        # 清单损坏 → fail-safe：未知 ID 的拒因说明重读失败；上次有效清单仍在服务
+        manifest.write_text("[not-a-mapping]", encoding="utf-8")
+        response = await _send({"cmd": "load", "deployment_id": "ghost"}, host)
+        assert not response["ok"] and "重读失败" in response["detail"]
+        response = await _send({"cmd": "load", "deployment_id": "fresh"}, host)
+        # fresh 仍能从沿用的清单解析到（拒因是「包已注册」而非「未配置的部署 ID」——
+        # 同 ID 重复装载被注册表拒是既有语义，这里只证清单条目没有因重读失败而丢失）
+        assert not response["ok"] and "包已注册" in str(response["detail"])
+    finally:
+        host._stop.set()
+        await asyncio.wait_for(task, timeout=5)
+
+
 async def test_full_lifecycle(running_host, sample_pack):
     host = running_host
 
