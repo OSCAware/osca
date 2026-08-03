@@ -45,7 +45,7 @@ from osca_host.runner import run_episode
 from osca_host.settle import settle_episode
 from osca_host.suspension import SuspensionStore
 from osca_host.threads import PublishFence, run_in_daemon_thread
-from osca_host.triggers import Subscription, TriggerTable
+from osca_host.triggers import Delivery, Subscription, TriggerTable
 
 log = logging.getLogger("osca-host")
 
@@ -522,10 +522,25 @@ class Host:
         return {"ok": True, "detail": detail}
 
     async def _fire(self, package_id: str, trigger_id: str) -> dict:
-        error = await self.table.fire_manual(package_id, trigger_id)
-        if error:
-            return {"ok": False, "detail": error}
-        return {"ok": True, "detail": f"已人工发射 {trigger_id}（裁决见 Host 日志与 status.gates）"}
+        """人工发射。响应在旧形态（ok/detail）之上**增补** episode_id（M8-T3-a）——
+        加字段向后兼容（控制通道只校验请求 schema，响应原样 JSON 序列化；老客户端读不到即忽略）。
+        缺省语义是硬约定：**没装配出剧集就没有 episode_id 这个字段**，绝不给空串让调用方误当 id。
+        调用方（员工触发桥）据此直接绑定自己这一发的剧集，不必再按时间/触发器反查台账猜。"""
+        delivery = await self.table.fire_manual(package_id, trigger_id)
+        if delivery.reason:
+            return {"ok": False, "detail": delivery.reason}
+        if not delivery.episode_id:
+            # 发射走完但没装配剧集：闸门未唤醒 / 账本刷新失败 / kill_switch 拒唤醒——detail 如实说没有，
+            # 不带 episode_id 字段（fail-closed，宁可没有也不给假 id）
+            return {
+                "ok": True,
+                "detail": f"已人工发射 {trigger_id}，但本次未装配剧集（未唤醒或被拒——裁决见 Host 日志与 status.gates）",
+            }
+        return {
+            "ok": True,
+            "episode_id": delivery.episode_id,
+            "detail": f"已人工发射 {trigger_id} → 剧集 {delivery.episode_id}（裁决见 Host 日志与 status.gates）",
+        }
 
     def _make_deliver(self, package_id: str, aware_id: str):
         # Aware 代际**固化于订阅闭包创建时**（复核 P1）：若在 deliver 开始执行时才读当前代际，
@@ -534,7 +549,7 @@ class Host:
         # 新代际，旧订阅（无论何时才轮到执行）恒持旧代际、恒被拒。
         subscription_generation = self._aware_generations.get((package_id, aware_id), 0)
 
-        async def deliver(trigger_id: str) -> str | None:
+        async def deliver(trigger_id: str) -> Delivery:
             # 投递的两段重活（GPT Review P1 事件循环阻塞）都下线程：账本刷新是磁盘重活（全量 lint +
             # 索引重建），闸门裁决内含 precondition 真取数（经**本代** Connector 代理走真实网络）——原先
             # 直接跑在事件循环上，一次外呼/慢盘就压住控制通道（status/stop/审批）。同包投递按包锁串行：
@@ -544,13 +559,14 @@ class Host:
             # 可在任一 await 期间发生——旧 generation 投递若继续裁决、再从注册表取到新包装配，或在
             # DRAINING 后发布新剧集，都违反「迟到发布必见 tombstone」。故进锁后按对象身份取齐三件套，
             # **进锁即查 + 每个 await 返回后复核**（HostState 一并纳入），失效即整体放弃、绝不发布。
-            # 返回值 = 未发布原因（None=正常投递完成）——人工 fire 据此如实报失败。
+            # 返回值 = Delivery：reason 非空即未发布原因（人工 fire 据此如实报失败），episode_id 只在
+            # 真装配出剧集时有值（M8-T3-a）——未唤醒/被拒一律 Delivery()：正常走完、但没有剧集。
             async with self._deliver_locks.setdefault(package_id, asyncio.Lock()):
                 gate = self.gates.get((package_id, aware_id))
                 policy = self.policies.get(package_id)
                 loaded = self.registry.packages.get(package_id)
                 if gate is None:
-                    return f"{package_id}/{aware_id} 未布防或已卸载——投递不发布"
+                    return Delivery(reason=f"{package_id}/{aware_id} 未布防或已卸载——投递不发布")
 
                 def stale() -> str | None:
                     if self.state is not HostState.RUNNING:
@@ -569,7 +585,7 @@ class Host:
 
                 if why := stale():  # 进锁即查：fire 短锁状态检查与投递之间的 stop/unload TOCTOU
                     log.info(f"[{package_id}/{aware_id}] {trigger_id} 投递放弃：{why}")
-                    return why
+                    return Delivery(reason=why)
                 if (
                     policy
                     and loaded
@@ -578,21 +594,22 @@ class Host:
                     log.warning(
                         f"[{package_id}/{aware_id}] {trigger_id} 命中 → 账本刷新失败，本次唤醒拒绝（保留旧快照）"
                     )
-                    return None
+                    return Delivery()
                 if why := stale():
                     log.info(f"[{package_id}/{aware_id}] {trigger_id} 投递放弃：{why}")
-                    return why
+                    return Delivery(reason=why)
                 if policy and policy.kill_tripped:
                     log.warning(f"[{package_id}/{aware_id}] {trigger_id} 命中 → 拒绝唤醒：{policy.kill_reason}")
-                    return None
+                    return Delivery()
                 woke, verdict = await run_in_daemon_thread(gate.on_trigger, trigger_id, name="osca-gate")
                 if why := stale():
                     log.info(f"[{package_id}/{aware_id}] {trigger_id} 投递放弃：{why}")
-                    return why
+                    return Delivery(reason=why)
                 log.info(f"[{package_id}/{aware_id}] {trigger_id} 命中 → {verdict}")
                 if woke:
-                    self._assemble_episode(package_id, aware_id, trigger_id)
-                return None
+                    # 装配即拿号：这一发的 episode_id 顺回执带回发射方（装配失败/前提缺失回 None → 无字段）
+                    return Delivery(episode_id=self._assemble_episode(package_id, aware_id, trigger_id))
+                return Delivery()
 
         return deliver
 
@@ -666,12 +683,13 @@ class Host:
             return False, f"{connector_id}.{interface}({params}) 返回为空"
         return True, f"求值通过（{connector_id}.{interface}({params}) 返回非空）"
 
-    def _assemble_episode(self, package_id: str, aware_id: str, trigger_id: str) -> None:
+    def _assemble_episode(self, package_id: str, aware_id: str, trigger_id: str) -> str | None:
+        """装配并起跑一集；回这一集的 episode_id（三件套缺一即回 None——没装配就是没有）。"""
         loaded = self.registry.packages.get(package_id)
         proxy = self.proxies.get(package_id)
         policy = self.policies.get(package_id)
         if loaded is None or proxy is None or policy is None:
-            return
+            return None
         aware = next(a for a in loaded.awares if a.aware_id == aware_id)
         self._episode_seq += 1
         episode = assemble(f"EP-{self._episode_seq:04d}", loaded, aware, trigger_id)
@@ -688,6 +706,7 @@ class Host:
         task = asyncio.create_task(self._execute_episode(episode, loaded, proxy, policy))
         self._episode_tasks.add(task)
         task.add_done_callback(self._episode_tasks.discard)
+        return episode.episode_id
 
     async def _run_in_daemon_thread(self, fn, *args):
         """认知平面重活（run_episode/settle）跑在**守护线程**（P1 关停语义）：统一有界执行模型见

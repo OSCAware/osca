@@ -9,6 +9,9 @@ schedule 受限语法（取代 v0.3 样例中的自由文本「每月9日 09:00�
     schedule: {every: day, time: "07:00", tz: Asia/Shanghai}  # 每天 07:00（显式时区）
 
 时长语法（watch.every 与 gate.debounce 共用）：<整数><单位>，单位 s/m/h/d，如 24h、72h、30m。
+
+本模块也收 **pipeline 步骤的受限语法**（performer 受限集、预算记法、M8-T3 的 `input.from` /
+`produces.as` 衔接声明）——同样是「语法定义一次、lint 与 Host 共用」，见下方各节。
 """
 
 from __future__ import annotations
@@ -43,6 +46,51 @@ def parse_performer(value: object) -> str | None:
     （`human（未闭合`）一律 None（GPT Review：子串匹配与前缀匹配都放行过非法形）。"""
     m = PERFORMER_KIND.fullmatch(str(value).strip())
     return m.group(1) if m else None
+
+
+# ── pipeline 步骤衔接的受限语法（SPEC §5 衔接约定；M8-T3）────────────────────────
+# 单一真理源同 performer：lint（OSCA042/043）与 Host runner 共用本节——两边各写一份解析，
+# 就会出现「lint 全绿、跑必败」或反过来「lint 拦住 runtime 本来能跑的」。
+STRUCTURED_AS = ("json",)  # produces.as 受限词表：目前只认 json（缺省即纯文本，既有包一字不变）
+
+
+def step_input_key(spec: object) -> str | None:
+    """步骤 `input` → 上游产物键：`{ref: X}` 取 X，裸字符串取其自身；无 input 即 None。"""
+    declared = spec.get("input") if isinstance(spec, dict) else None
+    if declared is None:
+        return None
+    return str(declared.get("ref")) if isinstance(declared, dict) else str(declared)
+
+
+def step_input_from(spec: object) -> str | None:
+    """步骤 `input.from` → 从上游产物**字典**里取哪一格；未声明即 None（取整份，既有行为）。"""
+    declared = spec.get("input") if isinstance(spec, dict) else None
+    if isinstance(declared, dict) and declared.get("from") is not None:
+        return str(declared["from"])
+    return None
+
+
+def step_produces_key(spec: object, step_name: str) -> str:
+    """步骤产物键：`{ref: X}` 取 X，裸字符串取其自身，未声明则以步名为键（与 runner 逐字同口径）。"""
+    produced = spec.get("produces") if isinstance(spec, dict) else None
+    if isinstance(produced, dict):
+        return str(produced.get("ref") or step_name)
+    return str(produced) if produced else step_name
+
+
+def parse_produces_as(spec: object) -> tuple[str | None, str]:
+    """步骤 `produces.as` 产物形态声明（受限词表 STRUCTURED_AS）。
+
+    返回 (形态, 错误人话)：未声明 = (None, "")（纯文本，既有行为）；词表外的值报错拒绝——
+    宁可拒绝，不可猜测（与 performer 受限集同纪律）。
+    """
+    produced = spec.get("produces") if isinstance(spec, dict) else None
+    if not isinstance(produced, dict) or produced.get("as") is None:
+        return None, ""
+    form = str(produced.get("as"))
+    if form not in STRUCTURED_AS:
+        return None, f"produces.as「{form}」不可识别（受限词表：{'/'.join(STRUCTURED_AS)}）——宁可拒绝，不可猜测"
+    return form, ""
 
 
 TIME_HHMM = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")

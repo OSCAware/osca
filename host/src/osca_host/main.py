@@ -91,8 +91,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-
-
 def _client(request: dict, socket_path: Path, token_file: Path | None) -> int:
     token = None
     if token_file is not None:

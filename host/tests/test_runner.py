@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -628,3 +630,279 @@ def test_connector_call_receives_remaining_budget_as_timeout(loaded, policy, pro
     result = run_episode(episode, loaded, proxy, policy)
     assert result.status == "completed", result.stop_reason
     assert seen == [120.0]  # 剩余预算（2 分钟整,fake clock 未走动）已传导
+
+
+# ── M8-T3-c：写步 input.from —— 从上游产物字典里取哪一格 ──────────────
+
+READ_REF = "CON-009.查待办"
+TODO_ROWS = {"待办": [{"单位": "甲厂", "动作": "限额审批", "经办人手机": "13812345678"}]}
+
+
+def _add_read_connector(proxy, policy):
+    """测试内追加一个**只读**连接器（映射形状与 loader 产出同构：connectors/interfaces/bindings 三处）。
+
+    样例包只有 CON-001，而写测试把它整只标成写连接器（is_write 是连接器级），
+    「取数 → 写」的上游取数步必须挂在另一个 write: forbidden 的连接器上。
+    """
+    fixtures = Path(proxy.bindings["FINANCE_DB"]["endpoint"].removeprefix("mock://"))
+    (fixtures / "查待办.yaml").write_text(yaml.safe_dump(TODO_ROWS, allow_unicode=True), encoding="utf-8")
+    proxy.connectors["CON-009"] = {
+        "connector_id": "CON-009",
+        "binding_ref": "FINANCE_DB",
+        "permissions": {"write": "forbidden"},
+        "interfaces": [{"name": "查待办"}],
+    }
+    proxy.interfaces[READ_REF] = {"name": "查待办"}
+    policy.permissions["取数"] = {READ_REF}
+
+
+def _read_then_write_pipeline(episode, proxy, policy, write_input, write_ref="CON-001.拉取费用明细"):
+    """[connector 取数 → connector 写步] 管线：上游产物是真实的 `{接口ref: 回执}` 字典。"""
+    episode.context = copy.deepcopy(episode.context)  # structure 与包共享引用，改前先拷贝
+    _add_read_connector(proxy, policy)
+    proxy.connectors["CON-001"].setdefault("permissions", {})["write"] = "allowed_with_approval"
+    policy.permissions["下发"] = {write_ref}
+    policy.approvals[write_ref] = "专家"
+    episode.context["structure"]["pipeline"] = [
+        {"step": "取数", "performer": "connector", "uses": READ_REF, "produces": "取数结果"},
+        {"step": "下发", "performer": "connector", "uses": write_ref, "input": write_input},
+    ]
+    return write_ref
+
+
+def _redacted_rows(policy):
+    """上游回执注入剧集前已脱敏——被写内容的期望值以脱敏后为准（与真实取数路径同口径）。"""
+    value, _ = policy.redact(TODO_ROWS)
+    return value
+
+
+def test_write_input_without_from_takes_whole_upstream_dict(episode, loaded, proxy, policy, llm):
+    """不写 from = 行为一字不变：写 params ＝ 上游**整份** `{接口ref: 回执}` 字典（既有包的既有契约，
+    与 test_write_e2e 的逐字断言同源）。本条是 T3-c 的向后兼容证据。"""
+    from osca_host.challenge import payload_digest
+
+    _read_then_write_pipeline(episode, proxy, policy, {"ref": "取数结果"})
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+
+    assert episode.status == "suspended_pending_approval"
+    [ch] = policy.pending_challenges()
+    assert ch["payload_digest"] == payload_digest({READ_REF: _redacted_rows(policy)})
+
+
+def test_write_input_from_narrows_to_single_upstream_ref(episode, loaded, proxy, policy, llm):
+    """写 from = 收窄到字典里的那一格：写 params ＝ 该接口回执本身，不再是 `{接口ref: 回执}` 包装。"""
+    from osca_host.challenge import payload_digest
+
+    _read_then_write_pipeline(episode, proxy, policy, {"ref": "取数结果", "from": READ_REF})
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+
+    assert episode.status == "suspended_pending_approval"
+    [ch] = policy.pending_challenges()
+    rows = _redacted_rows(policy)
+    assert ch["payload_digest"] == payload_digest(rows)
+    assert ch["payload_digest"] != payload_digest({READ_REF: rows})  # 收窄真的发生了
+    assert ch["payload_display"] == rows  # W6-4：审批卡呈的是那一格，不是一坨回执字典
+
+
+def test_write_input_dangling_from_fails_closed(episode, loaded, proxy, policy, llm):
+    """from 指向的 ref 不在上游产物里 → fail-closed（剧集失败 + 人话列出可选 ref），
+    绝不回落成「取整份」——回落等于把一坨回执字典当被写内容送上 wire。零写：一张挑战都没挂。"""
+    _read_then_write_pipeline(episode, proxy, policy, {"ref": "取数结果", "from": "CON-009.查空闲"})
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+
+    assert episode.status == "failed"
+    assert "CON-009.查空闲" in episode.stop_reason and "可选 ref" in episode.stop_reason
+    assert READ_REF in episode.stop_reason  # 人话说清有哪些 ref 可选
+    assert policy.pending_challenges() == []
+
+
+def test_input_from_on_non_dict_artifact_fails_closed(episode, loaded, proxy, policy, llm):
+    """上游产物不是字典却写了 from → fail-closed（不猜「大概是想要整份」）。"""
+    _write_pipeline(episode, proxy, policy)  # 上游是 agent 文本草稿（str）
+    episode.context["structure"]["pipeline"][1]["input"] = {"ref": "草稿", "from": READ_REF}
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+
+    assert episode.status == "failed" and "不是可按 ref 取格的字典" in episode.stop_reason
+    assert policy.pending_challenges() == []
+
+
+def test_resolve_input_units():
+    """取参口径的单元判据（_resolve_input 是写步/agent 步共用的唯一入口）。"""
+    from osca_host.runner import _resolve_input
+
+    artifacts = {"取数结果": {READ_REF: [1, 2]}, "草稿": "一段人话"}
+    assert _resolve_input({"step": "x"}, artifacts) == (None, None, "")  # 无 input
+    assert _resolve_input({"input": "草稿"}, artifacts) == ("草稿", "一段人话", "")  # 裸字符串
+    assert _resolve_input({"input": {"ref": "取数结果"}}, artifacts)[1] == {READ_REF: [1, 2]}  # 整份
+    assert _resolve_input({"input": {"ref": "取数结果", "from": READ_REF}}, artifacts)[1] == [1, 2]  # 收窄
+    _, value, error = _resolve_input({"input": {"ref": "缺的"}}, artifacts)
+    assert value is None and "缺失" in error
+
+
+# ── M8-T3-b：agent 步结构化产出（人话 draft 与结构化产物并存） ──────────
+
+SHAPED_ROW = {"工单标题": "压降差旅费", "目标单位": "甲厂", "处置动作": "限额审批", "经办人手机": "13812345678"}
+ENVELOPE = json.dumps(
+    {"说明": "甲厂差旅费超阈值，建议下发限额审批（J-0417）。", "数据": SHAPED_ROW}, ensure_ascii=False
+)
+
+
+def _structured_llm(tmp_path, output: str, step: str = "整形") -> MockLLM:
+    """MockLLM（与真实 LLM 通道同一 complete 契约、同一调用路径）喂定制产出。"""
+    d = tmp_path / f"structured-{abs(hash(output)) % 10**8}" / "episode"
+    d.mkdir(parents=True)
+    (d / f"{step}.md").write_text(output, encoding="utf-8")
+    return MockLLM(d.parent)
+
+
+def _shape_then_write_pipeline(episode, proxy, policy, *, produces=None, write_ref="CON-001.拉取费用明细"):
+    """端到端管线：读（真回执字典）→ agent 结构化整形（收窄到那一格）→ 写（拿到一行待写数据）。"""
+    _read_then_write_pipeline(episode, proxy, policy, {"ref": "待写行"}, write_ref=write_ref)
+    episode.context["structure"]["pipeline"].insert(
+        1,
+        {
+            "step": "整形",
+            "performer": "agent",
+            "input": {"ref": "取数结果", "from": READ_REF},
+            "produces": produces if produces is not None else {"ref": "待写行", "as": "json"},
+        },
+    )
+    return write_ref
+
+
+def test_structured_agent_step_feeds_pipeline_and_keeps_human_draft(episode, loaded, proxy, policy, tmp_path):
+    """T3-b 主干：结构化产物进 artifacts（dict，不是 JSON 字符串），**人话 draft 并存**（仍非空、仍是人话），
+    产物可溯源到上游产物（机器可查），写步拿到的是**一行真正要写的数据**。"""
+    from osca_host.challenge import payload_digest
+
+    _shape_then_write_pipeline(episode, proxy, policy)
+    run_episode(episode, loaded, proxy, policy, llm=_structured_llm(tmp_path, ENVELOPE))
+
+    assert episode.status == "suspended_pending_approval"
+    shaped = next(s for s in episode.steps if s["step"] == "整形")
+    # ① 结构化产物是 dict/list，不是文本
+    assert shaped["structured_output"] == SHAPED_ROW and isinstance(shaped["structured_output"], dict)
+    # ② draft 并存：人话仍在 episode.draft（capture/frontdesk/控制台快照的消费口径不被夺走），且不是 JSON
+    assert episode.draft == "甲厂差旅费超阈值，建议下发限额审批（J-0417）。"
+    assert not episode.draft.lstrip().startswith("{") and episode.summary()["draft_ready"] is True
+    # ③ 可溯源（机器可查）：产物 ← 哪个上游产物的哪一格
+    assert shaped["produced"] == "待写行" and shaped["produced_as"] == "json"
+    assert shaped["derived_from"] == {"input": "取数结果", "from": READ_REF}
+    # ④ 写步拿到的是一行待写数据本身（不是 {接口ref: …} 包装、也不是文本）
+    [ch] = policy.pending_challenges()
+    assert ch["payload_digest"] == payload_digest(SHAPED_ROW)
+    assert ch["payload_display"]["目标单位"] == "甲厂"  # W6-4：审批人看得懂自己在批什么
+    assert ch["payload_display"]["经办人手机"] == "***手机号已脱敏***"  # 显示脱敏（digest 仍绑原文）
+
+
+def test_structured_write_lands_the_row_end_to_end(episode, loaded, proxy, policy, tmp_path):
+    """端到端收口：读 → 整形 → 批准 → 恢复消费 → 写落地的就是那一行（被写内容 = 结构化产物原文，
+    未被显示脱敏改写——脱敏只脱显示，不动被写内容）。"""
+    _shape_then_write_pipeline(episode, proxy, policy)
+    llm = _structured_llm(tmp_path, ENVELOPE)
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    [ch] = policy.pending_challenges()
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "completed"
+    [landed] = _landed(_write_step(episode))
+    # mock 写回执回显被批准的被写内容；回执入档前过脱敏（故手机号在回执里是标记，被写内容仍是原文）
+    assert landed["payload"]["applied"]["目标单位"] == "甲厂"
+    assert "CON-009.查待办" not in landed["payload"]["applied"]  # 不是一坨读回执字典
+    assert episode.draft and "甲厂" in episode.draft  # 人话 draft 全程并存
+
+
+def test_structured_step_requires_input_for_traceability(episode, loaded, proxy, policy, tmp_path):
+    """可溯源纪律（A6 边界的守护）：结构化产出的 agent 步无 input = 凭空造数 → 拒绝**发起调用**。"""
+    _shape_then_write_pipeline(episode, proxy, policy)
+    del episode.context["structure"]["pipeline"][1]["input"]
+    llm = _structured_llm(tmp_path, ENVELOPE)
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+
+    assert episode.status == "failed" and "可溯源" in episode.stop_reason
+    assert llm.calls == [] and policy.pending_challenges() == []  # 一次外呼都没发起、零写
+
+
+def test_unknown_produces_as_rejected(episode, loaded, proxy, policy, tmp_path):
+    """produces.as 是受限词表：词表外的形态直接拒绝，不猜（与 performer 受限集同纪律）。"""
+    _shape_then_write_pipeline(episode, proxy, policy, produces={"ref": "待写行", "as": "yaml"})
+    llm = _structured_llm(tmp_path, ENVELOPE)
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+
+    assert episode.status == "failed" and "produces.as「yaml」不可识别" in episode.stop_reason
+    assert llm.calls == []
+
+
+ILLEGAL_OUTPUTS = {
+    "纯文本": "甲厂差旅费超阈值，建议下发限额审批。",
+    "半截 JSON": '{"说明": "人话", "数据": {"目标单位": "甲',
+    "markdown 围栏": f"```json\n{ENVELOPE}\n```",
+    "顶层数组": '[{"目标单位": "甲厂"}]',
+    "顶层标量": '"就一个字符串"',
+    "缺说明": '{"数据": {"目标单位": "甲厂"}}',
+    "说明空白": '{"说明": "   ", "数据": {"目标单位": "甲厂"}}',
+    "缺数据": '{"说明": "人话"}',
+    "数据非结构": '{"说明": "人话", "数据": "甲厂 限额审批"}',
+    "夹带未知键": '{"说明": "人话", "数据": {"a": 1}, "备注": "顺手夹带"}',
+    "空产出": "",
+    "超长": '{"说明": "人话", "数据": {"备注": "' + "长" * 100_001 + '"}}',
+    "深嵌套": '{"说明": "人话", "数据": ' + "[" * 20_000 + "]" * 20_000 + "}",
+}
+
+
+@pytest.mark.parametrize("name", sorted(ILLEGAL_OUTPUTS))
+def test_illegal_structured_output_always_fails_closed(name, episode, loaded, proxy, policy, tmp_path):
+    """非法 JSON **一律 fail-closed，绝不退回文本**——退回文本 = 把方案 3 悄悄退化回今天的洞。
+    判据四条：剧集 failed / 人话报错 / draft 不被非法产出污染 / 下游写步零触达（无挑战、无落地）。"""
+    _shape_then_write_pipeline(episode, proxy, policy)
+    run_episode(episode, loaded, proxy, policy, llm=_structured_llm(tmp_path, ILLEGAL_OUTPUTS[name]))
+
+    assert episode.status == "failed", name
+    assert episode.stop_reason and "结构化" not in episode.status
+    assert episode.draft is None, name  # 没有「解析不了就当草稿用」
+    assert policy.pending_challenges() == []  # 写步一步没跑：零挑战、零写
+    assert [s["step"] for s in episode.steps] == ["取数", "整形"] and episode.steps[-1]["status"] == "failed"
+
+
+def test_illegal_structured_output_still_charges_tokens(episode, loaded, proxy, policy, tmp_path):
+    """解析失败不白嫖额度：外呼已发生，tokens 照记账（aware 侧累加 + 笼子侧计费），
+    否则「产出非法就免费重试」是零成本绕过预算硬顶的口子。"""
+    _shape_then_write_pipeline(episode, proxy, policy)
+    run_episode(episode, loaded, proxy, policy, llm=_structured_llm(tmp_path, "不是 JSON"))
+
+    assert episode.status == "failed" and episode.tokens_used > 0
+    assert episode.steps[-1]["tokens"] > 0
+    assert any("tokens 记账" in a["reason"] for a in policy.audit)
+
+
+def test_structured_draft_is_redacted_but_write_content_is_not(episode, loaded, proxy, policy, tmp_path):
+    """脱敏边界：人话那部分仍过 policy.redact（进台账、给人看）；**结构化数据不脱**——它是被写内容，
+    脱敏改写它等于把真实待写值写坏（预约行里的联系电话就是合法字段）。与 B.4 同一纪律：
+    payload_digest 绑原文、payload_display 只脱显示。"""
+    from osca_host.challenge import payload_digest
+
+    envelope = json.dumps(
+        {"说明": "经办人手机13812345678，请核。", "数据": {"目标单位": "甲厂", "经办人手机": "13812345678"}},
+        ensure_ascii=False,
+    )
+    _shape_then_write_pipeline(episode, proxy, policy)
+    run_episode(episode, loaded, proxy, policy, llm=_structured_llm(tmp_path, envelope))
+
+    assert episode.draft == "经办人手机***手机号已脱敏***，请核。"  # 人话过脱敏
+    assert episode.steps[-1]["redacted"] == 1
+    [ch] = policy.pending_challenges()
+    # 被写内容仍是原文（digest 绑原文）；只有显示那一份被脱
+    assert ch["payload_digest"] == payload_digest({"目标单位": "甲厂", "经办人手机": "13812345678"})
+    assert ch["payload_display"]["经办人手机"] == "***手机号已脱敏***"
+
+
+def test_structured_prompt_carries_envelope_and_a6_contract(episode):
+    """提示词契约：结构化步须明示信封两格、禁围栏、A6 边界（只整形输入里已有的取数结果、不得凭空造数），
+    且归属纪律（判断 ID 标注）不因换形态而丢。"""
+    spec = {"step": "整形", "performer": "agent", "produces": {"ref": "待写行", "as": "json"}}
+    user = _step_user_prompt(spec, "整形", "取数结果", {"CON-009.查待办": [1]}, structured=True)
+    assert '"说明"' in user and '"数据"' in user and "markdown" in user
+    assert "不得凭空造数" in user and "判断 ID 标注" in user
+    # 文本步一字不变（既有契约）
+    assert "只输出本步骤产出物的内容本身" in _step_user_prompt({"step": "成文"}, "成文", None, None)

@@ -13,7 +13,10 @@ pipeline:
   - step: 下发
     performer: connector          # 写连接器：命中审批门 → 挂起等批 → approve 恢复消费落地
     uses: CON-202.下发处置工单     # 写接口（method POST）；write: allowed_with_approval
-    input: {ref: OBJ-201}         # 被写内容 = 上游取数产物（params 穿透；摘要绑真实被写内容）
+    # 被写内容 = 上游取数产物（params 穿透；摘要绑真实被写内容）。
+    # from 收窄到取数步回执字典里的**那一格**：不写 from 时被写内容是整份 {接口ref: 回执} 字典，
+    # 与本接口 params 声明的 {ref: OBJ-201} 对不上——按列名校验的写目标会当场退回（SPEC §5 衔接约定）。
+    input: {ref: OBJ-201, from: CON-201.拉取待下发处置清单}
     produces: {ref: OBJ-202}
 
 # 嵌套预留：若未来按业务线拆下发子流程，在此以 sub_agent 引用其独立 .osca 包，本文件不膨胀。

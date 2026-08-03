@@ -26,7 +26,11 @@ from osca_cli.triggers import (
     POLICY_BUDGET_KEYS,
     declared_triggers,
     parse_performer,
+    parse_produces_as,
     parse_quantity,
+    step_input_from,
+    step_input_key,
+    step_produces_key,
     validate_gate,
     validate_trigger,
 )
@@ -852,6 +856,158 @@ def osca041_trigger_gate_syntax(pkg: OscaPackage) -> list[Finding]:
         if isinstance(gate, dict):
             findings.extend(_err("OSCA041", f.relpath, msg) for msg in validate_gate(gate, len(triggers)))
     return findings
+
+
+# ─────────────── pipeline 步骤衔接（SPEC §5 衔接约定 / 附录 A.4，M8-T3） ───────────────
+
+
+def _pipeline_steps(pkg: OscaPackage) -> list[tuple[str, dict]]:
+    """structure.pipeline 的 (步名, 步声明) 序列。非 mapping 步、形状缺陷由 OSCA040 报，此处不重复。"""
+    structure = pkg.yaml_files.get("structure.yaml")
+    if structure is None or structure.parse_error:
+        return []
+    pipeline = structure.mapping.get("pipeline")
+    steps = []
+    for i, step in enumerate(pipeline if isinstance(pipeline, list) else []):
+        if not isinstance(step, dict):
+            continue
+        name = step["step"] if isinstance(step.get("step"), str) and step["step"].strip() else f"第 {i + 1} 项"
+        steps.append((name, step))
+    return steps
+
+
+def _declared_interface_refs(pkg: OscaPackage) -> dict[str, list[str]]:
+    """connector_id → manifest 声明的接口 ref（`CON-xxx.接口名`）列表。"""
+    by_connector: dict[str, list[str]] = {}
+    for f in pkg.typed_files("connectors"):
+        if f.parse_error:
+            continue
+        cid = f.mapping.get("connector_id")
+        if not isinstance(cid, str):
+            continue  # ID 形状缺陷由 OSCA011 报
+        itfs = f.mapping.get("interfaces")
+        names = [itf.get("name") for itf in (itfs if isinstance(itfs, list) else []) if isinstance(itf, dict)]
+        by_connector[cid] = [f"{cid}.{n}" for n in names if isinstance(n, str)]
+    return by_connector
+
+
+def _step_interface_refs(uses: object, by_connector: dict[str, list[str]]) -> list[str]:
+    """步骤 `uses` → 该步真实取到的接口 ref 集合。裸 `CON-xxx` 按 manifest 展开全部接口
+    ——与 Host runner 的 `_interface_refs` 同口径（回执字典的键就是这些 ref）。"""
+    refs: list[str] = []
+    for item in uses if isinstance(uses, list) else [uses]:
+        ref = str(item)
+        if "." in ref:
+            refs.append(ref)
+        else:
+            refs.extend(by_connector.get(ref, []))
+    return refs
+
+
+@rule
+def osca042_structured_produces(pkg: OscaPackage) -> list[Finding]:
+    """OSCA042 结构化产出声明 `produces.as`（SPEC §5 衔接约定 / 附录 A.4）。
+
+    三条判据：受限词表（只认 json，与 Host runner 共用 parse_produces_as——词表外的值运行时拒绝
+    发起调用，lint 不拦则「声明写错的包全绿、跑必败」）；只有 agent 步可声明（connector/optimizer
+    的产物形状由执行器决定）；声明 `as: json` 的步骤必须有 `input`——**可溯源纪律**的静态点：
+    没有上游产物可整形 = 凭空造数（公理 A6），运行时同判据拒绝发起调用。"""
+    findings = []
+    for name, step in _pipeline_steps(pkg):
+        produced = step.get("produces")
+        if not isinstance(produced, dict) or produced.get("as") is None:
+            continue  # 未声明 = 纯文本产物（既有包一字不变）
+        _, error = parse_produces_as(step)
+        if error:
+            findings.append(_err("OSCA042", "structure.yaml", f"步骤「{name}」的 {error}"))
+            continue
+        if parse_performer(step.get("performer", "")) != "agent":
+            findings.append(
+                _err(
+                    "OSCA042",
+                    "structure.yaml",
+                    f"步骤「{name}」不是 agent 步却声明 produces.as——结构化产出只由 agent 步产出"
+                    "（connector/optimizer 的产物形状由执行器决定）",
+                )
+            )
+        if step_input_key(step) is None:
+            findings.append(
+                _err(
+                    "OSCA042",
+                    "structure.yaml",
+                    f"步骤「{name}」声明 produces.as: json 却没有 input——结构化产物须可溯源上游产物，"
+                    "无上游可整形即凭空造数（公理 A6）",
+                )
+            )
+    return findings
+
+
+@rule
+def osca043_input_from(pkg: OscaPackage) -> list[Finding]:
+    """OSCA043 `input.from` 取格声明（SPEC §5 衔接约定）。
+
+    `from` 只能取**上游 connector 步真实取到的那一格**：connector 步的产物是 `{接口ref: 回执}`
+    一个字典，别的产物没有「格」可取。运行时对悬空 `from` 一律 fail-closed（绝不回落成「取整份」
+    ——回落等于把一坨读回执当被写内容送上 wire），本规则把同一判据提到编译期静态咬住。"""
+    findings = []
+    by_connector = _declared_interface_refs(pkg)
+    produced_by: dict[str, tuple[str, dict]] = {}  # 产物键 → (产出步名, 步声明)
+    for name, step in _pipeline_steps(pkg):
+        picked = step_input_from(step)
+        if picked is not None:
+            findings.extend(_check_input_from(name, step, picked, produced_by, by_connector))
+        # 先消费后登记：`from` 只认**上游**产物（同键被后续步骤覆盖时，运行时取到的也是最近的上游那份）
+        produced_by[step_produces_key(step, name)] = (name, step)
+    return findings
+
+
+def _check_input_from(
+    name: str,
+    step: dict,
+    picked: str,
+    produced_by: dict[str, tuple[str, dict]],
+    by_connector: dict[str, list[str]],
+) -> list[Finding]:
+    declared = step.get("input")
+    if not (isinstance(declared, dict) and declared.get("ref") is not None):
+        return [
+            _err(
+                "OSCA043",
+                "structure.yaml",
+                f"步骤「{name}」写了 input.from「{picked}」却没有 input.ref"
+                "——from 是在 input.ref 那份产物里取格，缺 ref 无从取起",
+            )
+        ]
+    key = step_input_key(step)
+    if key not in produced_by:
+        return [
+            _err(
+                "OSCA043",
+                "structure.yaml",
+                f"步骤「{name}」的 input.ref「{key}」在 pipeline 上游没有产出步——from 只能取上游步骤产物里的那一格",
+            )
+        ]
+    producer_name, producer = produced_by[key]
+    if parse_performer(producer.get("performer", "")) != "connector":
+        return [
+            _err(
+                "OSCA043",
+                "structure.yaml",
+                f"步骤「{name}」写了 input.from，但 input.ref「{key}」的产出步「{producer_name}」不是 connector 步"
+                "——只有连接器步的产物是 {接口ref: 回执} 字典，别的产物没有「格」可取",
+            )
+        ]
+    refs = _step_interface_refs(producer.get("uses"), by_connector)
+    if not refs or picked in refs:
+        return []  # 接口声明缺失/连接器不存在由 OSCA020/OSCA040 报，这里不重复
+    return [
+        _err(
+            "OSCA043",
+            "structure.yaml",
+            f"步骤「{name}」的 input.from「{picked}」不是上游步骤「{producer_name}」取到的接口"
+            f"（可选：{'、'.join(refs)}）——from 只能取上游取数步真实取到的那一格",
+        )
+    ]
 
 
 # ───────────────────────── 安全（铁律，SPEC v0.3 §13） ─────────────────────────

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 
-from osca_host.triggers import Subscription, TriggerTable
+from osca_host.triggers import Delivery, Subscription, TriggerTable, as_delivery
 
 SCHEDULE_SPEC = {"schedule": {"every": "month", "day": 9, "time": "09:00"}}
 
@@ -27,8 +27,9 @@ async def test_fire_isolates_subscriber_exceptions():
     assert hits == ["AW-001/T3"]  # 同伴照常收到派发
     assert table.watchers  # watcher 存活
 
-    error = await table.fire_manual("p1", "AW-001/T3")  # 人工发射路径：异常转人话错误，不穿透控制通道
-    assert error is not None and "派发异常" in error
+    delivery = await table.fire_manual("p1", "AW-001/T3")  # 人工发射路径：异常转人话错误，不穿透控制通道
+    assert delivery.reason is not None and "派发异常" in delivery.reason
+    assert delivery.episode_id is None  # 没装配就是没有
     table.shutdown()
 
 
@@ -138,12 +139,68 @@ async def test_fire_manual_event_only():
     table.subscribe("event", {"source": "控制台"}, sub("p1", "AW-001", "AW-001/T3", hits))
     table.subscribe("schedule", SCHEDULE_SPEC, sub("p1", "AW-001", "AW-001/T1", hits))
 
-    assert await table.fire_manual("p1", "AW-001/T3") is None
+    assert await table.fire_manual("p1", "AW-001/T3") == Delivery()  # 裸回调：正常投递、无剧集号
     assert hits == ["AW-001/T3"]
 
-    error = await table.fire_manual("p1", "AW-001/T1")
-    assert error and "仅 event 可人工发射" in error
-    assert await table.fire_manual("p1", "AW-001/T9") is not None  # 未布防
+    delivery = await table.fire_manual("p1", "AW-001/T1")
+    assert delivery.reason and "仅 event 可人工发射" in delivery.reason
+    assert (await table.fire_manual("p1", "AW-001/T9")).reason  # 未布防
+    table.shutdown()
+
+
+async def test_fire_manual_carries_episode_id_and_drops_it_when_unpublished():
+    """M8-T3-a 触发表侧契约：deliver 回的 Delivery 带 episode_id 就原样带出；
+    回未发布原因时**丢弃 episode_id**（没发布就没有剧集，绝不给假 id）。"""
+    table = TriggerTable()
+
+    async def with_episode(trigger_id):
+        return Delivery(episode_id="EP-0007")
+
+    async def unpublished(trigger_id):
+        # 防御性：即便回调同时给了原因和 id，未发布也一律不许带 id 出去
+        return Delivery(reason="包已卸载/重载——跨代投递不发布", episode_id="EP-0009")
+
+    table.subscribe("event", {"source": "op"}, Subscription("p1", "AW-001", "AW-001/T3", with_episode))
+    table.subscribe("event", {"source": "op2"}, Subscription("p2", "AW-001", "AW-001/T3", unpublished))
+
+    assert await table.fire_manual("p1", "AW-001/T3") == Delivery(episode_id="EP-0007")
+    denied = await table.fire_manual("p2", "AW-001/T3")
+    assert denied.episode_id is None and "跨代投递不发布" in denied.reason
+    table.shutdown()
+
+
+async def test_as_delivery_keeps_the_legacy_string_contract():
+    """旧契约兼容：非空字符串 = 未发布原因；None/空串 = 正常投递、无剧集号。"""
+    assert as_delivery("包已卸载") == Delivery(reason="包已卸载")
+    assert as_delivery(None) == Delivery()
+    assert as_delivery("") == Delivery()  # 空串不是原因，也不是 id
+    assert as_delivery(Delivery(episode_id="EP-0001")) == Delivery(episode_id="EP-0001")
+
+
+async def test_watcher_auto_fire_ignores_delivery_return_value():
+    """回归：watcher 自动发射那条路不看回值——回 Delivery、回字符串、回 None 一视同仁，
+    照常派发、watcher 照常存活、fires 照常计数（改动前后逐字同行为）。"""
+    table, seen = TriggerTable(), []
+
+    async def returns_delivery(trigger_id):
+        seen.append(("delivery", trigger_id))
+        return Delivery(reason="包已卸载/重载——跨代投递不发布", episode_id="EP-0001")
+
+    async def returns_str(trigger_id):
+        seen.append(("str", trigger_id))
+        return "Host 已 DRAINING——迟到投递不发布"
+
+    watcher = table.subscribe("event", {"source": "op"}, Subscription("p1", "AW-001", "AW-001/T3", returns_delivery))
+    table.subscribe("event", {"source": "op"}, Subscription("p2", "AW-001", "AW-001/T3", returns_str))
+
+    await table._fire(watcher)
+    await asyncio.sleep(0.05)
+    assert sorted(seen) == [("delivery", "AW-001/T3"), ("str", "AW-001/T3")]
+    assert watcher.fires == 1 and table.watchers  # watcher 存活，未发布原因不影响自动发射循环
+
+    await table._fire(watcher)  # 再来一发照旧
+    await asyncio.sleep(0.05)
+    assert len(seen) == 4 and watcher.fires == 2
     table.shutdown()
 
 

@@ -583,6 +583,108 @@ def test_osca041_watch_duration(make_pkg, base):
     assert any(f.rule == "OSCA041" and "every=一天" in f.message for f in result.findings)
 
 
+# ── pipeline 步骤衔接：结构化产出与取格（OSCA042 / OSCA043，SPEC §5 衔接约定 / A.4）──
+
+
+def _shape_pipeline(base, **overrides) -> None:
+    """读 → agent 结构化整形 的最小合法管线（整形步字段可逐个覆盖来构造违规）。"""
+    shape = {
+        "step": "整形",
+        "performer": "agent",
+        "input": {"ref": "取数结果", "from": "CON-001.取数"},  # 裸 CON-001 展开出的那一格
+        "produces": {"ref": "OBJ-001", "as": "json"},
+    }
+    shape.update(overrides)
+    base["structure.yaml"]["pipeline"] = [
+        {"step": "取数", "performer": "connector", "uses": "CON-001", "produces": "取数结果"},
+        shape,
+    ]
+
+
+def test_structured_shape_pipeline_passes(make_pkg, base):
+    """正例：agent 结构化步 + 从上游 connector 步取格——零错误零警告。"""
+    _shape_pipeline(base)
+    result = lint_package(make_pkg(base))
+    assert result.ok and result.warnings == 0, [f.format() for f in result.findings]
+
+
+def test_osca042_unknown_produces_as_rejected(make_pkg, base):
+    _shape_pipeline(base, produces={"ref": "OBJ-001", "as": "yaml"})
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA042" and "produces.as「yaml」不可识别" in f.message for f in result.findings)
+
+
+def test_osca042_only_agent_step_may_declare_as(make_pkg, base):
+    """connector/optimizer 的产物形状由执行器决定——非 agent 步声明 as 即报错。"""
+    _shape_pipeline(base)
+    base["structure.yaml"]["pipeline"][0]["produces"] = {"ref": "OBJ-001", "as": "json"}
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA042" and "不是 agent 步却声明 produces.as" in f.message for f in result.findings)
+
+
+def test_osca042_structured_step_requires_input(make_pkg, base):
+    """可溯源纪律的静态点：无 input 的结构化步 = 凭空造数（A6），运行时同判据拒绝发起调用。"""
+    _shape_pipeline(base)
+    del base["structure.yaml"]["pipeline"][1]["input"]
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA042" and "可溯源" in f.message for f in result.findings)
+
+
+def test_osca043_dangling_from_lists_the_real_options(make_pkg, base):
+    """悬空 from：运行时 fail-closed（绝不回落成「取整份」），lint 提到编译期咬住并列出可选 ref。"""
+    _shape_pipeline(base, input={"ref": "取数结果", "from": "CON-001.查空闲"})
+    result = lint_package(make_pkg(base))
+    assert any(
+        f.rule == "OSCA043" and "CON-001.查空闲" in f.message and "可选：CON-001.取数" in f.message
+        for f in result.findings
+    )
+
+
+def test_osca043_from_on_non_connector_product_rejected(make_pkg, base):
+    """只有连接器步的产物是 {接口ref: 回执} 字典，别的产物没有「格」可取。"""
+    _shape_pipeline(base)
+    base["structure.yaml"]["pipeline"].append(
+        {"step": "下发", "performer": "connector", "uses": "CON-001.取数", "input": {"ref": "OBJ-001", "from": "x"}}
+    )
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA043" and "不是 connector 步" in f.message for f in result.findings)
+
+
+def test_osca043_from_needs_an_upstream_producer(make_pkg, base):
+    """input.ref 在上游没有产出步（含指向自己产物的自引用）——from 只能取上游产物里的那一格。"""
+    _shape_pipeline(base, input={"ref": "OBJ-001", "from": "CON-001.取数"})  # 指向本步自己的产物
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA043" and "上游没有产出步" in f.message for f in result.findings)
+
+
+def test_osca043_from_without_ref_rejected(make_pkg, base):
+    _shape_pipeline(base, input={"from": "CON-001.取数"})
+    result = lint_package(make_pkg(base))
+    assert any(f.rule == "OSCA043" and "缺 ref 无从取起" in f.message for f in result.findings)
+
+
+def test_lint_total_over_step_linkage_shapes(make_pkg, base):
+    """衔接字段同守总函数纪律：`uses` / `input` / `produces` 任意形状只产出 findings、绝不抛异常
+    （Host 首次 load 也走同一批规则，包解析边界不许崩）。"""
+    import copy
+
+    hostile = ([1, 2], {"ref": {"嵌套": 1}, "from": [1]}, {"as": ["json"]}, "文本", 42, True, None)
+    for index, field in ((0, "uses"), (1, "input"), (1, "produces")):
+        for bad in hostile:
+            mutated = copy.deepcopy(base)
+            _shape_pipeline(mutated)
+            mutated["structure.yaml"]["pipeline"][index][field] = bad
+            result = lint_package(make_pkg(mutated))
+            # run_all 会把规则异常兜成 finding——故判据是「没有异常兜底那条」，不是「没抛出来」
+            assert not any("规则执行异常" in f.message for f in result.findings), f"{field}={bad!r}"
+
+
+def test_write_example_package_passes():
+    """写样例包（examples/oper-dispatch.osca）——`input.from` 的一等正例，与 CI lint 同判据。"""
+    result = lint_package(Path(__file__).resolve().parents[2] / "examples" / "oper-dispatch.osca")
+    assert result.ok, [f.format() for f in result.findings]
+
+
 # ── 分层与权属（OSCA060）──
 
 

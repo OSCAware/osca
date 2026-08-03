@@ -7,6 +7,8 @@ Host 本体（控制平面）确定性、无 LLM；剧集是短命的认知平�
 performer 分工（架构 §5，受限集——不可识别的 performer 直接拒绝，不猜）：
 - connector：确定性取数，经 Connector 代理（模型只能按名调用），回执入档；
 - agent（含 agent + judgments）：LLM 依一次性上下文出草稿，产出注入前过 Policy 脱敏；
+  声明 `produces.as: json` 时改出**结构化产出**（M8-T3）：人话草稿与结构化数据**并存**——
+  草稿仍进 episode.draft 给人看，结构化数据进 artifacts 给下游写步吃；解析失败一律 fail-closed；
 - optimizer：确定性算法寻优——初版贪心（架构原文「初版贪心即可」）：
   候选受限形式 list[dict{value: 数值}]，按 objective 方向排序取最优；缺数值即拒不猜；
 - human：审批门与终审——飞轮采集点，机器的流水线到此为止（界面归 M4）；
@@ -19,13 +21,23 @@ performer 分工（架构 §5，受限集——不可识别的 performer 直接�
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from dataclasses import asdict
 
 import yaml
 from osca_cli.llm import LLMError, estimate_tokens, resolve_llm
-from osca_cli.triggers import AWARE_BUDGET_KEYS, PERFORMERS, parse_performer
+from osca_cli.triggers import (
+    AWARE_BUDGET_KEYS,
+    PERFORMERS,
+    STRUCTURED_AS,
+    parse_performer,
+    parse_produces_as,
+    step_input_from,
+    step_input_key,
+    step_produces_key,
+)
 
 from osca_host.connector import ConnectorProxy
 from osca_host.episode import Episode
@@ -33,6 +45,20 @@ from osca_host.lifecycle import finish_episode_state
 from osca_host.loader import LoadedPackage
 from osca_host.policy import PolicyInterceptor, parse_quantity
 from osca_host.timeouts import supports_keyword_timeout
+
+# ── agent 步结构化产出（M8-T3）的信封 ──────────────────────
+# 衔接声明的受限语法（`produces.as` 受限词表 STRUCTURED_AS、`input.ref`/`input.from` 取键口径）
+# 与 lint 共用 osca_cli.triggers——两边不写第二份解析（lint 过 = Host 跑得动，OSCA042/043）。
+# 信封两格：人话草稿给人看（capture 的 agent_draft / frontdesk「依据：」/ 控制台快照都消费 episode.draft），
+# 结构化数据给管道吃（下游写步的 body）。**并存不是替换**——两者本就是两件事。
+# 之所以要求模型一次输出**一份 JSON 信封**、而不是「人话段 + JSON 段」两段：两段输出必须靠分隔符/围栏
+# 扫描切分，那是形状猜测器（猜错即写错内容），与本次要堵的洞同源；一份信封 = 一次 json.loads = 一个
+# fail-closed 判据。
+DRAFT_KEY = "说明"
+DATA_KEY = "数据"
+# 结构化产出的体积上限：结构化产物会进恢复快照（持久化）、上审批卡（人读）、原样上 wire——无界即把
+# 无界体积灌进这三处。与 llm/openapi 执行器的响应体上限同一纪律（有界才敢解析）。
+MAX_STRUCTURED_CHARS = 100_000
 
 
 def _yaml(data) -> str:
@@ -83,25 +109,95 @@ def render_system_prompt(episode: Episode) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
-def _input_key(spec: dict) -> str | None:
-    declared = spec.get("input")
-    if declared is None:
-        return None
-    return str(declared.get("ref")) if isinstance(declared, dict) else str(declared)
+def _resolve_input(spec: dict, artifacts: dict) -> tuple[str | None, object, str]:
+    """取上游产物：`input.ref` 取整份产物，再有 `input.from` 则收窄到字典里的那一格。
+
+    `input.from` 收窄的是「取哪个」，不是「怎么取」——不引入任何条件语法（想写 if 的那一刻，
+    它是一条该进 judgments/ 的判断）。取键口径与 lint 共用（osca_cli.triggers）。
+
+    返回 (input_key, 取到的值, 错误人话)；错误非空即 fail-closed（缺产物、产物不是字典、from 悬空）。
+    悬空的 from 一律拒绝并列出可选 ref——绝不回落成「取整份」，那会把一坨回执字典当被写内容送上 wire。
+    """
+    key = step_input_key(spec)
+    if key is None:
+        return None, None, ""
+    if key not in artifacts:
+        return key, None, f"上游产物「{key}」缺失——流水线声明与执行不符，直接拒绝"
+    value = artifacts[key]
+    picked = step_input_from(spec)
+    if picked is None:
+        return key, value, ""
+    if not isinstance(value, dict):
+        detail = (
+            f"input.from 声明取「{picked}」，但上游产物「{key}」是 {type(value).__name__}、"
+            "不是可按 ref 取格的字典——直接拒绝"
+        )
+        return key, None, detail
+    if picked not in value:
+        available = "、".join(str(k) for k in value) or "（空）"
+        return key, None, f"input.from 指向的「{picked}」不在上游产物「{key}」里——可选 ref：{available}"
+    return key, value[picked], ""
 
 
-def _produces_key(spec: dict, step_name: str) -> str:
-    produced = spec.get("produces")
-    if isinstance(produced, dict):
-        return str(produced.get("ref") or step_name)
-    return str(produced) if produced else step_name
+def _parse_structured(raw: object) -> tuple[dict | None, str]:
+    """结构化 agent 产出的**唯一**解析口径：一份 JSON 信封 `{说明: 人话, 数据: 对象/数组}`。
+
+    解析失败 = 本步失败（调用方 fail-closed 收剧集），**绝不**做任何宽容修复：不剥 markdown 围栏、
+    不截半补全、不「解析不了就当文本用」——退回文本等于把「写步 body ＝ 一行真正要写的数据」
+    悄悄退化回「body ＝ 一坨读回执」，那正是本次要堵的洞。
+
+    返回 ({"draft": 人话, "data": 结构化数据}, "") 或 (None, 错误人话)。
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None, "模型产出为空——结构化产出解析失败（不退回文本）"
+    if len(raw) > MAX_STRUCTURED_CHARS:
+        detail = (
+            f"模型产出 {len(raw)} 字超过结构化产出上限 {MAX_STRUCTURED_CHARS} 字——拒绝解析"
+            "（结构化产物会进恢复快照、上审批卡、原样上 wire，体积须有界）"
+        )
+        return None, detail
+    try:
+        envelope = json.loads(raw)
+    except (ValueError, RecursionError) as e:  # JSONDecodeError 属 ValueError；深嵌套触 RecursionError
+        return None, f"模型产出不是合法 JSON（{type(e).__name__}）——结构化产出一律 fail-closed，不退回文本"
+    if not isinstance(envelope, dict):
+        detail = (
+            f"模型产出 JSON 顶层是 {type(envelope).__name__}，不是信封对象——"
+            f'须为 {{"{DRAFT_KEY}": 人话, "{DATA_KEY}": 结构化数据}}'
+        )
+        return None, detail
+    if unknown := sorted(str(k) for k in envelope if k not in (DRAFT_KEY, DATA_KEY)):
+        return None, f"信封含未知键 {unknown}（只认「{DRAFT_KEY}」「{DATA_KEY}」）——宁可拒绝，不可猜测"
+    draft = envelope.get(DRAFT_KEY)
+    if not isinstance(draft, str) or not draft.strip():
+        return None, f"信封的「{DRAFT_KEY}」缺失或不是非空文本——人话草稿与结构化产物**并存**，缺一即拒"
+    if DATA_KEY not in envelope:
+        return None, f"信封缺「{DATA_KEY}」——结构化产出没有数据可交给下游步骤"
+    data = envelope[DATA_KEY]
+    if not isinstance(data, (dict, list)):
+        return None, f"信封的「{DATA_KEY}」是 {type(data).__name__}，不是对象/数组——下游写步的 body 须是结构化数据"
+    return {"draft": draft, "data": data}, ""
 
 
-def _step_user_prompt(spec: dict, step_name: str, input_key: str | None, input_value) -> str:
+def _step_user_prompt(spec: dict, step_name: str, input_key: str | None, input_value, structured: bool = False) -> str:
     parts = [f"当前执行 pipeline 步骤「{step_name}」。步骤声明：\n```yaml\n{_yaml(spec)}\n```"]
     if input_key is not None:
         rendered = input_value if isinstance(input_value, str) else _yaml(input_value)
         parts.append(f"输入产物「{input_key}」：\n\n{rendered}")
+    if structured:
+        # 结构化产出契约（M8-T3）：一份 JSON 信封、两格并存。A6 边界写进提示词——整形的是上游确定性
+        # 取数的结果，不是凭空造数；解析不了即本步失败，模型没有「退回文本」这条退路。
+        parts.append(
+            f"本步骤产出**结构化数据**（produces.as: {'/'.join(STRUCTURED_AS)}）。只输出**一份 JSON 对象**，"
+            "前后不要任何解释性文字、不要 markdown 代码围栏：\n\n"
+            f'{{"{DRAFT_KEY}": "给人看的人话说明", "{DATA_KEY}": 交给下游步骤的结构化数据（对象或数组）}}\n\n'
+            f"「{DRAFT_KEY}」是给人读的草稿，依据 guard 命中判断的段落保留段末判断 ID 标注"
+            "（归属纪律；guard 不命中或无法判断的判断不得应用）；"
+            f"「{DATA_KEY}」只允许整形上述输入产物里已有的取数结果——**不得凭空造数、"
+            "不得补全输入里没有的字段**（公理 A6）。"
+            "产出不是合法信封 JSON 时本步骤直接判失败，不会退回当文本使用。"
+        )
+        return "\n\n".join(parts)
     parts.append(
         "只输出本步骤产出物的内容本身，不要输出解释性前后缀；"
         "依据 guard 命中判断的段落保留段末判断 ID 标注（归属纪律；guard 不命中或无法判断的判断不得应用）。"
@@ -126,7 +222,7 @@ def _interface_refs(uses, proxy: ConnectorProxy) -> tuple[list[str], str | None]
 
 def _run_optimizer(spec: dict, artifacts: dict, objects: dict) -> tuple[dict | None, str]:
     """初版贪心：按 objective 方向对候选排序取最优。数值缺失即拒——optimizer 不猜数。"""
-    key = _input_key(spec)
+    key = step_input_key(spec)
     candidates = artifacts.get(key) if key else None
     if not isinstance(candidates, list) or not candidates:
         return None, f"optimizer 输入「{key}」不是非空候选列表（受限形式：list[dict{{value: 数值}}]）"
@@ -298,6 +394,7 @@ def run_episode(
                 return _finish(episode, "failed", error)
             # 写步取上游产物作**写 params**（params 穿透）：写接口经审批门以其摘要绑被写内容（防偷梁换柱）；
             # 读接口执行器忽略 params、也不过写审批门（取数步无 input）。写命中审批门 → **挂起等批**（可恢复剧集）。
+            # `input.from` 在此收窄取值（M8-T3）：从整份 `{接口ref: 回执}` 收到字典里的那一格。
             resuming = resume_state is not None and index == resume_step
             if resuming:
                 rs = resume_state
@@ -307,13 +404,12 @@ def run_episode(
                 resume_state = None
             else:
                 write_params, start_ref, pending_cid = "", 0, None
-                input_key = _input_key(spec)
+                input_key, input_value, error = _resolve_input(spec, artifacts)
+                if error:
+                    _record(episode, step_name, performer, "failed", error)
+                    return _finish(episode, "failed", error)
                 if input_key is not None:
-                    if input_key not in artifacts:
-                        detail = f"上游产物「{input_key}」缺失——连接器步声明与执行不符，直接拒绝"
-                        _record(episode, step_name, performer, "failed", detail)
-                        return _finish(episode, "failed", detail)
-                    write_params = artifacts[input_key]
+                    write_params = input_value
                 payloads, receipts = {}, []
 
             fell_back = False
@@ -371,7 +467,7 @@ def run_episode(
                     return _finish(episode, "failed", f"取数失败：{receipt.error}")
                 payloads[ref] = receipt.payload
 
-            artifacts[_produces_key(spec, step_name)] = payloads
+            artifacts[step_produces_key(spec, step_name)] = payloads
             if fell_back:
                 _record(
                     episode,
@@ -390,14 +486,26 @@ def run_episode(
             if plan is None:
                 _record(episode, step_name, performer, "failed", detail)
                 return _finish(episode, "failed", detail)
-            artifacts[_produces_key(spec, step_name)] = plan
+            artifacts[step_produces_key(spec, step_name)] = plan
             _record(episode, step_name, performer, "done", detail, output=plan)
             continue
 
         if kind == "agent":
-            input_key = _input_key(spec)
-            if input_key is not None and input_key not in artifacts:
-                detail = f"上游产物「{input_key}」缺失——流水线声明与执行不符，直接拒绝"
+            input_key, input_value, error = _resolve_input(spec, artifacts)
+            if error:
+                _record(episode, step_name, performer, "failed", error)
+                return _finish(episode, "failed", error)
+            structured, error = parse_produces_as(spec)
+            if error:
+                _record(episode, step_name, performer, "failed", error)
+                return _finish(episode, "failed", error)
+            if structured and input_key is None:
+                # 可溯源纪律（A6 边界的守护）：结构化产出必须有上游产物可整形——无 input 即凭空造数，
+                # 拒绝发起调用（lint 亦静态咬同一判据）。
+                detail = (
+                    f"结构化产出（produces.as: {'/'.join(STRUCTURED_AS)}）的 agent 步必须声明 input——"
+                    "结构化产物须可溯源上游产物，无上游产物可整形即凭空造数（公理 A6），拒绝发起调用"
+                )
                 _record(episode, step_name, performer, "failed", detail)
                 return _finish(episode, "failed", detail)
             # 统一闸（每次 LLM 调用前）：包停 / kill switch / tokens 额度——
@@ -411,7 +519,7 @@ def run_episode(
                     "stopped",
                     f"预算硬顶：aware tokens 额度已尽（{episode.tokens_used}/{max_tokens}），拒绝发起调用（剧集停）",
                 )
-            user_prompt = _step_user_prompt(spec, step_name, input_key, artifacts.get(input_key))
+            user_prompt = _step_user_prompt(spec, step_name, input_key, input_value, structured=bool(structured))
             # 时间预算传导为单次调用硬顶（GPT Review P2）：max_minutes 只剩数秒时不许再吊默认 120s
             # 外呼继续烧外部成本。timeout 是**强制契约**（三审收口）：max_minutes 在而通道不支持
             # timeout（无参数、无 **kwargs、签名不可内省）→ fail-closed 拒绝发起，绝不 fail-open 无界外呼。
@@ -438,28 +546,59 @@ def run_episode(
             except LLMError as e:
                 _record(episode, step_name, performer, "failed", str(e))
                 return _finish(episode, "failed", str(e))
-            text, redacted = policy.redact(reply.text)  # 产出注入剧集台账前脱敏
             # 用量自报是不可信输入（源头 osca_cli.llm 已清洗；可插拔注入的 llm 走本处兜底）：
             # 非法上报**不得按 0 记账**（零成本无限过顶）也不得冲减硬顶——runner 看得见 prompt/产出，
-            # 与 OpenAICompatLLM 同口径回落字符估算（GPT Review 复审 P1：按 0 计 = 免费绕过 max_tokens）
+            # 与 OpenAICompatLLM 同口径回落字符估算（GPT Review 复审 P1：按 0 计 = 免费绕过 max_tokens）。
+            # 估算口径按**原始产出**：外呼已经按原文计费，脱敏/解析都是事后处理，不改变已烧的成本。
             tokens = (
                 reply.tokens
                 if type(reply.tokens) is int and reply.tokens > 0
-                else estimate_tokens(system_prompt, user_prompt, text)
+                else estimate_tokens(system_prompt, user_prompt, reply.text)
             )
             episode.tokens_used += tokens
-            artifacts[_produces_key(spec, step_name)] = text
-            episode.draft = text
-            _record(
-                episode,
-                step_name,
-                performer,
-                "done",
-                f"LLM 产出 {len(text)} 字",
-                output=text,
-                tokens=tokens,
-                redacted=redacted,
-            )
+            produces_key = step_produces_key(spec, step_name)
+            if structured:
+                # 结构化产出（M8-T3）：按信封解析原始产出，解析失败即 fail-closed 收剧集——绝不退回文本。
+                parsed, error = _parse_structured(reply.text)
+                if parsed is None:
+                    _record(episode, step_name, performer, "failed", error, tokens=tokens)
+                    policy.charge_tokens(episode.episode_id, tokens)  # 外呼已发生：解析失败照记成本，不白嫖额度
+                    return _finish(episode, "failed", error)
+                # 人话草稿照旧过脱敏（进台账、给人看）；**结构化数据不脱**——它是待写内容，显示脱敏不得改写
+                # 被写内容（与 payload_digest 绑原文、payload_display 只脱显示同一纪律，附录 B.4），且它整形自
+                # 已在 connector 回执处脱过敏的上游产物。
+                text, redacted = policy.redact(parsed["draft"])
+                artifacts[produces_key] = parsed["data"]
+                episode.draft = text  # 并存：人话草稿仍是 draft，结构化数据另存 artifacts 给下游吃
+                _record(
+                    episode,
+                    step_name,
+                    performer,
+                    "done",
+                    f"LLM 结构化产出：人话草稿 {len(text)} 字 + 「{DATA_KEY}」{type(parsed['data']).__name__}",
+                    output=text,
+                    structured_output=parsed["data"],
+                    produced=produces_key,
+                    produced_as=structured,
+                    # 可溯源（机器可查）：这份结构化数据整形自哪个上游产物、收窄到哪一格
+                    derived_from={"input": input_key, "from": step_input_from(spec)},
+                    tokens=tokens,
+                    redacted=redacted,
+                )
+            else:
+                text, redacted = policy.redact(reply.text)  # 产出注入剧集台账前脱敏
+                artifacts[produces_key] = text
+                episode.draft = text
+                _record(
+                    episode,
+                    step_name,
+                    performer,
+                    "done",
+                    f"LLM 产出 {len(text)} 字",
+                    output=text,
+                    tokens=tokens,
+                    redacted=redacted,
+                )
             ok, reason = policy.charge_tokens(episode.episode_id, tokens)  # 笼子的止损顶
             if not ok:
                 return _finish(episode, "stopped", f"{reason}（剧集停）")

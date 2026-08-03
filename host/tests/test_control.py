@@ -1422,8 +1422,9 @@ async def test_disable_enable_kills_stale_delivery(running_host, sample_pack, de
     host._set_aware(pid, "AW-001", False)
     host._set_aware(pid, "AW-001", True)  # gate/policy/loaded 对象身份全不变——旧 CAS 关不住
     release.set()
-    why = await asyncio.wait_for(task, timeout=5)
-    assert why is not None and "停用" in why  # 旧代投递按代际失效放弃
+    delivery = await asyncio.wait_for(task, timeout=5)
+    assert delivery.reason is not None and "停用" in delivery.reason  # 旧代投递按代际失效放弃
+    assert delivery.episode_id is None  # 未发布即无剧集号
     assert host.episodes == {}  # 未创建任何剧集
 
 
@@ -1549,8 +1550,9 @@ async def test_old_subscription_closure_holds_old_generation(running_host, sampl
     old_deliver = host._make_deliver(pid, "AW-001")  # 装载期创建的旧订阅闭包
     host._set_aware(pid, "AW-001", False)
     host._set_aware(pid, "AW-001", True)
-    why = await old_deliver("AW-001/T3")  # 旧闭包此刻才开始执行——已拿不到新代际
-    assert why is not None and "永久失效" in why
+    delivery = await old_deliver("AW-001/T3")  # 旧闭包此刻才开始执行——已拿不到新代际
+    assert delivery.reason is not None and "永久失效" in delivery.reason
+    assert delivery.episode_id is None  # 未发布即无剧集号
     assert host.episodes == {}
 
 
@@ -1874,3 +1876,98 @@ async def test_hung_publish_flagged_and_stop_bounded(sock_path, sample_pack, tmp
     release.set()  # 释放悬挂线程收尾
     with contextlib.suppress(Exception):
         await asyncio.wait_for(load_task, timeout=5)
+
+
+# ── M8-T3-a：fire 响应回传 episode_id（发射方直接绑自己那一发，不必反查台账猜） ──
+
+
+async def test_fire_returns_the_episode_id_it_just_assembled(running_host, sample_pack, deploy):
+    """正常发射：响应带 episode_id，且**就是台账里那一条**（episodes 查得到、episode 取得出）。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+
+    response = await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    assert response["ok"]
+    episode_id = response["episode_id"]
+    assert episode_id in response["detail"]  # 人话 detail 也带号，操作者控制台照旧只读 detail
+
+    ledger = await _send({"cmd": "episodes"}, host)
+    assert [ep["episode_id"] for ep in ledger["episodes"]] == [episode_id]  # 台账里就是这一条
+    exported = await _send({"cmd": "episode", "episode_id": episode_id}, host)
+    assert exported["ok"] and exported["episode"]["episode_id"] == episode_id
+    assert exported["episode"]["fired_trigger"] == "AW-001/T3"
+
+
+async def test_fire_omits_episode_id_when_nothing_was_assembled(running_host, sample_pack, deploy):
+    """三条「未发布」路径都**没有 episode_id 字段**（fail-closed：宁可没有，不给空串当 id），
+    detail 如实说没装配剧集——绝不让发射方把「发射成功」当成「有剧集」。"""
+    from osca_cli.ledger import ledger_lock
+
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+
+    # ① 未布防（触发器停后发射）：ok=False，无字段
+    await _send({"cmd": "disable", "package_id": pid, "aware_id": "AW-001"}, host)
+    response = await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    assert not response["ok"] and "episode_id" not in response
+    await _send({"cmd": "enable", "package_id": pid, "aware_id": "AW-001"}, host)
+
+    # ② 闸门未唤醒（闸门自身裁决不唤醒；订阅仍在、投递照常走完）：detail 如实，无字段
+    host.gates[(pid, "AW-001")].enabled = False  # 真闸门的真裁决路径（on_trigger → 抑制）
+    response = await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    assert response["ok"] and "episode_id" not in response
+    assert "未装配剧集" in response["detail"]
+    host.gates[(pid, "AW-001")].enabled = True
+
+    # ③ 账本刷新失败（写入者真持账本写锁）：拒绝唤醒，无字段
+    with ledger_lock(sample_pack):
+        response = await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
+    assert response["ok"] and "episode_id" not in response
+    assert "未装配剧集" in response["detail"]
+
+    assert (await _send({"cmd": "episodes"}, host))["episodes"] == []  # 全程零剧集——字段缺省与事实一致
+
+
+async def test_concurrent_fires_get_distinct_episode_ids(running_host, sample_pack, deploy):
+    """并发两发 → 两个**不同**的 episode_id，且各自就是自己那一发装配出的那条。
+    这正是「按时间/触发器反查台账」错位的地方（B1）：回执直连即无从错位。"""
+    # 样例包闸门 debounce 72h 会把第二发抑制掉——本例要的是两发都装配，故去掉包内 debounce 声明
+    # （改的是 tmp 副本，不写回仓库；debounce 是 gate 可选字段，去掉仍过 lint）
+    aware_file = sample_pack / "aware" / "AW-001-月度扫描.yaml"
+    aware_file.write_text(
+        "".join(f"{line}\n" for line in aware_file.read_text(encoding="utf-8").splitlines() if "debounce" not in line),
+        encoding="utf-8",
+    )
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+
+    first, second = await asyncio.gather(
+        _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host),
+        _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host),
+    )
+    assert first["ok"] and second["ok"]
+    assert first["episode_id"] != second["episode_id"]
+    ledger = {ep["episode_id"] for ep in (await _send({"cmd": "episodes"}, host))["episodes"]}
+    assert ledger == {first["episode_id"], second["episode_id"]}
+
+
+async def test_watcher_auto_fire_still_assembles_without_reading_return_value(running_host, sample_pack, deploy):
+    """回归：watcher 自动发射那条路（_drain_lane 不看回值）行为不变——照常唤醒装配、
+    watcher 存活、fires 计数照旧；deliver 改回 Delivery 不影响它。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    pid = "demo-group-oper-diagnosis"
+    watcher = next(w for w in host.table.watchers.values() if any(s.trigger_id == "AW-001/T3" for s in w.subs))
+
+    await host.table._fire(watcher)  # 自动发射路径（schedule/watch 命中走的就是它）
+    for _ in range(500):
+        if host.episodes:
+            break
+        await asyncio.sleep(0.01)
+
+    assert [ep.fired_trigger for ep in host.episodes.values()] == ["AW-001/T3"]
+    assert host.gates[(pid, "AW-001")].wakes == 1
+    assert watcher.fires == 1 and host.table.watchers  # watcher 存活

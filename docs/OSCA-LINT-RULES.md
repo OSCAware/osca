@@ -55,6 +55,13 @@
 |---|---|---|---|
 | OSCA041 | 错误 | 触发原语与闸门的受限语法：schedule 结构化字段 {every, day, time[, tz]}（自由文本废止）；watch 必有 uses + every（时长语法 `<整数><s\|m\|h\|d>`）；event 必有 source；各 kind 允许字段集外的键报错；gate 仅 combine/precondition/debounce/on_fail，combine=all/sequence 要求 ≥2 条触发原语（编译期矛盾）。解析器 `osca_cli.triggers` 与运行框架 Host 共用——lint 过 ＝ Host 编译期能布防 | SPEC v0.4 草案 §5 |
 
+## pipeline 步骤衔接（M8-T3）
+
+| 规则 | 级别 | 内容 | 依据 |
+|---|---|---|---|
+| OSCA042 | 错误 | 结构化产出声明 `produces.as`：① 值须在受限词表 `{json}` 内（词表外拒绝，不猜——与 Host runner 共用 `parse_produces_as`）；② 只有 `agent` 步可声明（connector/optimizer 的产物形状由执行器决定）；③ 声明 `as: json` 的步骤必须有 `input`——**可溯源纪律**的静态点：无上游产物可整形 ＝ 凭空造数（公理 A6），运行时同判据拒绝发起调用 | SPEC §5 衔接约定 / A.4 |
+| OSCA043 | 错误 | `input.from` 取格声明：写了 `from` 时，`input.ref` 必须有**上游**产出步（缺 ref 亦报错）；该产出步必须是 connector 步（只有连接器步的产物是 `{接口ref: 回执}` 字典，别的产物没有「格」可取）；`from` 的值必须落在该步 `uses` 展开后（裸 `CON-xxx` 按 manifest 展开全部接口）的接口 ref 集合里，报错列出可选 ref。运行时对悬空 `from` 一律 fail-closed（绝不回落成「取整份」），本规则把同一判据提到编译期 | SPEC §5 衔接约定 |
+
 ## 安全铁律
 
 | 规则 | 级别 | 内容 | 依据 |
@@ -82,6 +89,7 @@
 
 ## 变更记录
 
+- **v0.4（M8-T3）**（2026-08-03）：新增 OSCA042（结构化产出声明 `produces.as`：受限词表 / 只限 agent 步 / 必须有 input）与 OSCA043（`input.from` 只能取上游 connector 步真实取到的那一格），共 27 条规则；两条的取键与词表解析与 Host runner 共用 `osca_cli.triggers`（lint 过 ＝ Host 跑得动）。
 - **v0.4（M6-W7）**（2026-07-19）：新增 OSCA025——写连接器（allowed_with_approval）每个写接口 ref 必须在 policy.approvals 声明 approver（SPEC §6/B.4，否则写路径运行时静默死），共 25 条规则。
 - **v0.4（M6-W2）**（2026-07-18）：新增 OSCA061——osca.yaml 包级分层默认段校验（SPEC v0.4 §1/§9，与 OSCA060 共用枚举/形状/洁净室判据），共 24 条规则。
 - **v0.4-draft**（2026-07-18）：新增 OSCA060——判断分层权属三字段 + 洁净室机器布防（SPEC v0.4 §9），共 23 条规则。

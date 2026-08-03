@@ -33,15 +33,41 @@ log = logging.getLogger("osca-host")
 Poller = Callable[[str, str], object]
 
 
+@dataclass(frozen=True)
+class Delivery:
+    """一次投递的回执（deliver 回调 → 触发表 → 人工发射响应）。M8-T3-a。
+
+    - `reason`：**非空即未发布原因**（关停/跨代失效等）——与旧契约「非空字符串 = 未发布原因」
+      逐字同义，人工 fire 据此如实报失败；None = 投递正常走完（**不等于装配了剧集**：闸门未唤醒、
+      账本刷新失败、kill_switch 都是「正常走完但没剧集」）。
+    - `episode_id`：**真装配出剧集**才有值，没装配就是 None。fail-closed：绝不用空串冒充 id，
+      调用方据「有没有 id」分辨有无剧集，不据 ok。
+    """
+
+    reason: str | None = None
+    episode_id: str | None = None
+
+
+def as_delivery(result: object) -> Delivery:
+    """把 deliver 回调的返回值归一成 Delivery——旧契约（非空字符串 = 未发布原因；None = 正常）
+    照单兼容，裸回调（测试/外部实现）不必跟着改。"""
+    if isinstance(result, Delivery):
+        return result
+    if isinstance(result, str) and result:
+        return Delivery(reason=result)
+    return Delivery()
+
+
 @dataclass
 class Subscription:
     package_id: str
     aware_id: str
     trigger_id: str  # 全局 ID，如 AW-001/T1
     # 发射回调：deliver(trigger_id) → 闸门裁决。可回协程（Host 的投递把账本刷新/precondition
-    # 取数下线程，事件循环不承载阻塞 IO）；同步回调（测试裸用）也接受。协程可回「未发布原因」
-    # 字符串（生命周期失效等）——人工 fire 据此如实报失败；watcher 自动发射只记日志。
-    deliver: Callable[[str], Awaitable[str | None] | None]
+    # 取数下线程，事件循环不承载阻塞 IO）；同步回调（测试裸用）也接受。回值可以是 Delivery
+    # （带未发布原因 + 装配出的 episode_id）或旧形态的「未发布原因」字符串/None——两者等价可用。
+    # 人工 fire 据此如实报失败并回传剧集号；watcher 自动发射不看回值，只记日志。
+    deliver: Callable[[str], Awaitable[Delivery | str | None] | Delivery | str | None]
     # watch 轮询回调（Host 注入，捕获**本代** Connector 代理——跨代不外呼，GPT Review 三审 P1）。
     # None 时轮询回落表级 poller（测试裸用）；仍无则只计 tick。
     poll: Callable[[str], object] | None = None
@@ -134,15 +160,17 @@ class TriggerTable:
 
     # ── 发射 ──────────────────────────────────────────────────────────
 
-    async def fire_manual(self, package_id: str, trigger_id: str) -> str | None:
-        """人工发射（操作者通道）。仅 event 触发原语可人工发射；返回错误消息或 None。
-        投递等到裁决/装配完成才返回——fire 命令的响应语义保持确定（发射即可查台账）。
-        投递回「未发布原因」（关停/跨代失效）时如实转错误——失效的人工 fire 不许假报成功（GPT 三审 P1）。"""
+    async def fire_manual(self, package_id: str, trigger_id: str) -> Delivery:
+        """人工发射（操作者通道）。仅 event 触发原语可人工发射；回 Delivery（reason 非空即失败）。
+        投递等到裁决/装配完成才返回——fire 命令的响应语义保持确定（发射即可查台账），
+        这一发装配出的 episode_id 也随回执带出（M8-T3-a：调用方不必再反查台账猜自己的剧集）。
+        投递回「未发布原因」（关停/跨代失效）时如实转错误——失效的人工 fire 不许假报成功（GPT 三审 P1），
+        且未发布时**丢弃任何 episode_id**：没装配就是没有（fail-closed）。"""
         for watcher in self.watchers.values():
             for sub in watcher.subs:
                 if sub.package_id == package_id and sub.trigger_id == trigger_id:
                     if watcher.kind != "event":
-                        return f"{trigger_id} 是 {watcher.kind} 触发，仅 event 可人工发射"
+                        return Delivery(reason=f"{trigger_id} 是 {watcher.kind} 触发，仅 event 可人工发射")
                     watcher.fires += 1
                     try:
                         result = sub.deliver(sub.trigger_id)
@@ -150,11 +178,12 @@ class TriggerTable:
                             result = await result
                     except Exception as e:
                         log.exception(f"人工发射派发异常：{trigger_id}")
-                        return f"发射派发异常：{e}（watcher 存活，详见 Host 日志）"
-                    if isinstance(result, str) and result:
-                        return f"发射未发布：{result}"
-                    return None
-        return f"触发原语未布防：{package_id} 的 {trigger_id}"
+                        return Delivery(reason=f"发射派发异常：{e}（watcher 存活，详见 Host 日志）")
+                    delivery = as_delivery(result)
+                    if delivery.reason:
+                        return Delivery(reason=f"发射未发布：{delivery.reason}")
+                    return Delivery(episode_id=delivery.episode_id)
+        return Delivery(reason=f"触发原语未布防：{package_id} 的 {trigger_id}")
 
     async def _fire(self, watcher: Watcher) -> None:
         watcher.fires += 1
