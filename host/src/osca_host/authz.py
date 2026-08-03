@@ -43,8 +43,13 @@ ROLE_CAPS: dict[str, frozenset[str]] = {
     # M8-T2 整机两最小角色（红笔①-1 + M8 计划拍板 3）：
     # requester——员工触发桥的 Host 身份：只发射与看快照，无启停/装卸/剧集读（读结果归桥的 expert token）；
     # deployer——App 服务层装载面：只装载与看快照，界面进程永不持 host_admin（信任模型 M4-W0.1 不破）。
+    # **deployer 扩 unload（2026-08-03 用户已批的改判，W3 侦察逼出）**：装载面要能收回自己装上去的东西
+    # ——只给 load 不给 unload，App 层就没法把一个装错/装坏的部署撤下来，只能请 host_admin 出手，
+    # 而「界面进程永不持 host_admin」正是这两个角色存在的理由。装与卸是同一件事的两半，拆开给
+    # 反而逼出更高的权限。**仍不给 enable/disable/stop**：那是运行期启停与整机停机，属 operator/
+    # host_admin 的面，装载面不碰。
     "requester": frozenset({"fire", "status"}),
-    "deployer": frozenset({"load", "status"}),
+    "deployer": frozenset({"load", "status", "unload"}),
 }
 
 # 命令 → 参数字段（全部必填、非空 str）。请求顶层除 v/cmd/token 与这些字段外不许有别的键

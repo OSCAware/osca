@@ -218,15 +218,21 @@ async def test_role_capability_matrix_enforced(running_host):
         {"cmd": "stop"},
     ):
         assert (await _send(request, host, token=requester))["error"] == "forbidden", request
-    # deployer：load 到达 handler（部署 ID 未配置 → ok=False 而非 forbidden）+ status 可看
+    # deployer：load / unload 都到达 handler（包未注册 → ok=False 而非 forbidden）+ status 可看。
+    # unload 是 2026-08-03 已批的改判：装载面要能收回自己装上去的东西——只给 load 不给 unload，
+    # App 层撤不掉装错的部署、只能请 host_admin 出手，而「界面进程永不持 host_admin」正是这个角色的理由。
     resp = await _send({"cmd": "load", "deployment_id": "x"}, host, token=deployer)
     assert "error" not in resp and resp["ok"] is False and "未配置的部署 ID" in resp["detail"]
+    resp = await _send({"cmd": "unload", "package_id": "p"}, host, token=deployer)
+    assert "error" not in resp and resp["ok"] is False, "unload 该到达 handler（包未注册），不该被鉴权挡在门外"
     assert (await _send({"cmd": "status"}, host, token=deployer))["ok"]
-    # deployer 明确禁止：发射/卸载/启停/剧集面/审批/关停——装载面进程偷不到别的能力
+    # deployer 明确禁止：发射/启停/剧集面/审批/关停——装载面进程偷不到别的能力。
+    # 仍不给 enable/disable/stop：那是运行期启停与整机停机（operator/host_admin 的面）；
+    # 装载面只管「这台机器上装着什么」，不管「装着的东西此刻跑不跑」。
     for request in (
         {"cmd": "fire", "package_id": "p", "trigger_id": "AW-x"},
-        {"cmd": "unload", "package_id": "p"},
         {"cmd": "enable", "package_id": "p", "aware_id": "AW-x"},
+        {"cmd": "disable", "package_id": "p", "aware_id": "AW-x"},
         {"cmd": "episodes"},
         {"cmd": "episode", "episode_id": "EP-0001"},
         {"cmd": "challenges", "package_id": "p"},

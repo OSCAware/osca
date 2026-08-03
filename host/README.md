@@ -127,7 +127,7 @@ shasum -a 256 operator.token           # 将摘要写入 Host 侧 principals 文
 | `approver` | challenges / approve / deny（M4-W3：绑 challenge_id 批/驳一张具体挑战；principal 名须与挑战指定审批人相符——冒名/越权/一次性/过期由挑战状态机 fail-closed。**名绑定是全局的、无包域**：同名审批人可批任何指定其名的包，challenges 覆盖任意包全部待批项、不按审批人过滤；per-principal 包域收窄归 T1/T2，之前勿在多租户 Host 上授予——与 expert 同款告示） | 其余全部（无生命周期/快照/启停/剧集面） |
 | `expert` | episodes / episode（M4-W1 专家端只读交付面——draft 即交付物；episodes 摘要当前覆盖 Host 上全部包，per-principal 包域收窄未做，勿在多租户 Host 上授予） | 其余全部 |
 | `requester` | fire / status（M8-T2 员工触发桥的最小身份：只发射与看快照；剧集结果读取归桥自己的 expert token，不给本角色） | 其余全部（无剧集读面/装卸/启停/审批） |
-| `deployer` | load / status（M8-T2 App 服务层装载面的最小身份；界面进程永不持 host_admin——信任模型 M4-W0.1 不破） | 其余全部（无卸载/启停/发射/剧集面/审批/stop） |
+| `deployer` | load / unload / status（M8 App 服务层装载面的最小身份；界面进程永不持 host_admin——信任模型 M4-W0.1 不破。**装与卸是同一件事的两半**：只给 load 不给 unload，App 层撤不掉自己装错的部署、只能请 host_admin 出手，反而逼出更高的权限） | 其余全部（无启停/发射/剧集面/审批/stop——运行期启停与整机停机属 operator/host_admin 的面；装载面只管「装着什么」，不管「此刻跑不跑」） |
 
 ### M4-W3 审批挑战 + M6 真写全接通（诚实标注：审批闭环 + 真实执行器机制完成，测 fake 后端 ≠ 生产验证）
 

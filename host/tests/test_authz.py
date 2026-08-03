@@ -56,9 +56,12 @@ def test_role_caps_matrix_pinned():
     assert ROLE_CAPS["requester"] == {"fire", "status"}  # 员工触发桥：只发射与看快照
     for cap in ("episode", "episodes"):  # 读结果不归 requester，归桥自己的 expert token
         assert cap not in ROLE_CAPS["requester"]
-    assert ROLE_CAPS["deployer"] == {"load", "status"}  # App 服务层装载面：只装载与看快照
-    for cap in ("unload", "stop", "enable", "disable"):  # 生命周期其余面对两新角色一律不给
+    # deployer 扩 unload（2026-08-03 已批改判）：装与卸是同一件事的两半，只给 load 不给 unload，
+    # App 层撤不掉自己装错的部署，只能请 host_admin 出手——那正好破掉「界面进程永不持 admin」。
+    assert ROLE_CAPS["deployer"] == {"load", "status", "unload"}  # App 服务层装载面：装、卸、看快照
+    for cap in ("stop", "enable", "disable"):  # 运行期启停与整机停机仍不给：那是 operator/host_admin 的面
         assert cap not in ROLE_CAPS["requester"] and cap not in ROLE_CAPS["deployer"]
+    assert "unload" not in ROLE_CAPS["requester"]  # 员工触发桥永远只发射，装卸一格都不沾
 
 
 def test_expert_role_readonly_delivery_surface():
@@ -92,13 +95,23 @@ def test_requester_role_fire_and_status_only():
         assert not az.authorize(requester, cap)
 
 
-def test_deployer_role_load_and_status_only():
-    """deployer（M8 App 服务层装载面）：只有 load 与 status；卸载/启停/发射/审批/剧集面一律被拒。"""
+def test_deployer_role_load_unload_and_status_only():
+    """deployer（M8 App 服务层装载面）：装、卸、看快照三样；启停/发射/审批/剧集面/停机一律被拒。
+
+    **为什么给 unload**（2026-08-03 已批改判，W3 侦察逼出）：装载面得能收回自己装上去的东西。
+    只给 load 不给 unload，App 层撤不掉一个装错/装坏的部署，只能请 host_admin 出手——
+    而「界面进程永不持 host_admin」正是 deployer 这个角色存在的全部理由。装与卸是同一件事的
+    两半，拆开给反而逼出更高的权限。
+
+    **为什么仍不给 enable/disable/stop**：那是运行期启停与整机停机，属 operator / host_admin 的面。
+    装载面只管「这台机器上装着什么」，不管「装着的东西此刻跑不跑」——两件事分开，越权面才收得住。
+    """
     az = Authorizer()
     deployer = Principal("App 服务层", "deployer")
     assert az.authorize(deployer, "load")
+    assert az.authorize(deployer, "unload")
     assert az.authorize(deployer, "status")
-    denied = ("unload", "enable", "disable", "fire", "episodes", "episode", "approve", "deny", "challenges", "stop")
+    denied = ("enable", "disable", "fire", "episodes", "episode", "approve", "deny", "challenges", "stop")
     for cap in denied:
         assert not az.authorize(deployer, cap)
 
