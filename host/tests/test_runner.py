@@ -14,7 +14,7 @@ from osca_host.connector import ConnectorProxy
 from osca_host.episode import assemble
 from osca_host.loader import load_for_host
 from osca_host.policy import PolicyInterceptor, ledger_stats, parse_quantity
-from osca_host.runner import _run_optimizer, _step_user_prompt, render_system_prompt, run_episode
+from osca_host.runner import _parse_structured, _run_optimizer, _step_user_prompt, render_system_prompt, run_episode
 
 
 @pytest.fixture
@@ -834,6 +834,12 @@ def test_unknown_produces_as_rejected(episode, loaded, proxy, policy, tmp_path):
     assert llm.calls == []
 
 
+def _nested(depth: int, *, envelope: bool = True) -> str:
+    """depth 层纯嵌套数组的信封（或裸数据）。层数是**数据**的嵌套层数。"""
+    data = "[" * depth + "]" * depth
+    return '{"说明": "人话", "数据": ' + data + "}" if envelope else data
+
+
 ILLEGAL_OUTPUTS = {
     "纯文本": "甲厂差旅费超阈值，建议下发限额审批。",
     "半截 JSON": '{"说明": "人话", "数据": {"目标单位": "甲',
@@ -848,6 +854,26 @@ ILLEGAL_OUTPUTS = {
     "空产出": "",
     "超长": '{"说明": "人话", "数据": {"备注": "' + "长" * 100_001 + '"}}',
     "深嵌套": '{"说明": "人话", "数据": ' + "[" * 20_000 + "]" * 20_000 + "}",
+    # ── 漏网口 ①：JSON 规范外的字面量（RFC 8259 无 NaN/Infinity，Python json 默认收） ──
+    "NaN 字面量": '{"说明": "人话", "数据": {"金额": NaN}}',
+    "Infinity 字面量": '{"说明": "人话", "数据": {"上限": Infinity}}',
+    "负 Infinity 字面量": '{"说明": "人话", "数据": {"下限": -Infinity}}',
+    "数组里的 NaN": '{"说明": "人话", "数据": [1, NaN, 3]}',
+    "深层嵌套的 NaN": '{"说明": "人话", "数据": {"行": [{"金额": NaN}]}}',
+    "说明位的 NaN": '{"说明": NaN, "数据": {"a": 1}}',
+    # 同一条纪律的另一条进口：合法 JSON 数字**溢出**成 inf（parse_constant 拦不住），
+    # 落盘/上 wire 时 json.dumps 照样吐 `Infinity` —— 后果与字面量完全一致
+    "浮点溢出成 inf": '{"说明": "人话", "数据": {"金额": 1e999}}',
+    "浮点溢出成 -inf": '{"说明": "人话", "数据": {"金额": -1e999}}',
+    # ── 漏网口 ②：重复键（json.loads 默认静默取最后一个） ──
+    "信封重复键": '{"说明": "A 版本", "说明": "B 版本", "数据": {"a": 1}}',
+    "信封重复数据键": '{"说明": "人话", "数据": {"金额": 1}, "数据": {"金额": 999}}',
+    "数据内层重复键": '{"说明": "人话", "数据": {"金额": 100, "金额": 999999}}',
+    "数据深层重复键": '{"说明": "人话", "数据": {"行": [{"单位": "甲厂", "单位": "乙厂"}]}}',
+    # ── 漏网口 ③：深嵌套（解析放行 9996 层，下游 330 层即炸栈） ──
+    "深嵌套-越上限一层": _nested(33),
+    "深嵌套-下游炸栈档": _nested(331),
+    "深嵌套-解析上限档": _nested(9996),
 }
 
 
@@ -863,6 +889,97 @@ def test_illegal_structured_output_always_fails_closed(name, episode, loaded, pr
     assert episode.draft is None, name  # 没有「解析不了就当草稿用」
     assert policy.pending_challenges() == []  # 写步一步没跑：零挑战、零写
     assert [s["step"] for s in episode.steps] == ["取数", "整形"] and episode.steps[-1]["status"] == "failed"
+
+
+# ── 三个漏网口的定点判据（上面的矩阵证「四条判据成立」，下面证「拦在哪、话说的是什么」） ──
+
+
+@pytest.mark.parametrize(
+    "raw,keyword",
+    [
+        ('{"说明": "人话", "数据": {"金额": NaN}}', "NaN"),
+        ('{"说明": "人话", "数据": {"上限": Infinity}}', "Infinity"),
+        ('{"说明": "人话", "数据": {"下限": -Infinity}}', "-Infinity"),
+        ('{"说明": "人话", "数据": {"金额": 1e999}}', "1e999"),
+    ],
+)
+def test_json_extension_literals_are_rejected_by_name(raw, keyword):
+    """NaN/Infinity 不是 JSON（RFC 8259），Python 的 json 却默认收：一路放行会让审批人对着 nan 拍板、
+    让 L2 快照落一份非 Python 读者解不开的非法 JSON、让 wire body 带 `NaN` 发给写后端。
+    报错须指名道姓说是哪个字面量——人看得懂才改得了提示词。"""
+    parsed, error = _parse_structured(raw)
+    assert parsed is None
+    assert keyword in error and "JSON" in error
+
+
+def test_finite_numbers_still_pass():
+    """闸只咬非有限数：正常浮点/整数/科学计数照旧放行（别把闸修成把合法数值一起拒了）。"""
+    parsed, error = _parse_structured('{"说明": "人话", "数据": {"金额": 1.5, "件数": 3, "占比": 1e30}}')
+    assert error == "" and parsed["data"] == {"金额": 1.5, "件数": 3, "占比": 1e30}
+
+
+def test_structured_artifact_is_always_legal_json():
+    """放行的结构化产物**必是合法 JSON**——它要进 L2 快照（落盘）、上审批卡、原样上 wire。
+    allow_nan=False 就是 RFC 8259 的口径：这条断言是三处下游的共同前置。"""
+    parsed, _ = _parse_structured(ENVELOPE)
+    json.dumps(parsed["data"], allow_nan=False)  # 不抛即合法
+
+
+@pytest.mark.parametrize(
+    "raw,dup",
+    [
+        ('{"说明": "A 版本", "说明": "B 版本", "数据": {"a": 1}}', "说明"),
+        ('{"说明": "人话", "数据": {"a": 1}, "数据": {"a": 2}}', "数据"),
+        ('{"说明": "人话", "数据": {"金额": 100, "金额": 999999}}', "金额"),
+        ('{"说明": "人话", "数据": {"行": [{"单位": "甲厂", "单位": "乙厂"}]}}', "单位"),
+    ],
+)
+def test_duplicate_keys_rejected_at_every_level(raw, dup):
+    """重复键：json.loads 默认静默取**最后一个**——「取哪一份」是猜，猜错即写错内容。
+    信封层与「数据」内层同一把闸（一个 object_pairs_hook 覆盖所有层级）：两层的后果是同一个
+    ——被写内容/审批卡/wire body 都只剩最后一份，谁也看不出还有过第一份。报错须点名重复的那个键。"""
+    parsed, error = _parse_structured(raw)
+    assert parsed is None
+    assert dup in error and "重复键" in error
+
+
+def test_structured_depth_boundary():
+    """深度上限按**下游真正扛得住的数**定（见 runner.MAX_STRUCTURED_DEPTH 注释里的实测）：
+    上限层放行、上限 + 1 层拒绝，且报错说清是嵌套超限（不是笼统「不是合法 JSON」）。"""
+    from osca_host.runner import MAX_STRUCTURED_DEPTH
+
+    parsed, error = _parse_structured(_nested(MAX_STRUCTURED_DEPTH))
+    assert error == "" and parsed is not None  # 恰好上限：放行
+    parsed, error = _parse_structured(_nested(MAX_STRUCTURED_DEPTH + 1))
+    assert parsed is None and "嵌套" in error and str(MAX_STRUCTURED_DEPTH) in error
+    # 上限本身须**远低于**实测下游上限（下游最浅 330 层即炸栈，且随调用栈已用深度浮动）
+    assert MAX_STRUCTURED_DEPTH * 8 <= 330
+
+
+def _shape_then_agent_then_write_pipeline(episode, proxy, policy):
+    """整形（结构化）→ **下游 agent 步吃它**（_step_user_prompt 走 yaml.safe_dump，3 帧/层，
+    是下游最浅的一道）→ 写步。深嵌套的炸栈就发生在这条管线上。"""
+    _shape_then_write_pipeline(episode, proxy, policy)
+    episode.context["structure"]["pipeline"].insert(
+        2, {"step": "成文", "performer": "agent", "input": {"ref": "待写行"}, "produces": "文稿"}
+    )
+
+
+def test_deep_nesting_fails_closed_instead_of_crashing_downstream(episode, loaded, proxy, policy, tmp_path):
+    """修前实测：331 层解析放行 → 下游 agent 步的 yaml.safe_dump 炸 RecursionError，**未捕获冲出
+    run_episode**，剧集停在 status=running（既非 failed 也无 stop_reason，台账里是一具活死人）。
+    修后：解析处即 fail-closed，剧集 failed、下游一步没跑。"""
+    _shape_then_agent_then_write_pipeline(episode, proxy, policy)
+    d = tmp_path / "deep" / "episode"
+    d.mkdir(parents=True)
+    (d / "整形.md").write_text(_nested(331), encoding="utf-8")
+    (d / "成文.md").write_text("一段人话文稿。", encoding="utf-8")
+
+    run_episode(episode, loaded, proxy, policy, llm=MockLLM(d.parent))  # 修前此处抛 RecursionError
+
+    assert episode.status == "failed" and "嵌套" in episode.stop_reason
+    assert [s["step"] for s in episode.steps] == ["取数", "整形"]  # 下游 agent 步、写步都没跑
+    assert episode.draft is None and policy.pending_challenges() == []
 
 
 def test_illegal_structured_output_still_charges_tokens(episode, loaded, proxy, policy, tmp_path):

@@ -59,6 +59,19 @@ DATA_KEY = "数据"
 # 结构化产出的体积上限：结构化产物会进恢复快照（持久化）、上审批卡（人读）、原样上 wire——无界即把
 # 无界体积灌进这三处。与 llm/openapi 执行器的响应体上限同一纪律（有界才敢解析）。
 MAX_STRUCTURED_CHARS = 100_000
+# 结构化产出的**嵌套深度**上限。取值不是随手挑的，是按**下游真正扛得住的层数**倒推的（实测，
+# CPython 3.12 / sys.getrecursionlimit()=1000，从 run_episode 顶层起算）：
+# - 下游 agent 步渲染输入 `_step_user_prompt` → `yaml.safe_dump`：**330 层 ok / 331 层 RecursionError**（最浅）；
+# - 写步的 `policy.redact`（审批卡 payload_display / 回执脱敏）：993 层 ok / 994 层 RecursionError；
+# - `dataclasses.asdict`（回执入档）≈496 层、`json.dumps`（payload_digest）≈9996 层。
+# 而 `json.loads` 自己能收到 **9996 层**——「解析放行、下游炸栈」的落差有 30 倍，炸出来的
+# RecursionError 还会**未捕获冲出 run_episode**，剧集停在 status=running（既非 failed 也无 stop_reason）。
+# 上限取 32 ≈ 最浅下游上限 330 的 1/10，留一个数量级余量，理由是那 330 **不是常量**：
+# ① 它随调用栈**已用**深度浮动——实测垫 200 帧后 329 层就炸（Host 真跑时剧集在事件循环 + 工作线程的
+#    深栈上，不是脚本顶层）；② 它随部署侧 sys.getrecursionlimit() 变；③ 下游消费者还会增加，
+# 每个消费者的「帧/层」比各不相同（yaml 3 帧、asdict 2 帧、redact 1 帧）。
+# 32 层对真实被写内容绰绰有余（一行待写数据的自然深度是 2–4 层）。
+MAX_STRUCTURED_DEPTH = 32
 
 
 def _yaml(data) -> str:
@@ -139,6 +152,73 @@ def _resolve_input(spec: dict, artifacts: dict) -> tuple[str | None, object, str
     return key, value[picked], ""
 
 
+class _EnvelopeRejected(ValueError):
+    """信封解析期间的定点拒绝（JSON 规范外字面量 / 重复键）——带人话理由，与 JSONDecodeError 区分开。
+
+    继承 ValueError 是刻意的：即便调用方漏了本类的 except，也仍落进既有的 ValueError 分支 fail-closed
+    （只是报错人话退成笼统版），绝不会漏成放行。
+    """
+
+
+def _reject_constant(name: str):
+    """`json.loads` 的 parse_constant 闸：NaN / Infinity / -Infinity 一律拒。
+
+    这三个**不是 JSON**（RFC 8259 的数字文法里没有它们），Python 的 json 出于历史原因默认收。
+    收下去的后果实测过一整条：审批卡显示 `{'金额': nan}`（审批人对着 nan 拍板）、L2 挂起快照落盘成
+    `{"artifacts": {"金额": NaN}}`（一份非 Python 读者解不开的非法 JSON 文件）、executor 拼的 wire body
+    也是 `{"金额": NaN}` 直接发给写后端。故在**进门处**拒绝，不在下游一处处打补丁。
+    """
+    raise _EnvelopeRejected(f"含 JSON 规范外的字面量 {name}（RFC 8259 只有数字，没有 NaN/Infinity）")
+
+
+def _reject_nonfinite(text: str) -> float:
+    """`json.loads` 的 parse_float 闸：语法合法但**溢出成 ±inf** 的数值同拒（如 `1e999`）。
+
+    parse_constant 只管字面量，拦不住溢出——而 `1e999` 落进产物后 `json.dumps` 照样吐 `Infinity`，
+    落盘/上 wire 的后果与写 `Infinity` 字面量一字不差。同一条纪律，两个进口都得堵。
+    """
+    value = float(text)
+    if not math.isfinite(value):
+        raise _EnvelopeRejected(f"数值 {text} 溢出成非有限浮点数（{value}）——落盘/上 wire 时它就是非法 JSON")
+    return value
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    """`json.loads` 的 object_pairs_hook 闸：同一对象里出现重复键即拒。
+
+    默认行为是**静默取最后一个**：`{"说明":"A","说明":"B"}` 只剩 B，`{"金额":100,"金额":999999}`
+    只剩 999999——「取哪一份」是猜，猜错即写错内容，且台账里谁也看不出还有过第一份。
+
+    取舍：信封层与「数据」内层**共用这一把闸**（hook 天然作用于文档里的每一个 JSON 对象），不为两层
+    写两套判据。理由是两层的后果同一个——数据内层的重复键照样进被写内容、进审批卡、进 wire body；
+    真要分层区别对待，就得先回答「哪一层的猜是可接受的猜」，而这个问题没有可接受的答案。
+    """
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise _EnvelopeRejected(f"同一 JSON 对象里出现重复键「{key}」——取哪一份都是猜，直接拒绝")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _exceeds_depth(value: object, limit: int) -> bool:
+    """结构化数据的嵌套是否超过 limit 层。**迭代**实现（显式栈）——用递归量深度，量到一半自己先炸栈，
+    这道闸就成了它要防的那个 bug。"""
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children: object = node.values()
+        elif isinstance(node, (list, tuple)):
+            children = node
+        else:
+            continue
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
+
+
 def _parse_structured(raw: object) -> tuple[dict | None, str]:
     """结构化 agent 产出的**唯一**解析口径：一份 JSON 信封 `{说明: 人话, 数据: 对象/数组}`。
 
@@ -157,7 +237,15 @@ def _parse_structured(raw: object) -> tuple[dict | None, str]:
         )
         return None, detail
     try:
-        envelope = json.loads(raw)
+        # 三把闸都挂在**解析这一次**上（不在下游一处处补）：规范外字面量、溢出成 ±inf 的数值、重复键。
+        envelope = json.loads(
+            raw,
+            parse_constant=_reject_constant,
+            parse_float=_reject_nonfinite,
+            object_pairs_hook=_no_duplicate_keys,
+        )
+    except _EnvelopeRejected as e:  # 定点拒绝：报错指名道姓（人看得懂才改得了提示词/包）
+        return None, f"模型产出不是合法 JSON：{e}。结构化产出一律 fail-closed，不退回文本"
     except (ValueError, RecursionError) as e:  # JSONDecodeError 属 ValueError；深嵌套触 RecursionError
         return None, f"模型产出不是合法 JSON（{type(e).__name__}）——结构化产出一律 fail-closed，不退回文本"
     if not isinstance(envelope, dict):
@@ -176,6 +264,15 @@ def _parse_structured(raw: object) -> tuple[dict | None, str]:
     data = envelope[DATA_KEY]
     if not isinstance(data, (dict, list)):
         return None, f"信封的「{DATA_KEY}」是 {type(data).__name__}，不是对象/数组——下游写步的 body 须是结构化数据"
+    if _exceeds_depth(data, MAX_STRUCTURED_DEPTH):
+        # 解析器自己能收近万层，下游最浅 330 层就炸栈（见 MAX_STRUCTURED_DEPTH 注释的实测）——
+        # 「解析放行、下游炸栈」的落差必须在这里合上，否则 RecursionError 会未捕获冲出 run_episode。
+        detail = (
+            f"信封的「{DATA_KEY}」嵌套超过 {MAX_STRUCTURED_DEPTH} 层——拒绝解析"
+            "（结构化产物要过脱敏、进恢复快照、渲染给下游步骤，深嵌套会在下游炸栈；"
+            "一行待写数据的自然深度是 2–4 层）"
+        )
+        return None, detail
     return {"draft": draft, "data": data}, ""
 
 
