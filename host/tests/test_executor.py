@@ -7,6 +7,7 @@ secret 作鉴权头不外泄 / 不跟随重定向）——**非生产库/生产 
 from __future__ import annotations
 
 import http.server
+import importlib
 import json
 import sqlite3
 import threading
@@ -569,6 +570,60 @@ def test_openapi_executor_bounds_urlopen_timeout_by_deadline(monkeypatch):
             timeout=deadline,
         )
         assert seen["timeout"] == expected, (deadline, seen)
+
+
+def test_openapi_executor_ignores_environment_proxy_and_keeps_bearer_off_proxy(monkeypatch):
+    """环境代理不是部署登记表的一部分：即使进程环境带代理，连接器也必须直连目标。
+
+    这条用真 HTTP 假代理接 wire，不靠检查 opener 私有结构。目标端口刻意不可达：旧实现会把
+    完整 URL 与 Bearer 交给假代理并拿到伪造成功；正确实现应直连失败，假代理一个请求都看不到。
+    """
+    from osca_host import executor as ex_mod
+
+    seen: list[tuple[str, str | None]] = []
+
+    class _Proxy(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 —— BaseHTTPRequestHandler 命名约定
+            seen.append((self.path, self.headers.get("Authorization")))
+            body = b'{"via":"ambient-proxy"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Proxy)
+    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    thread.start()
+    proxy_url = f"http://127.0.0.1:{proxy.server_address[1]}"
+    try:
+        with monkeypatch.context() as env:
+            for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+                env.setenv(name, proxy_url)
+            for name in ("NO_PROXY", "no_proxy"):
+                env.delenv(name, raising=False)
+            # ProxyHandler 在 opener 构造时读取环境；重载确保测试的是带代理环境下的生产默认值。
+            importlib.reload(ex_mod)
+            payload, error = ex_mod.OpenapiExecutor().execute(
+                endpoint="openapi://127.0.0.1:9",
+                interface={"method": "GET", "path": "/private"},
+                params={},
+                secret="fake-proxy-regression-secret",
+                is_write=False,
+                pack_root=Path("."),
+                timeout=0.2,
+            )
+            assert payload is None and error == "openapi GET 调用失败（连接层错误）"
+            assert seen == [], f"环境代理截获了内部请求或 Bearer：{seen!r}"
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        thread.join(timeout=2)
+        # 恢复无测试环境注入的生产模块状态，避免影响本文件后续用例。
+        importlib.reload(ex_mod)
 
 
 def test_sql_readonly_progress_handler_enforces_absolute_deadline(tmp_path):

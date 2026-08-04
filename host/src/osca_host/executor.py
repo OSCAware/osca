@@ -142,7 +142,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
+# 连接器的 endpoint 来自部署登记表，环境代理不在这条受审计的配置链里。显式空 ProxyHandler
+# 关闭 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY；否则回环 HTTP 的 Bearer 也会被环境代理直接看见。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 _READ_METHODS = frozenset({"GET", "HEAD"})  # 读路径只允许这些 HTTP method（其余属写，须过审批门）
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})  # 本地回环——secret 走明文 http 仅限于此（参考适配器测试）
