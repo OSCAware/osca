@@ -181,8 +181,9 @@ W3 落地的是**机制**：绑定挑战状态机（approver / episode / payload
 `load` 只收 `deployment_id`：包路径、bindings、解压目录一律由 Host 侧
 `--deployments` 清单解析（相对路径按清单文件所在目录解析），绝不从连接者
 透传（confused-deputy 面收口）。清单在每次 `load` 前**热重读**（M8-T2）：
-新增的部署条目免重启即可装载；重读失败 fail-safe——沿用上次有效清单继续
-服务，拒因附失败说明。load 准备在线程中按 deployment 单飞，不同
+新增的部署条目免重启即可装载；重读失败时新的 `load` **fail-closed**，拒因
+原样带回重读失败原因。已经装载的实例继续按内存运行态服务、不受影响；上次有效
+清单缓存只保这些已经跑着的实例，不授权新的变更。load 准备在线程中按 deployment 单飞，不同
 deployment 可并行；发布段才进入短锁并复核 lifecycle/generation/tombstone。
 `STARTING → RUNNING → DRAINING → STOPPED` 保证 stop/unload 胜过迟到 load，同时
 慢 load 期间 status 仍可快速返回。

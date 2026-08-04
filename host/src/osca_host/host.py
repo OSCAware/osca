@@ -147,12 +147,17 @@ class Host:
             if cmd == "load":
                 # 重活（读盘/解压/lint）在锁外线程执行——慢 load 不许压住 status/stop（W0.1 P2）
                 reload_error = await self._refresh_deployments()
+                if reload_error is not None:
+                    return {
+                        "ok": False,
+                        "detail": f"部署清单重读失败，拒绝执行新的 load：{reload_error}",
+                    }
                 spec = self.deployments.get(request["deployment_id"])
                 if spec is None:
-                    detail = f"未配置的部署 ID：{request['deployment_id']}（部署清单归 Host 侧管理）"
-                    if reload_error:
-                        detail += f"；且部署清单重读失败、仍在用上次有效清单：{reload_error}"
-                    return {"ok": False, "detail": detail}
+                    return {
+                        "ok": False,
+                        "detail": f"未配置的部署 ID：{request['deployment_id']}（部署清单归 Host 侧管理）",
+                    }
                 return await self._request_load(request["deployment_id"], spec)
             if cmd == "fire":
                 # fire 同 load 出全局命令锁（GPT Review 复审 P2）：投递含线程化的账本刷新/precondition
@@ -245,15 +250,15 @@ class Host:
     async def _refresh_deployments(self) -> str | None:
         """load 前热重读部署清单（M8-T2）：新发布的部署条目免重启即可装载。
         清单来源仍是 Host 侧文件、服务端解析——控制通道只收 deployment_id，
-        confused-deputy 收口不破；重读失败 fail-safe：沿用上次有效清单继续服务，
-        返回失败原因供调用方拼进拒因（成功返回 None）。文件读解析在线程里跑。"""
+        confused-deputy 收口不破；重读失败时保留上次有效运行态，但新的 load fail-closed，
+        返回失败原因供调用方原样带进拒因（成功返回 None）。文件读解析在线程里跑。"""
         if self.deployments_path is None:
             return None
         async with self._deployments_reload_lock:
             try:
                 fresh = await asyncio.to_thread(load_deployments, str(self.deployments_path))
             except (OSError, ValueError, yaml.YAMLError) as e:
-                log.warning(f"部署清单重读失败（沿用上次有效清单）：{e}")
+                log.warning(f"部署清单重读失败（保留已运行实例，拒绝新的 load）：{e}")
                 return str(e)
             self.deployments = fresh
             return None

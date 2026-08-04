@@ -55,10 +55,12 @@ async def _load_pack(host, path, bindings=None, did="t-pack"):
     return await _send({"cmd": "load", "deployment_id": did}, host)
 
 
-async def test_load_hot_rereads_deployments_manifest(sock_path, sample_pack, tmp_path):
+async def test_load_hot_rereads_deployments_manifest(sock_path, sample_pack, tmp_path, monkeypatch):
     """M8-T2：--deployments 清单在每次 load 前热重读——新发布的部署条目免重启即可装载；
-    清单损坏 fail-safe：沿用上次有效清单继续服务，拒因带重读失败说明。"""
+    清单损坏时新的 load fail-closed；已经装载的包继续运行。"""
     import yaml as _yaml
+
+    import osca_host.host as host_module
 
     manifest = tmp_path / "deployments.yaml"
     manifest.write_text(_yaml.safe_dump({}), encoding="utf-8")
@@ -81,14 +83,22 @@ async def test_load_hot_rereads_deployments_manifest(sock_path, sample_pack, tmp
         response = await _send({"cmd": "load", "deployment_id": "fresh"}, host)
         assert response["ok"] and response["package_id"] == "demo-group-oper-diagnosis"
 
-        # 清单损坏 → fail-safe：未知 ID 的拒因说明重读失败；上次有效清单仍在服务
-        manifest.write_text("[not-a-mapping]", encoding="utf-8")
+        # 清单损坏 → 新的 load 一律 fail-closed，底层重读原因逐字进拒因。
+        # 即使 deployment 在上次有效清单里也不能借旧配置发起新变更。
+        def _reload_fails(_path):
+            raise ValueError("P1-3-原样原因")
+
+        monkeypatch.setattr(host_module, "load_deployments", _reload_fails)
         response = await _send({"cmd": "load", "deployment_id": "ghost"}, host)
-        assert not response["ok"] and "重读失败" in response["detail"]
+        assert response == {"ok": False, "detail": "部署清单重读失败，拒绝执行新的 load：P1-3-原样原因"}
         response = await _send({"cmd": "load", "deployment_id": "fresh"}, host)
-        # fresh 仍能从沿用的清单解析到（拒因是「包已注册」而非「未配置的部署 ID」——
-        # 同 ID 重复装载被注册表拒是既有语义，这里只证清单条目没有因重读失败而丢失）
-        assert not response["ok"] and "包已注册" in str(response["detail"])
+        assert response == {"ok": False, "detail": "部署清单重读失败，拒绝执行新的 load：P1-3-原样原因"}
+
+        # fail-safe 只保“已经跑着的”：包仍在 registry，运行期 fire 照常走，不因清单坏掉被停掉。
+        snapshot = await _send({"cmd": "status"}, host)
+        assert [p["package_id"] for p in snapshot["packages"]] == ["demo-group-oper-diagnosis"]
+        fired = await _send({"cmd": "fire", "package_id": "demo-group-oper-diagnosis", "trigger_id": "AW-001/T3"}, host)
+        assert fired["ok"] is True
     finally:
         host._stop.set()
         await asyncio.wait_for(task, timeout=5)
