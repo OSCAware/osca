@@ -17,6 +17,7 @@ from osca_host.control import send_command
 from osca_host.episode import Episode, assemble
 from osca_host.host import Host
 from osca_host.runner import run_episode
+from osca_host.triggers import Delivery
 
 
 @pytest.fixture
@@ -1878,29 +1879,33 @@ async def test_hung_publish_flagged_and_stop_bounded(sock_path, sample_pack, tmp
         await asyncio.wait_for(load_task, timeout=5)
 
 
-# ── M8-T3-a：fire 响应回传 episode_id（发射方直接绑自己那一发，不必反查台账猜） ──
+# ── M8-T3-a/b：fire 响应回传 episode_id + operation_id（发射方直接绑自己那一发，不必反查台账猜） ──
 
 
-async def test_fire_returns_the_episode_id_it_just_assembled(running_host, sample_pack, deploy):
-    """正常发射：响应带 episode_id，且**就是台账里那一条**（episodes 查得到、episode 取得出）。"""
+async def test_fire_returns_both_ids_of_the_episode_it_just_assembled(running_host, sample_pack, deploy):
+    """正常发射：响应带 episode_id **与** operation_id，且**都指向台账里那一条**
+    （episodes 查得到、episode 取得出）。operation_id 是跨重启唯一的机器身份，EP 号只是展示。"""
     host = running_host
     await _load_pack(host, sample_pack, deploy)
     pid = "demo-group-oper-diagnosis"
 
     response = await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
     assert response["ok"]
-    episode_id = response["episode_id"]
-    assert episode_id in response["detail"]  # 人话 detail 也带号，操作者控制台照旧只读 detail
+    episode_id, operation_id = response["episode_id"], response["operation_id"]
+    assert episode_id in response["detail"]  # 人话 detail 只带展示号，操作者控制台照旧只读 detail
+    assert operation_id.startswith("EO-") and operation_id not in response["detail"]  # 长 uuid 不进人话
 
     ledger = await _send({"cmd": "episodes"}, host)
     assert [ep["episode_id"] for ep in ledger["episodes"]] == [episode_id]  # 台账里就是这一条
+    assert [ep["operation_id"] for ep in ledger["episodes"]] == [operation_id]  # 两个字段查的是同一条
     exported = await _send({"cmd": "episode", "episode_id": episode_id}, host)
     assert exported["ok"] and exported["episode"]["episode_id"] == episode_id
+    assert exported["episode"]["operation_id"] == operation_id
     assert exported["episode"]["fired_trigger"] == "AW-001/T3"
 
 
-async def test_fire_omits_episode_id_when_nothing_was_assembled(running_host, sample_pack, deploy):
-    """三条「未发布」路径都**没有 episode_id 字段**（fail-closed：宁可没有，不给空串当 id），
+async def test_fire_omits_both_ids_when_nothing_was_assembled(running_host, sample_pack, deploy):
+    """三条「未发布」路径都**两个 id 字段都没有**（fail-closed：宁可没有，不给空串当 id），
     detail 如实说没装配剧集——绝不让发射方把「发射成功」当成「有剧集」。"""
     from osca_cli.ledger import ledger_lock
 
@@ -1911,28 +1916,28 @@ async def test_fire_omits_episode_id_when_nothing_was_assembled(running_host, sa
     # ① 未布防（触发器停后发射）：ok=False，无字段
     await _send({"cmd": "disable", "package_id": pid, "aware_id": "AW-001"}, host)
     response = await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
-    assert not response["ok"] and "episode_id" not in response
+    assert not response["ok"] and "episode_id" not in response and "operation_id" not in response
     await _send({"cmd": "enable", "package_id": pid, "aware_id": "AW-001"}, host)
 
     # ② 闸门未唤醒（闸门自身裁决不唤醒；订阅仍在、投递照常走完）：detail 如实，无字段
     host.gates[(pid, "AW-001")].enabled = False  # 真闸门的真裁决路径（on_trigger → 抑制）
     response = await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
-    assert response["ok"] and "episode_id" not in response
+    assert response["ok"] and "episode_id" not in response and "operation_id" not in response
     assert "未装配剧集" in response["detail"]
     host.gates[(pid, "AW-001")].enabled = True
 
     # ③ 账本刷新失败（写入者真持账本写锁）：拒绝唤醒，无字段
     with ledger_lock(sample_pack):
         response = await _send({"cmd": "fire", "package_id": pid, "trigger_id": "AW-001/T3"}, host)
-    assert response["ok"] and "episode_id" not in response
+    assert response["ok"] and "episode_id" not in response and "operation_id" not in response
     assert "未装配剧集" in response["detail"]
 
     assert (await _send({"cmd": "episodes"}, host))["episodes"] == []  # 全程零剧集——字段缺省与事实一致
 
 
-async def test_concurrent_fires_get_distinct_episode_ids(running_host, sample_pack, deploy):
-    """并发两发 → 两个**不同**的 episode_id，且各自就是自己那一发装配出的那条。
-    这正是「按时间/触发器反查台账」错位的地方（B1）：回执直连即无从错位。"""
+async def test_concurrent_fires_get_distinct_ids(running_host, sample_pack, deploy):
+    """并发两发 → 两个**不同**的 episode_id 与两个**不同**的 operation_id，各自就是自己那一发
+    装配出的那条。这正是「按时间/触发器反查台账」错位的地方（B1）：回执直连即无从错位。"""
     # 样例包闸门 debounce 72h 会把第二发抑制掉——本例要的是两发都装配，故去掉包内 debounce 声明
     # （改的是 tmp 副本，不写回仓库；debounce 是 gate 可选字段，去掉仍过 lint）
     aware_file = sample_pack / "aware" / "AW-001-月度扫描.yaml"
@@ -1950,8 +1955,67 @@ async def test_concurrent_fires_get_distinct_episode_ids(running_host, sample_pa
     )
     assert first["ok"] and second["ok"]
     assert first["episode_id"] != second["episode_id"]
-    ledger = {ep["episode_id"] for ep in (await _send({"cmd": "episodes"}, host))["episodes"]}
-    assert ledger == {first["episode_id"], second["episode_id"]}
+    assert first["operation_id"] != second["operation_id"]  # 机器身份也各是各的
+    episodes = (await _send({"cmd": "episodes"}, host))["episodes"]
+    assert {ep["episode_id"] for ep in episodes} == {first["episode_id"], second["episode_id"]}
+    assert {ep["operation_id"] for ep in episodes} == {first["operation_id"], second["operation_id"]}
+    # 两个身份在台账里成对——不会出现「拿 A 的 EP 号配到 B 的 operation_id」
+    pairs = {(ep["episode_id"], ep["operation_id"]) for ep in episodes}
+    assert pairs == {(first["episode_id"], first["operation_id"]), (second["episode_id"], second["operation_id"])}
+
+
+async def test_operation_id_is_not_reused_across_restart_although_ep_number_is(sock_path, sample_pack, deploy):
+    """重启边界（本条正对着 ②ᵖᵘᵇ 要修的 bug 写）：Host 重启后 `EP-xxxx` 从 EP-0001 重新计号——
+    **同一个展示号会落到另一条剧集上**，桥若按 EP 号绑定/轮询就会绑到别人那一发；
+    `operation_id` 每次装配都是新的 `EO-<uuid4>`，跨重启不复用，故只有它能当绑定主键。"""
+
+    async def _fire_once(path):
+        """起一个全新 Host（= 进程重启：_episode_seq 归零）→ 装载 → 发一发 → 关停。"""
+        host = Host(path)
+        task = asyncio.create_task(host.run())
+        for _ in range(100):  # 等控制通道就绪
+            if host.control.socket_path.exists():
+                break
+            await asyncio.sleep(0.01)
+        try:
+            assert (await _load_pack(host, sample_pack, deploy))["ok"]
+            return await _send(
+                {"cmd": "fire", "package_id": "demo-group-oper-diagnosis", "trigger_id": "AW-001/T3"}, host
+            )
+        finally:
+            host._stop.set()
+            await asyncio.wait_for(task, timeout=10)
+
+    first = await _fire_once(sock_path)
+    second = await _fire_once(sock_path.parent / "restarted.sock")
+
+    assert first["ok"] and second["ok"]
+    assert first["episode_id"] == second["episode_id"] == "EP-0001"  # 展示号**复用**了——它不是身份
+    assert first["operation_id"] != second["operation_id"]  # 机器身份**不复用**——两发是两条剧集
+    assert first["operation_id"].startswith("EO-") and second["operation_id"].startswith("EO-")
+
+
+async def test_receipt_drops_only_the_missing_id_when_machine_identity_is_absent(
+    running_host, sample_pack, deploy, caplog
+):
+    """两个字段的对称性兜底（正常不可达的绊线）：`assemble()` 恒生成 `EO-<uuid4>`，故实际运行中两个
+    字段恒对称——有剧集两个都有，没剧集两个都没有。唯一可想象的不对称是「有展示号而无机器身份」，
+    只可能来自绕过 assemble 造出的 Episode（dataclass 默认空串），此路不经发射。真出现时**只丢缺席
+    的那个**（绝不给空串冒充身份）＋ 留 error 痕；episode_id 照带——剧集确实装配了，丢它反倒成了
+    SPEC A.7 纪律 2 说的假报。反向恒成立：有 operation_id 必有 episode_id。"""
+    host = running_host
+    await _load_pack(host, sample_pack, deploy)
+    loaded = host.registry.packages["demo-group-oper-diagnosis"]
+    aware = next(a for a in loaded.awares if a.aware_id == "AW-001")
+
+    episode = assemble("EP-0001", loaded, aware, "AW-001/T3")  # 真装配路径
+    assert episode.operation_id.startswith("EO-")  # 机器身份无条件生成，不可能缺
+    assert host._delivery_for(episode) == Delivery(episode_id="EP-0001", operation_id=episode.operation_id)
+    assert host._delivery_for(None) == Delivery()  # 没装配 → 两个都没有
+
+    episode.operation_id = ""
+    assert host._delivery_for(episode) == Delivery(episode_id="EP-0001")  # 只丢机器身份，展示号照带
+    assert "缺 operation_id" in caplog.text  # 不变量破了要看得见，不静默
 
 
 async def test_watcher_auto_fire_still_assembles_without_reading_return_value(running_host, sample_pack, deploy):

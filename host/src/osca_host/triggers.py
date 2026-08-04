@@ -35,17 +35,22 @@ Poller = Callable[[str, str], object]
 
 @dataclass(frozen=True)
 class Delivery:
-    """一次投递的回执（deliver 回调 → 触发表 → 人工发射响应）。M8-T3-a。
+    """一次投递的回执（deliver 回调 → 触发表 → 人工发射响应）。M8-T3-a / T3-b。
 
     - `reason`：**非空即未发布原因**（关停/跨代失效等）——与旧契约「非空字符串 = 未发布原因」
       逐字同义，人工 fire 据此如实报失败；None = 投递正常走完（**不等于装配了剧集**：闸门未唤醒、
       账本刷新失败、kill_switch 都是「正常走完但没剧集」）。
     - `episode_id`：**真装配出剧集**才有值，没装配就是 None。fail-closed：绝不用空串冒充 id，
       调用方据「有没有 id」分辨有无剧集，不据 ok。
+    - `operation_id`：同一条剧集的**跨重启唯一机器身份**（`EO-<uuid>`），与 `episode_id`
+      **同源同生同灭**——两者都取自「这一发真装配出的那个 Episode」。`EP-xxxx` 只是**进程内**
+      展示号（Host 重启从 EP-0001 重新计号、会复用），要绑定/轮询请以 `operation_id` 为主键。
+      同一条 fail-closed 纪律：没有就是 None，绝不给空串冒充身份。
     """
 
     reason: str | None = None
     episode_id: str | None = None
+    operation_id: str | None = None
 
 
 def as_delivery(result: object) -> Delivery:
@@ -163,9 +168,10 @@ class TriggerTable:
     async def fire_manual(self, package_id: str, trigger_id: str) -> Delivery:
         """人工发射（操作者通道）。仅 event 触发原语可人工发射；回 Delivery（reason 非空即失败）。
         投递等到裁决/装配完成才返回——fire 命令的响应语义保持确定（发射即可查台账），
-        这一发装配出的 episode_id 也随回执带出（M8-T3-a：调用方不必再反查台账猜自己的剧集）。
+        这一发装配出的 episode_id 与 operation_id 也随回执带出（M8-T3-a/T3-b：调用方不必再反查台账
+        猜自己的剧集，且拿得到跨重启唯一的机器身份）。
         投递回「未发布原因」（关停/跨代失效）时如实转错误——失效的人工 fire 不许假报成功（GPT 三审 P1），
-        且未发布时**丢弃任何 episode_id**：没装配就是没有（fail-closed）。"""
+        且未发布时**两个 id 一并丢弃**：没装配就是没有（fail-closed）。"""
         for watcher in self.watchers.values():
             for sub in watcher.subs:
                 if sub.package_id == package_id and sub.trigger_id == trigger_id:
@@ -182,7 +188,7 @@ class TriggerTable:
                     delivery = as_delivery(result)
                     if delivery.reason:
                         return Delivery(reason=f"发射未发布：{delivery.reason}")
-                    return Delivery(episode_id=delivery.episode_id)
+                    return Delivery(episode_id=delivery.episode_id, operation_id=delivery.operation_id)
         return Delivery(reason=f"触发原语未布防：{package_id} 的 {trigger_id}")
 
     async def _fire(self, watcher: Watcher) -> None:

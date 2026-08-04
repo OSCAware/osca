@@ -742,6 +742,8 @@ def test_resolve_input_units():
 # ── M8-T3-b：agent 步结构化产出（人话 draft 与结构化产物并存） ──────────
 
 SHAPED_ROW = {"工单标题": "压降差旅费", "目标单位": "甲厂", "处置动作": "限额审批", "经办人手机": "13812345678"}
+# 台账副本（M8-T4 ④）：steps[*].structured_output 存的是 policy.redact 后的副本——被写内容仍是上面的原文。
+SHAPED_ROW_REDACTED = {**SHAPED_ROW, "经办人手机": "***手机号已脱敏***"}
 ENVELOPE = json.dumps(
     {"说明": "甲厂差旅费超阈值，建议下发限额审批（J-0417）。", "数据": SHAPED_ROW}, ensure_ascii=False
 )
@@ -780,8 +782,8 @@ def test_structured_agent_step_feeds_pipeline_and_keeps_human_draft(episode, loa
 
     assert episode.status == "suspended_pending_approval"
     shaped = next(s for s in episode.steps if s["step"] == "整形")
-    # ① 结构化产物是 dict/list，不是文本
-    assert shaped["structured_output"] == SHAPED_ROW and isinstance(shaped["structured_output"], dict)
+    # ① 结构化产物是 dict/list，不是文本（台账里那份是脱敏副本——M8-T4 ④，形状与类型不变）
+    assert shaped["structured_output"] == SHAPED_ROW_REDACTED and isinstance(shaped["structured_output"], dict)
     # ② draft 并存：人话仍在 episode.draft（capture/frontdesk/控制台快照的消费口径不被夺走），且不是 JSON
     assert episode.draft == "甲厂差旅费超阈值，建议下发限额审批（J-0417）。"
     assert not episode.draft.lstrip().startswith("{") and episode.summary()["draft_ready"] is True
@@ -993,25 +995,45 @@ def test_illegal_structured_output_still_charges_tokens(episode, loaded, proxy, 
     assert any("tokens 记账" in a["reason"] for a in policy.audit)
 
 
-def test_structured_draft_is_redacted_but_write_content_is_not(episode, loaded, proxy, policy, tmp_path):
-    """脱敏边界：人话那部分仍过 policy.redact（进台账、给人看）；**结构化数据不脱**——它是被写内容，
-    脱敏改写它等于把真实待写值写坏（预约行里的联系电话就是合法字段）。与 B.4 同一纪律：
-    payload_digest 绑原文、payload_display 只脱显示。"""
+def test_structured_output_ledger_copy_is_redacted_but_write_content_is_not(episode, loaded, proxy, policy, tmp_path):
+    """脱敏边界（M8-T4 ④）：结构化产出**分两份走**，三条须同时成立——
+
+    ① 台账副本已脱：steps[*].structured_output 是 policy.redact 后的副本，与 connector 回执同权
+       （回执一进台账就脱；结构化产出此前是台账里唯一不脱的字段 = PII 绕过脱敏进台账的旁路）；
+    ② artifacts 原文未变：被写内容仍是原文——脱敏改写它等于把真实待写值写坏（预约行里的联系电话
+       本就是合法字段），下游写步吃到的是原文；
+    ③ digest 仍绑原文：附录 B.4 的既有对偶（digest 绑原文、display 只脱显示）一字不动。
+    三条中任一条被改掉，本测试即红：②③ 咬的是同一份原文（digest 由 params 现算），①咬台账那份。"""
     from osca_host.challenge import payload_digest
 
-    envelope = json.dumps(
-        {"说明": "经办人手机13812345678，请核。", "数据": {"目标单位": "甲厂", "经办人手机": "13812345678"}},
-        ensure_ascii=False,
-    )
+    raw_row = {"目标单位": "甲厂", "经办人手机": "13812345678"}
+    redacted_row = {"目标单位": "甲厂", "经办人手机": "***手机号已脱敏***"}
+    envelope = json.dumps({"说明": "经办人手机13812345678，请核。", "数据": raw_row}, ensure_ascii=False)
     _shape_then_write_pipeline(episode, proxy, policy)
-    run_episode(episode, loaded, proxy, policy, llm=_structured_llm(tmp_path, envelope))
+    llm = _structured_llm(tmp_path, envelope)
+    run_episode(episode, loaded, proxy, policy, llm=llm)
 
-    assert episode.draft == "经办人手机***手机号已脱敏***，请核。"  # 人话过脱敏
-    assert episode.steps[-1]["redacted"] == 1
+    shaped = next(s for s in episode.steps if s["step"] == "整形")
+    assert episode.draft == "经办人手机***手机号已脱敏***，请核。"  # 人话过脱敏（既有口径不变）
+    # ① 台账副本已脱（形状/类型不变，只是那一格成了标记）
+    assert shaped["structured_output"] == redacted_row
+    assert shaped["structured_output"]["经办人手机"] == "***手机号已脱敏***"
+    # redacted 计的是**进台账的两份**（人话草稿 + 结构化副本）合计命中数，与 connector 回执同口径
+    assert shaped["redacted"] == 2
+    # ②③ 被写内容仍是原文：digest 绑原文、且**不等于**脱敏副本的摘要（副本若流去当被写内容，此处即红）
     [ch] = policy.pending_challenges()
-    # 被写内容仍是原文（digest 绑原文）；只有显示那一份被脱
-    assert ch["payload_digest"] == payload_digest({"目标单位": "甲厂", "经办人手机": "13812345678"})
-    assert ch["payload_display"]["经办人手机"] == "***手机号已脱敏***"
+    assert ch["payload_digest"] == payload_digest(raw_row)
+    assert ch["payload_digest"] != payload_digest(redacted_row)
+    assert ch["payload_display"]["经办人手机"] == "***手机号已脱敏***"  # display 只脱显示
+
+    # ② 的端到端硬证据：批准后恢复，consume 按**当刻现算的 params 摘要**匹配——artifacts 若被脱敏改写过，
+    # 摘要对不上，写必回落成「未写」。写真落地 = artifacts 里那份自始至终是原文。
+    policy.decide_challenge(ch["challenge_id"], by_name="专家", by_role="approver", approve=True)
+    run_episode(episode, loaded, proxy, policy, llm=llm)
+    assert episode.status == "completed"
+    [landed] = _landed(_write_step(episode))
+    assert landed["payload"]["applied"]["目标单位"] == "甲厂"
+    assert not any(s.get("status") == "denied" for s in episode.steps)  # 没有回落成保守默认
 
 
 def test_structured_prompt_carries_envelope_and_a6_contract(episode):
@@ -1023,3 +1045,83 @@ def test_structured_prompt_carries_envelope_and_a6_contract(episode):
     assert "不得凭空造数" in user and "判断 ID 标注" in user
     # 文本步一字不变（既有契约）
     assert "只输出本步骤产出物的内容本身" in _step_user_prompt({"step": "成文"}, "成文", None, None)
+
+
+# ── M8-T4 ⑥：run_episode 的边界捕获（台账不留 running 僵尸） ──────────────
+
+
+class _Boom:
+    """可插拔注入的 LLM 通道在 complete 里炸——**非解析路径**的未预期异常。
+    带一句含敏感内文的报错，用来咬「异常内文不进台账」。"""
+
+    model = "mock"
+    SECRET = "postgres://osca:S3CR3T-TOKEN@10.0.0.9:5432/prod"
+
+    def __init__(self, exc_type):
+        self.exc_type = exc_type
+
+    def complete(self, system, user, tag=None, timeout=None):
+        raise self.exc_type(f"连不上写后端 {self.SECRET}")
+
+
+def _deeply_nested_objects(episode):
+    """把剧集上下文的 objects 塞成极深嵌套——render_system_prompt 的 yaml.safe_dump 会在这里
+    真炸 RecursionError（**不是** _parse_structured 那条解析路径，也没有 mock 任何东西）。
+    深度按当前递归上限取：yaml 每层吃约 3 帧，取上限层数必越界，不依赖 1000 这个具体数。"""
+    import sys
+
+    episode.context = copy.deepcopy(episode.context)
+    nested: object = []
+    for _ in range(sys.getrecursionlimit()):
+        nested = [nested]
+    episode.context["objects"] = {"OBJ-DEEP": nested}
+
+
+def test_recursion_error_outside_parsing_lands_failed_not_running_zombie(episode, loaded, proxy, policy, llm):
+    """⑥ 的主判据：从**非解析路径**冒出的 RecursionError（渲染一次性上下文时 yaml 炸栈）不再未捕获
+    冲出 run_episode。剧集须落 failed + 人话 stop_reason + finished_at，**绝不是 running**——
+    status 是所有下游的分派键，running 的语义是「还在跑，别碰它」，僵尸永远没人收、没人报。"""
+    _deeply_nested_objects(episode)
+
+    result = run_episode(episode, loaded, proxy, policy, llm=llm)  # 修前此处抛 RecursionError
+
+    assert result is episode
+    assert episode.status == "failed" and episode.status != "running"
+    assert episode.stop_reason and "RecursionError" in episode.stop_reason  # 人话说清是什么把它打断的
+    assert "内部错误" in episode.stop_reason and "running" in episode.stop_reason
+    assert episode.finished_at is not None  # 终态该有的都有，台账收得干净
+    assert episode.steps == [] and llm.calls == []  # 炸在第一步之前：一次外呼都没发起
+
+
+@pytest.mark.parametrize("exc_type", [RecursionError, AttributeError, RuntimeError, MemoryError])
+def test_boundary_records_type_but_never_leaks_exception_text(exc_type, episode, loaded, proxy, policy):
+    """捕获范围取 Exception（不只 RecursionError）：僵尸的危害与异常类型无关。
+    但「宽」不等于「吞」——台账写下**类型名**（AttributeError 一眼看得出是编程错误、不是业务失败），
+    终态是 failed 而非 completed/stopped。且**异常内文绝不进台账**：报错消息可能带连接串/令牌，
+    而台账要进控制台快照、日志与归档。"""
+    run_episode(episode, loaded, proxy, policy, llm=_Boom(exc_type))
+
+    assert episode.status == "failed"
+    assert exc_type.__name__ in episode.stop_reason
+    assert _Boom.SECRET not in episode.stop_reason and "S3CR3T-TOKEN" not in episode.stop_reason
+    # 整份台账（含逐步留痕）都不许带内文——步里也不许留一句「连不上写后端 postgres://…」
+    assert "S3CR3T-TOKEN" not in json.dumps(episode.dump(), ensure_ascii=False, default=str)
+
+
+def test_boundary_does_not_swallow_shutdown_signals(episode, loaded, proxy, policy):
+    """**不捕 BaseException**：KeyboardInterrupt/SystemExit 是关停信号、不是剧集失败。
+    吞掉它们会把 Ctrl-C 变成「剧集失败」、并挡住 P1 关停语义——关停必须能穿透执行器。"""
+    for signal_type in (KeyboardInterrupt, SystemExit):
+        with pytest.raises(signal_type):
+            run_episode(episode, loaded, proxy, policy, llm=_Boom(signal_type))
+
+
+def test_boundary_logs_full_traceback_to_host_log(episode, loaded, proxy, policy, caplog):
+    """内文不进台账 ≠ 内文消失：完整堆栈照打进 Host 日志（与 host.py 既有边界同一行为，
+    不是新增静默）——否则「宽捕获」就真成了吞掉编程错误。"""
+    with caplog.at_level("ERROR", logger="osca-host"):
+        run_episode(episode, loaded, proxy, policy, llm=_Boom(AttributeError))
+
+    [record] = [r for r in caplog.records if "执行器内部错误" in r.getMessage()]
+    assert record.exc_info is not None and record.exc_info[0] is AttributeError
+    assert episode.episode_id in record.getMessage()  # 按剧集号查得到

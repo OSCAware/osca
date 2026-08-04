@@ -522,25 +522,44 @@ class Host:
         return {"ok": True, "detail": detail}
 
     async def _fire(self, package_id: str, trigger_id: str) -> dict:
-        """人工发射。响应在旧形态（ok/detail）之上**增补** episode_id（M8-T3-a）——
-        加字段向后兼容（控制通道只校验请求 schema，响应原样 JSON 序列化；老客户端读不到即忽略）。
-        缺省语义是硬约定：**没装配出剧集就没有 episode_id 这个字段**，绝不给空串让调用方误当 id。
-        调用方（员工触发桥）据此直接绑定自己这一发的剧集，不必再按时间/触发器反查台账猜。"""
+        """人工发射。响应在旧形态（ok/detail）之上**增补** episode_id（M8-T3-a）与 operation_id
+        （M8-T3-b）——加字段向后兼容（控制通道只校验请求 schema，响应原样 JSON 序列化；老客户端
+        读不到即忽略）。缺省语义是硬约定：**没装配出剧集就没有这两个字段**，绝不给空串让调用方误当 id。
+        两个字段同源同生同灭（详见 _delivery_for）：`episode_id`（EP-xxxx）是**进程内**展示号，
+        `operation_id`（EO-<uuid>）才是跨重启唯一的机器身份——调用方绑定/轮询按后者，前者只作展示。"""
         delivery = await self.table.fire_manual(package_id, trigger_id)
         if delivery.reason:
             return {"ok": False, "detail": delivery.reason}
         if not delivery.episode_id:
             # 发射走完但没装配剧集：闸门未唤醒 / 账本刷新失败 / kill_switch 拒唤醒——detail 如实说没有，
-            # 不带 episode_id 字段（fail-closed，宁可没有也不给假 id）
+            # 两个 id 字段都不带（fail-closed，宁可没有也不给假 id）
             return {
                 "ok": True,
                 "detail": f"已人工发射 {trigger_id}，但本次未装配剧集（未唤醒或被拒——裁决见 Host 日志与 status.gates）",
             }
-        return {
-            "ok": True,
-            "episode_id": delivery.episode_id,
-            "detail": f"已人工发射 {trigger_id} → 剧集 {delivery.episode_id}（裁决见 Host 日志与 status.gates）",
-        }
+        response = {"ok": True, "episode_id": delivery.episode_id}
+        if delivery.operation_id:
+            response["operation_id"] = delivery.operation_id
+        # detail 只带展示号：人读控制台看 EP-xxxx，机器绑定读 operation_id 字段（长 uuid 不进人话）
+        response["detail"] = f"已人工发射 {trigger_id} → 剧集 {delivery.episode_id}（裁决见 Host 日志与 status.gates）"
+        return response
+
+    @staticmethod
+    def _delivery_for(episode: Episode | None) -> Delivery:
+        """把装配结果折成投递回执：两个身份**同源**（都取自这一发装配出的那个 Episode），故恒对称——
+        有剧集就两个都带，没剧集两个都没有。
+
+        唯一可想象的不对称是「有 episode_id 而无 operation_id」：assemble() 无条件生成
+        `EO-<uuid4>`，故只可能来自绕过 assemble 造出的 Episode（dataclass 默认空串），此路不经发射。
+        真出现时只丢缺席的那个（不给空串冒充机器身份）＋ 留 error 痕，**不丢 episode_id**——
+        剧集确实装配了，丢它反倒成了 SPEC A.7 纪律 2 说的假报。反向恒成立：有 operation_id 必有 episode_id。
+        """
+        if episode is None:
+            return Delivery()
+        if not episode.operation_id:
+            log.error(f"剧集 {episode.episode_id} 缺 operation_id（机器身份）——回执只带展示号，请查装配路径")
+            return Delivery(episode_id=episode.episode_id)
+        return Delivery(episode_id=episode.episode_id, operation_id=episode.operation_id)
 
     def _make_deliver(self, package_id: str, aware_id: str):
         # Aware 代际**固化于订阅闭包创建时**（复核 P1）：若在 deliver 开始执行时才读当前代际，
@@ -607,8 +626,9 @@ class Host:
                     return Delivery(reason=why)
                 log.info(f"[{package_id}/{aware_id}] {trigger_id} 命中 → {verdict}")
                 if woke:
-                    # 装配即拿号：这一发的 episode_id 顺回执带回发射方（装配失败/前提缺失回 None → 无字段）
-                    return Delivery(episode_id=self._assemble_episode(package_id, aware_id, trigger_id))
+                    # 装配即拿号：这一发的两个身份（展示号 + 机器身份）顺回执带回发射方
+                    # （装配失败/前提缺失回 None → 两个字段都无）
+                    return self._delivery_for(self._assemble_episode(package_id, aware_id, trigger_id))
                 return Delivery()
 
         return deliver
@@ -683,8 +703,11 @@ class Host:
             return False, f"{connector_id}.{interface}({params}) 返回为空"
         return True, f"求值通过（{connector_id}.{interface}({params}) 返回非空）"
 
-    def _assemble_episode(self, package_id: str, aware_id: str, trigger_id: str) -> str | None:
-        """装配并起跑一集；回这一集的 episode_id（三件套缺一即回 None——没装配就是没有）。"""
+    def _assemble_episode(self, package_id: str, aware_id: str, trigger_id: str) -> Episode | None:
+        """装配并起跑一集；回这一集（三件套缺一即回 None——没装配就是没有）。
+
+        回整条 Episode 而不只是号：这一发的两个身份（展示号 episode_id + 机器身份 operation_id）
+        都从同一个对象上取，回执结构上不可能只带半截、也不可能带成别的剧集的号。"""
         loaded = self.registry.packages.get(package_id)
         proxy = self.proxies.get(package_id)
         policy = self.policies.get(package_id)
@@ -706,7 +729,7 @@ class Host:
         task = asyncio.create_task(self._execute_episode(episode, loaded, proxy, policy))
         self._episode_tasks.add(task)
         task.add_done_callback(self._episode_tasks.discard)
-        return episode.episode_id
+        return episode
 
     async def _run_in_daemon_thread(self, fn, *args):
         """认知平面重活（run_episode/settle）跑在**守护线程**（P1 关停语义）：统一有界执行模型见

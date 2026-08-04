@@ -169,12 +169,34 @@ async def test_fire_manual_carries_episode_id_and_drops_it_when_unpublished():
     table.shutdown()
 
 
+async def test_fire_manual_carries_operation_id_alongside_episode_id():
+    """M8-T3-b 触发表侧契约：`operation_id` 与 `episode_id` **并列**原样带出（触发表只做管道，
+    不重编不补全）；未发布时**两个一起丢弃**——没发布就没有剧集，两个身份都不许漏出去。"""
+    table = TriggerTable()
+
+    async def with_both(trigger_id):
+        return Delivery(episode_id="EP-0007", operation_id="EO-deadbeef")
+
+    async def unpublished(trigger_id):
+        # 防御性：即便回调同时给了原因和两个 id，未发布也一律不许带 id 出去
+        return Delivery(reason="包已卸载/重载——跨代投递不发布", episode_id="EP-0009", operation_id="EO-cafe")
+
+    table.subscribe("event", {"source": "op"}, Subscription("p1", "AW-001", "AW-001/T3", with_both))
+    table.subscribe("event", {"source": "op2"}, Subscription("p2", "AW-001", "AW-001/T3", unpublished))
+
+    assert await table.fire_manual("p1", "AW-001/T3") == Delivery(episode_id="EP-0007", operation_id="EO-deadbeef")
+    denied = await table.fire_manual("p2", "AW-001/T3")
+    assert denied.episode_id is None and denied.operation_id is None
+    table.shutdown()
+
+
 async def test_as_delivery_keeps_the_legacy_string_contract():
     """旧契约兼容：非空字符串 = 未发布原因；None/空串 = 正常投递、无剧集号。"""
     assert as_delivery("包已卸载") == Delivery(reason="包已卸载")
     assert as_delivery(None) == Delivery()
     assert as_delivery("") == Delivery()  # 空串不是原因，也不是 id
     assert as_delivery(Delivery(episode_id="EP-0001")) == Delivery(episode_id="EP-0001")
+    assert as_delivery("包已卸载").operation_id is None  # 旧形态回值不会凭空长出机器身份
 
 
 async def test_watcher_auto_fire_ignores_delivery_return_value():

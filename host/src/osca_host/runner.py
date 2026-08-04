@@ -21,7 +21,7 @@ performer 分工（架构 §5，受限集——不可识别的 performer 直接�
 
 from __future__ import annotations
 
-import json
+import logging
 import math
 import time
 from dataclasses import asdict
@@ -41,10 +41,13 @@ from osca_cli.triggers import (
 
 from osca_host.connector import ConnectorProxy
 from osca_host.episode import Episode
+from osca_host.jsongate import MAX_JSON_DEPTH, JsonGateRejected, exceeds_depth, loads_guarded
 from osca_host.lifecycle import finish_episode_state
 from osca_host.loader import LoadedPackage
 from osca_host.policy import PolicyInterceptor, parse_quantity
 from osca_host.timeouts import supports_keyword_timeout
+
+log = logging.getLogger("osca-host")
 
 # ── agent 步结构化产出（M8-T3）的信封 ──────────────────────
 # 衔接声明的受限语法（`produces.as` 受限词表 STRUCTURED_AS、`input.ref`/`input.from` 取键口径）
@@ -59,19 +62,10 @@ DATA_KEY = "数据"
 # 结构化产出的体积上限：结构化产物会进恢复快照（持久化）、上审批卡（人读）、原样上 wire——无界即把
 # 无界体积灌进这三处。与 llm/openapi 执行器的响应体上限同一纪律（有界才敢解析）。
 MAX_STRUCTURED_CHARS = 100_000
-# 结构化产出的**嵌套深度**上限。取值不是随手挑的，是按**下游真正扛得住的层数**倒推的（实测，
-# CPython 3.12 / sys.getrecursionlimit()=1000，从 run_episode 顶层起算）：
-# - 下游 agent 步渲染输入 `_step_user_prompt` → `yaml.safe_dump`：**330 层 ok / 331 层 RecursionError**（最浅）；
-# - 写步的 `policy.redact`（审批卡 payload_display / 回执脱敏）：993 层 ok / 994 层 RecursionError；
-# - `dataclasses.asdict`（回执入档）≈496 层、`json.dumps`（payload_digest）≈9996 层。
-# 而 `json.loads` 自己能收到 **9996 层**——「解析放行、下游炸栈」的落差有 30 倍，炸出来的
-# RecursionError 还会**未捕获冲出 run_episode**，剧集停在 status=running（既非 failed 也无 stop_reason）。
-# 上限取 32 ≈ 最浅下游上限 330 的 1/10，留一个数量级余量，理由是那 330 **不是常量**：
-# ① 它随调用栈**已用**深度浮动——实测垫 200 帧后 329 层就炸（Host 真跑时剧集在事件循环 + 工作线程的
-#    深栈上，不是脚本顶层）；② 它随部署侧 sys.getrecursionlimit() 变；③ 下游消费者还会增加，
-# 每个消费者的「帧/层」比各不相同（yaml 3 帧、asdict 2 帧、redact 1 帧）。
-# 32 层对真实被写内容绰绰有余（一行待写数据的自然深度是 2–4 层）。
-MAX_STRUCTURED_DEPTH = 32
+# 结构化产出的**嵌套深度**上限 = 那把共用 JSON 闸的上限（osca_host.jsongate.MAX_JSON_DEPTH）。
+# 取值的实测依据（下游各消费者扛得住多少层、为什么两个进口同一个数）都在 jsongate 里——此处只做别名，
+# 不留第二个可漂移的数。
+MAX_STRUCTURED_DEPTH = MAX_JSON_DEPTH
 
 
 def _yaml(data) -> str:
@@ -152,73 +146,6 @@ def _resolve_input(spec: dict, artifacts: dict) -> tuple[str | None, object, str
     return key, value[picked], ""
 
 
-class _EnvelopeRejected(ValueError):
-    """信封解析期间的定点拒绝（JSON 规范外字面量 / 重复键）——带人话理由，与 JSONDecodeError 区分开。
-
-    继承 ValueError 是刻意的：即便调用方漏了本类的 except，也仍落进既有的 ValueError 分支 fail-closed
-    （只是报错人话退成笼统版），绝不会漏成放行。
-    """
-
-
-def _reject_constant(name: str):
-    """`json.loads` 的 parse_constant 闸：NaN / Infinity / -Infinity 一律拒。
-
-    这三个**不是 JSON**（RFC 8259 的数字文法里没有它们），Python 的 json 出于历史原因默认收。
-    收下去的后果实测过一整条：审批卡显示 `{'金额': nan}`（审批人对着 nan 拍板）、L2 挂起快照落盘成
-    `{"artifacts": {"金额": NaN}}`（一份非 Python 读者解不开的非法 JSON 文件）、executor 拼的 wire body
-    也是 `{"金额": NaN}` 直接发给写后端。故在**进门处**拒绝，不在下游一处处打补丁。
-    """
-    raise _EnvelopeRejected(f"含 JSON 规范外的字面量 {name}（RFC 8259 只有数字，没有 NaN/Infinity）")
-
-
-def _reject_nonfinite(text: str) -> float:
-    """`json.loads` 的 parse_float 闸：语法合法但**溢出成 ±inf** 的数值同拒（如 `1e999`）。
-
-    parse_constant 只管字面量，拦不住溢出——而 `1e999` 落进产物后 `json.dumps` 照样吐 `Infinity`，
-    落盘/上 wire 的后果与写 `Infinity` 字面量一字不差。同一条纪律，两个进口都得堵。
-    """
-    value = float(text)
-    if not math.isfinite(value):
-        raise _EnvelopeRejected(f"数值 {text} 溢出成非有限浮点数（{value}）——落盘/上 wire 时它就是非法 JSON")
-    return value
-
-
-def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
-    """`json.loads` 的 object_pairs_hook 闸：同一对象里出现重复键即拒。
-
-    默认行为是**静默取最后一个**：`{"说明":"A","说明":"B"}` 只剩 B，`{"金额":100,"金额":999999}`
-    只剩 999999——「取哪一份」是猜，猜错即写错内容，且台账里谁也看不出还有过第一份。
-
-    取舍：信封层与「数据」内层**共用这一把闸**（hook 天然作用于文档里的每一个 JSON 对象），不为两层
-    写两套判据。理由是两层的后果同一个——数据内层的重复键照样进被写内容、进审批卡、进 wire body；
-    真要分层区别对待，就得先回答「哪一层的猜是可接受的猜」，而这个问题没有可接受的答案。
-    """
-    seen: set[str] = set()
-    for key, _ in pairs:
-        if key in seen:
-            raise _EnvelopeRejected(f"同一 JSON 对象里出现重复键「{key}」——取哪一份都是猜，直接拒绝")
-        seen.add(key)
-    return dict(pairs)
-
-
-def _exceeds_depth(value: object, limit: int) -> bool:
-    """结构化数据的嵌套是否超过 limit 层。**迭代**实现（显式栈）——用递归量深度，量到一半自己先炸栈，
-    这道闸就成了它要防的那个 bug。"""
-    stack: list[tuple[object, int]] = [(value, 1)]
-    while stack:
-        node, depth = stack.pop()
-        if isinstance(node, dict):
-            children: object = node.values()
-        elif isinstance(node, (list, tuple)):
-            children = node
-        else:
-            continue
-        if depth > limit:
-            return True
-        stack.extend((child, depth + 1) for child in children)
-    return False
-
-
 def _parse_structured(raw: object) -> tuple[dict | None, str]:
     """结构化 agent 产出的**唯一**解析口径：一份 JSON 信封 `{说明: 人话, 数据: 对象/数组}`。
 
@@ -237,14 +164,11 @@ def _parse_structured(raw: object) -> tuple[dict | None, str]:
         )
         return None, detail
     try:
-        # 三把闸都挂在**解析这一次**上（不在下游一处处补）：规范外字面量、溢出成 ±inf 的数值、重复键。
-        envelope = json.loads(
-            raw,
-            parse_constant=_reject_constant,
-            parse_float=_reject_nonfinite,
-            object_pairs_hook=_no_duplicate_keys,
-        )
-    except _EnvelopeRejected as e:  # 定点拒绝：报错指名道姓（人看得懂才改得了提示词/包）
+        # 三把解析期闸（规范外字面量、溢出成 ±inf 的数值、重复键）走**共用**的那把闸
+        # （osca_host.jsongate，与执行器解析后端响应体同一份实现——两份实现迟早漂移）。
+        # 深度闸此处传 None、留到下面对「数据」那一格量：信封的两格是协议外壳，不该占数据的层数预算。
+        envelope = loads_guarded(raw, max_depth=None)
+    except JsonGateRejected as e:  # 定点拒绝：报错指名道姓（人看得懂才改得了提示词/包）
         return None, f"模型产出不是合法 JSON：{e}。结构化产出一律 fail-closed，不退回文本"
     except (ValueError, RecursionError) as e:  # JSONDecodeError 属 ValueError；深嵌套触 RecursionError
         return None, f"模型产出不是合法 JSON（{type(e).__name__}）——结构化产出一律 fail-closed，不退回文本"
@@ -264,9 +188,10 @@ def _parse_structured(raw: object) -> tuple[dict | None, str]:
     data = envelope[DATA_KEY]
     if not isinstance(data, (dict, list)):
         return None, f"信封的「{DATA_KEY}」是 {type(data).__name__}，不是对象/数组——下游写步的 body 须是结构化数据"
-    if _exceeds_depth(data, MAX_STRUCTURED_DEPTH):
+    if exceeds_depth(data, MAX_STRUCTURED_DEPTH):
         # 解析器自己能收近万层，下游最浅 330 层就炸栈（见 MAX_STRUCTURED_DEPTH 注释的实测）——
-        # 「解析放行、下游炸栈」的落差必须在这里合上，否则 RecursionError 会未捕获冲出 run_episode。
+        # 「解析放行、下游炸栈」的落差在这里合上：合不上时剧集只能落到 run_episode 的边界上收成
+        # 「内部错误」，报错笼统、且已烧掉下游那次外呼；在此定点拒绝才说得清是哪一步、哪条纪律。
         detail = (
             f"信封的「{DATA_KEY}」嵌套超过 {MAX_STRUCTURED_DEPTH} 层——拒绝解析"
             "（结构化产物要过脱敏、进恢复快照、渲染给下游步骤，深嵌套会在下游炸栈；"
@@ -409,14 +334,17 @@ def _fallback_marker(ref: str, reason: str) -> dict:
     return {"interface": ref, "written": False, "fallback": True, "reason": reason}
 
 
-def run_episode(
+def _run_pipeline(
     episode: Episode,
     loaded: LoadedPackage,
     proxy: ConnectorProxy,
     policy: PolicyInterceptor,
     llm=None,
 ) -> Episode:
-    """沿 pipeline 执行剧集。llm 未注入时按环境变量解析（osca_cli.llm）。"""
+    """沿 pipeline 执行剧集（主体）。llm 未注入时按环境变量解析（osca_cli.llm）。
+
+    对外入口是 run_episode——未预期异常在那道边界上收束成终态，本函数不自己兜底。
+    """
     episode.status = "running"
     started = time.monotonic()
     if episode.budget is not None and not isinstance(episode.budget, dict):
@@ -661,10 +589,16 @@ def run_episode(
                     _record(episode, step_name, performer, "failed", error, tokens=tokens)
                     policy.charge_tokens(episode.episode_id, tokens)  # 外呼已发生：解析失败照记成本，不白嫖额度
                     return _finish(episode, "failed", error)
-                # 人话草稿照旧过脱敏（进台账、给人看）；**结构化数据不脱**——它是待写内容，显示脱敏不得改写
-                # 被写内容（与 payload_digest 绑原文、payload_display 只脱显示同一纪律，附录 B.4），且它整形自
-                # 已在 connector 回执处脱过敏的上游产物。
+                # 人话草稿照旧过脱敏（进台账、给人看）。**结构化数据一份原文、一份台账副本**（M8-T4 ④）：
+                # - artifacts 里放**原文**：它是被写内容，脱敏改写它 = 把待写值写坏（预约行里的联系电话
+                #   本就是合法字段），且写审批门的 payload_digest 绑的正是这份原文——附录 B.4 的既有对偶
+                #   （digest 绑原文、display 只脱显示）在此原样延续，L2 挂起快照的持久口径同样不动。
+                # - 台账/持久面（steps[*].structured_output）放**脱敏副本**，与 connector 回执同权：
+                #   回执一进台账就脱（connector.py），结构化产出此前是台账里唯一不脱的字段，等于给 PII
+                #   开了一条绕过脱敏进台账的旁路（台账会进控制台快照、进日志、进归档）。
+                # redact 对 dict/list/tuple 逐层重建新容器，副本与原文不共享容器——脱副本不会回改被写内容。
                 text, redacted = policy.redact(parsed["draft"])
+                ledger_data, data_hits = policy.redact(parsed["data"])
                 artifacts[produces_key] = parsed["data"]
                 episode.draft = text  # 并存：人话草稿仍是 draft，结构化数据另存 artifacts 给下游吃
                 _record(
@@ -674,13 +608,15 @@ def run_episode(
                     "done",
                     f"LLM 结构化产出：人话草稿 {len(text)} 字 + 「{DATA_KEY}」{type(parsed['data']).__name__}",
                     output=text,
-                    structured_output=parsed["data"],
+                    structured_output=ledger_data,
                     produced=produces_key,
                     produced_as=structured,
                     # 可溯源（机器可查）：这份结构化数据整形自哪个上游产物、收窄到哪一格
                     derived_from={"input": input_key, "from": step_input_from(spec)},
                     tokens=tokens,
-                    redacted=redacted,
+                    # 本步进台账的**两份**（人话草稿 + 结构化副本）合计命中数，与 connector 回执的
+                    # redacted（回执脱敏命中数）同口径：都是「进台账前实际替换了多少处」。
+                    redacted=redacted + data_hits,
                 )
             else:
                 text, redacted = policy.redact(reply.text)  # 产出注入剧集台账前脱敏
@@ -717,3 +653,44 @@ def run_episode(
     if max_minutes is not None and time.monotonic() - started > max_minutes * 60:
         return _finish(episode, "stopped", f"预算硬顶：max_minutes {max_minutes} 用满（末步超时，剧集停）")
     return _finish(episode, "completed")
+
+
+# ── 执行器边界：未预期异常收束成终态（M8-T4 ⑥） ───────────────────────
+# 台账里的 status 是所有下游的分派键（对账、控制台、恢复调度、淘汰都按它走），而 `running` 的语义是
+# 「还在跑，别碰它」。未预期异常冲出执行器时剧集就永远停在 running：既非 failed 也无 stop_reason，
+# 没人收、没人报；若它在恢复路径上，已批准的写还会静默永不兑现——台账里一具活死人。
+#
+# 捕获范围取 **Exception**（含 RecursionError/MemoryError），不只捕 RecursionError：僵尸的危害与
+# 异常是什么类型无关，只补上一次撞见的那一种，等于承诺下一种意外照样留僵尸。
+# 「太宽会吞掉本该炸的编程错误」由三件事抵掉——宽不等于吞：
+# ① 完整堆栈照打进 Host 日志（log.exception），与 host.py 既有边界同一行为，不是新增静默；
+# ② 台账写下异常**类型名**——AttributeError/KeyError 一眼看得出是编程错误、不是业务失败；
+# ③ 终态是 failed 而非 completed/stopped：失败仍是失败，不混进对账、不落 outcome case。
+# **不捕 BaseException**：KeyboardInterrupt/SystemExit/GeneratorExit 是关停信号、不是剧集失败，
+# 吞掉它们会把 Ctrl-C 变成「剧集失败」并挡住 P1 关停语义——关停必须能穿透执行器。
+# 异常**内文不进台账**（公仓既有纪律）：报错消息里可能带连接串/密钥/令牌（binding endpoint、驱动
+# 异常回显的 DSN），而台账要进控制台快照、日志与归档；只留类型名，内文与堆栈留在 Host 日志。
+_BOUNDARY_REASON = (
+    "剧集执行器内部错误：{kind}（未预期异常打断了执行——剧集就地按 failed 收束，"
+    "不在台账里留 running 僵尸）；异常内文与堆栈只进 Host 日志、不进台账"
+    "（报错消息可能带连接串/密钥），排查请按剧集号查日志"
+)
+
+
+def run_episode(
+    episode: Episode,
+    loaded: LoadedPackage,
+    proxy: ConnectorProxy,
+    policy: PolicyInterceptor,
+    llm=None,
+) -> Episode:
+    """沿 pipeline 执行剧集（llm 未注入时按环境变量解析，osca_cli.llm）。
+
+    本函数是执行器的**边界**：主体在 _run_pipeline，未预期异常在此收束成终态 failed +
+    人话 stop_reason（取舍与纪律见上方 _BOUNDARY_REASON 的注释）。
+    """
+    try:
+        return _run_pipeline(episode, loaded, proxy, policy, llm)
+    except Exception as e:
+        log.exception(f"剧集 {episode.episode_id} 执行器内部错误：{type(e).__name__}")
+        return _finish(episode, "failed", _BOUNDARY_REASON.format(kind=type(e).__name__))

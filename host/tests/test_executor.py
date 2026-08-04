@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from osca_host.executor import OpenapiExecutor, SqlReadonlyExecutor, _split_endpoint
+from osca_host.jsongate import MAX_JSON_DEPTH  # 深度上限的真理源（与 runner 共用同一把闸）
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "oper-diagnosis.osca"  # 用真实样例 impl SQL
 
@@ -786,3 +787,165 @@ def test_openapi_fail_closed_when_socket_unavailable_under_deadline(monkeypatch)
         pack_root=Path("."),
     )
     assert err is None  # 未声明 deadline:兼容路径不要求私有布局
+
+
+# ── 后端响应体过 JSON 闸（M8-T4 ⑤）─────────────────────────────
+# 响应体是**第二个进口**：模型产出那个进口已在 M8-T3 堵上，而**读回执是下游写 body 的原料**，
+# 同一批漏网口（NaN/±inf/重复键/深嵌套）从这个进口进来，落点一字不差（进台账、上审批卡、进 L2
+# 挂起快照、原样上 wire）。这些形状 `json.dumps` 造不出来，故 fake 后端要能**逐字**回一份响应体；
+# 且一律走**真 HTTP**（真实 _OPENER.open 打真 socket），不是把 json.loads 抽出来单测——
+# 同构纪律：假替身的调用路径必须与真组件同构。
+
+
+@pytest.fixture
+def raw_addr():
+    """fake 后端：原样回一份指定的响应体（Content-Length 如实声明，避开截断闸）。回 (addr, 设置器)。"""
+
+    class _RawHandler(http.server.BaseHTTPRequestHandler):
+        body = b"{}"
+
+        def _reply(self):
+            payload = type(self).body
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):  # noqa: N802 —— BaseHTTPRequestHandler 命名约定
+            self._reply()
+
+        def do_POST(self):  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self._reply()
+
+        def log_message(self, *args):  # 静音测试输出
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _RawHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"127.0.0.1:{srv.server_address[1]}", _RawHandler
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _read_body(raw_addr, body: bytes, *, is_write=False):
+    """让 fake 后端回 body，跑真实执行器取回来（读走 GET，写走 POST）。"""
+    addr, handler = raw_addr
+    handler.body = body
+    itf = {"method": "POST" if is_write else "GET", "path": "/x"}
+    return _run_http(addr, itf, {"n": 1} if is_write else {}, is_write=is_write)
+
+
+def _nested_body(depth: int) -> bytes:
+    return ("[" * depth + "]" * depth).encode("utf-8")
+
+
+ILLEGAL_BODIES = {
+    # ── 漏网口 ①：JSON 规范外的字面量（RFC 8259 无 NaN/Infinity，Python json 默认收） ──
+    "NaN 字面量": (b'{"rows": [{"\xe9\x87\x91\xe9\xa2\x9d": NaN}]}', "NaN"),
+    "Infinity 字面量": (b'{"\xe4\xb8\x8a\xe9\x99\x90": Infinity}', "Infinity"),
+    "负 Infinity 字面量": (b'{"\xe4\xb8\x8b\xe9\x99\x90": -Infinity}', "-Infinity"),
+    # 同一条纪律的另一条进口：合法 JSON 数字**溢出**成 ±inf（parse_constant 拦不住）
+    "浮点溢出成 inf": (b'{"rows": [{"\xe9\x87\x91\xe9\xa2\x9d": 1e999}]}', "1e999"),
+    "浮点溢出成 -inf": (b'{"rows": [{"\xe9\x87\x91\xe9\xa2\x9d": -1e999}]}', "-1e999"),
+    # ── 漏网口 ②：重复键（json.loads 默认静默取最后一个——「取哪一份」是猜，猜错即写错内容） ──
+    "顶层重复键": (b'{"rows": [1], "rows": [2]}', "rows"),
+    "行内重复键": (b'{"rows": [{"amount": 100, "amount": 999999}]}', "amount"),
+    # ── 漏网口 ③：深嵌套（解析放行近万层，下游最浅 330 层即炸栈） ──
+    "深嵌套-越上限一层": (_nested_body(33), "嵌套"),
+    "深嵌套-下游炸栈档": (_nested_body(331), "嵌套"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(ILLEGAL_BODIES))
+def test_openapi_response_body_fails_closed_at_json_gate(name, raw_addr):
+    """后端响应体的三类漏网口一律 fail-closed，且报错**指名道姓**（人看得懂才查得动后端）。
+
+    失败语义照既有分支走：`(None, error)` → connector 转 `Receipt(ok=False)` → runner 收
+    「取数失败 → 剧集 failed」。**没有半解析、没有退回文本、没有「拿 None 当空回执」**——
+    退回文本/空回执等于把「写步 body ＝ 一行真正要写的数据」悄悄退化回一坨来路不明的东西。"""
+    body, keyword = ILLEGAL_BODIES[name]
+    payload, err = _read_body(raw_addr, body)
+    assert payload is None, name
+    assert "JSON 闸" in err and keyword in err, (name, err)
+    assert "HTTP 200" in err  # 后端答的是 200：拒的是**内容**，不是状态码
+
+
+def test_openapi_response_body_depth_boundary(raw_addr):
+    """深度上限与模型产出**同一个数**（jsongate.MAX_JSON_DEPTH）——因为下游是同一批消费者：
+    脱敏、入台账、渲染给下游步骤、落 L2 快照、上 wire。上限层放行、上限 + 1 层拒绝。"""
+    payload, err = _read_body(raw_addr, _nested_body(MAX_JSON_DEPTH))
+    assert err is None and payload == json.loads(_nested_body(MAX_JSON_DEPTH))  # 恰好上限：放行
+
+    payload, err = _read_body(raw_addr, _nested_body(MAX_JSON_DEPTH + 1))
+    assert payload is None and "嵌套" in err and str(MAX_JSON_DEPTH) in err
+
+
+def test_openapi_response_body_deep_enough_to_blow_parser_is_caught(raw_addr):
+    """深到把**解析器自己**炸栈的那一档：RecursionError 不是 ValueError——漏捕即炸穿 execute。
+    这里要的是「恒回 (None, error)、绝不抛」，报错退成笼统版可以接受（那一档已无从定点）。"""
+    payload, err = _read_body(raw_addr, _nested_body(20_000))
+    assert payload is None and err  # 不抛、不炸穿；fail-closed
+
+
+def test_openapi_legal_response_bodies_still_pass(raw_addr):
+    """闸只咬非法形状：正常行数组、浮点/整数/科学计数、深度自然的嵌套照旧放行（别把闸修成误伤真回执）。"""
+    body = '{"rows": [{"单位": "甲厂", "金额": 45, "涨幅": 0.3, "占比": 1e30, "备注": null}], "total": 1}'
+    payload, err = _read_body(raw_addr, body.encode("utf-8"))
+    assert err is None and payload == json.loads(body)
+
+
+def test_openapi_accepted_response_body_is_always_legal_json(raw_addr):
+    """放行的回执**必是合法 JSON**——它是下游写 body 的原料，还要落 L2 快照、上审批卡。
+    `allow_nan=False` 就是 RFC 8259 的口径：这条断言是三处下游的共同前置（闸买到的正是它）。"""
+    payload, err = _read_body(raw_addr, b'{"rows": [{"amount": 1.5, "ratio": 1e30}]}')
+    assert err is None
+    json.dumps(payload, allow_nan=False)  # 不抛即合法
+
+
+def test_openapi_write_response_body_also_gated(raw_addr):
+    """写回执同一把闸：写已经落地了，拒的是「把这份回执当结果用」——宁可剧集 failed 上报由人接手，
+    也不把解不清的回执喂给下游/台账（回执本身也要进台账给人看）。"""
+    payload, err = _read_body(raw_addr, b'{"ticket": "WO-1", "ticket": "WO-2"}', is_write=True)
+    assert payload is None and "JSON 闸" in err and "ticket" in err
+
+
+def test_openapi_json_gate_generic_branch_carries_no_body_content(http_addr):
+    """语法错（非本闸的定点拒绝）走原分支、报错**原文不变**，且不带响应体内文/异常内文。"""
+    payload, err = _run_http(http_addr, {"method": "GET", "path": "/notjson"}, {})
+    assert payload is None and err.endswith("响应非 JSON（HTTP 200）")
+    assert "not json at all" not in err
+
+
+def test_openapi_json_gate_reason_is_scrubbed_of_secret_at_connector(raw_addr):
+    """定点报错的理由取自**响应体内容**（重复的那个键名），故反射型 API 回显 token 时理由里可能带 secret。
+    这条纪律的兜底在 connector 层（回执与 error 同抹 `_scrub_secret`）——此处验组合成立：
+    抹后 secret 不见了、键名这条诊断线索还在（不是把整条理由砍掉）。"""
+    from osca_host.connector import _scrub_secret
+
+    addr, handler = raw_addr
+    handler.body = b'{"TKN-abc": 1, "TKN-abc": 2}'  # 反射型后端把 Bearer 值回显成键、还重复了
+    payload, err = _run_http(addr, {"method": "GET", "path": "/x"}, {}, secret="TKN-abc")
+    assert payload is None and "TKN-abc" in err  # 执行器这层确实带出来了
+
+    scrubbed = _scrub_secret(err, "TKN-abc")
+    assert "TKN-abc" not in scrubbed and "重复键" in scrubbed
+
+
+def test_json_gate_is_one_implementation_not_two():
+    """**闸只有一份实现**——两份迟早漂移，而漂移那天松的那个就是没堵的洞。
+    这条测试是那句话的机器判据：两个进口引用的必须是**同一个函数对象**，且执行器里不许再有第二处
+    `json.loads(` 调用（复制一份的那天，这条先红）。"""
+    from osca_host import executor as ex_mod
+    from osca_host import jsongate
+    from osca_host import runner as runner_mod
+
+    assert ex_mod.loads_guarded is jsongate.loads_guarded is runner_mod.loads_guarded
+    assert runner_mod.exceeds_depth is jsongate.exceeds_depth
+    assert runner_mod.MAX_STRUCTURED_DEPTH == jsongate.MAX_JSON_DEPTH  # 深度上限单一真理源，不是两个旋钮
+
+    src = Path(ex_mod.__file__).read_text(encoding="utf-8")
+    assert "json.loads(" not in src  # 解析后端响应体只经共用闸；json 在本模块只剩 dumps（拼写 body）

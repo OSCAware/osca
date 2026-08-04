@@ -30,6 +30,8 @@ from urllib.parse import unquote, urlencode
 
 from osca_cli.package import resolve_in_root
 
+from osca_host.jsongate import MAX_JSON_DEPTH, JsonGateRejected, loads_guarded
+
 _MAX_BODY = 16 << 20  # openapi 响应体读上限 16 MiB——巨响应体不触发 OOM（DoS 面 + 守 call() 恒回 Receipt）
 
 
@@ -345,8 +347,19 @@ class OpenapiExecutor:
         if not raw:
             return None, None
         try:
-            return json.loads(raw), None
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            # 后端响应体过**同一把 JSON 闸**（osca_host.jsongate，与 runner 解析模型产出共用一份实现）：
+            # NaN/Infinity、溢出成 ±inf 的数值、重复键、深嵌套——从这个进口进来的，落点与从模型那个进口
+            # 进来的一字不差（**读回执是下游写 body 的原料**，还要进台账、上审批卡、进 L2 挂起快照）。
+            # 同一类漏网口不留第二个进口；闸只有一份实现，复制一份即是给漂移开门。
+            return loads_guarded(raw, max_depth=MAX_JSON_DEPTH), None
+        except JsonGateRejected as e:
+            # 定点拒绝：说清是哪把闸拦的（人看得懂才查得动后端）。理由取自**响应体内容**（重复的那个键名、
+            # 溢出的那个数值），不是驱动异常的内文——「不带异常内文」防的是连接串/凭据从异常消息漏进回执，
+            # 而反射型 API 把 token 回显进响应体的情形另有 connector 层 `_scrub_secret` 兜底（回执与 error 同抹）。
+            return None, f"openapi {method} 响应体过不了 JSON 闸（HTTP {status}）：{e}"
+        except (ValueError, RecursionError):
+            # JSONDecodeError / UnicodeDecodeError 都是 ValueError；深到把解析器自己炸栈时是 RecursionError
+            # ——它**不是** ValueError，漏掉即炸穿 execute（退到 connector 的兜底 except，报错退成笼统版）。
             return None, f"openapi {method} 响应非 JSON（HTTP {status}）"
 
 

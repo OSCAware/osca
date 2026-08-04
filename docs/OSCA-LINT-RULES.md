@@ -89,6 +89,7 @@
 
 ## 变更记录
 
+- **v0.4（M8-T4）**（2026-08-04）：**无新增规则，仍 27 条**——本批四项（结构化产出台账副本脱敏 / 执行器边界不留 running 僵尸 / 后端响应体与模型产出共用同一把 JSON 闸 / `fire` 并列回 `operation_id`）的判据全部落在**运行时数据**上（模型产出、后端响应体、异常、控制通道响应），包里没有对应的静态形状可咬，硬造一条只会是空规则。「同一把 JSON 闸就得是同一份实现」改由 host 测试守（`test_json_gate_is_one_implementation_not_two`：两个进口引用同一函数对象、深度上限同值，且执行器里不许再出现第二处 `json.loads(`——复制一份的那天这条先红）。
 - **v0.4（M8-T3）**（2026-08-03）：新增 OSCA042（结构化产出声明 `produces.as`：受限词表 / 只限 agent 步 / 必须有 input）与 OSCA043（`input.from` 只能取上游 connector 步真实取到的那一格），共 27 条规则；两条的取键与词表解析与 Host runner 共用 `osca_cli.triggers`（lint 过 ＝ Host 跑得动）。
 - **v0.4（M6-W7）**（2026-07-19）：新增 OSCA025——写连接器（allowed_with_approval）每个写接口 ref 必须在 policy.approvals 声明 approver（SPEC §6/B.4，否则写路径运行时静默死），共 25 条规则。
 - **v0.4（M6-W2）**（2026-07-18）：新增 OSCA061——osca.yaml 包级分层默认段校验（SPEC v0.4 §1/§9，与 OSCA060 共用枚举/形状/洁净室判据），共 24 条规则。

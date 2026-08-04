@@ -21,9 +21,9 @@ approver 命令面（W3：绑定挑战 + challenges/approve/deny，**闭环限�
 | 1. Loader + Linter | ✅ 复用 cli 装载核心（完整性 / lint / binding 比对 / 索引重建）+ 运行时结构解析 |
 | 2. 触发表 | ✅ 定时器 / 轮询器编译布防，哈希去重共享（引用计数；watch 按包隔离）；轮询经 Connector 代理取数，emit_when 真比对（SPEC v0.4 §4），首轮基线、无 emit_when 按状态变化发射；event 由控制通道人工发射 |
 | 3. 闸门 gate | ✅ combine（any/all/sequence）+ debounce + enabled + **precondition 真求值**（经代理取数，返回空/取数失败即拦截并复述 on_fail；不可求值保守放行留痕）。编译期矛盾检查在 lint（OSCA041）与装载时共用 `osca_cli.triggers` |
-| 4. 剧集装配器 + 执行器 | ✅ 唤醒 → 一次性上下文（AGENT.md + structure + discretion + 引用 objects + 判断 top3–7 各带代表 case）进剧集台账；检索 = 签名表硬过滤 + trust/confirmed 排序（语义排序归 M3 索引器）；policy.yaml 刻意不入上下文（公理 A5）。装配后即交剧集执行器（认知平面，独立线程）沿 pipeline 出草稿：performer 受限集 connector / agent / optimizer（初版贪心）/ human（飞轮采集点，机器到此为止）/ runtime（移交对账器）——SPEC v0.4 §5。步骤衔接（M8-T3）：agent 步可声明 `produces.as: json` 出**结构化产出**（人话 draft 与结构化数据**并存**，须可溯源上游产物，解析失败一律 fail-closed 不退回文本；**「合法 JSON」按 RFC 8259 判、不按 Python `json` 的默认宽容度**——`NaN`/`Infinity`/`-Infinity` 字面量与溢出成 ±inf 的数值（`1e999`）、同一对象里的重复键（默认静默取最后一个＝猜）、超 `MAX_STRUCTURED_DEPTH`（32）层的嵌套，三口一律在**解析这一次**上拒；深度上限按下游倒推——实测最浅的下游消费者 330 层即 `RecursionError`，取其 1/10 留一个数量级余量）；下游步骤可用 `input.from` 把上游 `{接口ref: 回执}` 字典收窄到**那一格**（不写即取整份，既有包一字不变）——lint OSCA042/043 同判据静态咬 |
+| 4. 剧集装配器 + 执行器 | ✅ 唤醒 → 一次性上下文（AGENT.md + structure + discretion + 引用 objects + 判断 top3–7 各带代表 case）进剧集台账；检索 = 签名表硬过滤 + trust/confirmed 排序（语义排序归 M3 索引器）；policy.yaml 刻意不入上下文（公理 A5）。装配后即交剧集执行器（认知平面，独立线程）沿 pipeline 出草稿：performer 受限集 connector / agent / optimizer（初版贪心）/ human（飞轮采集点，机器到此为止）/ runtime（移交对账器）——SPEC v0.4 §5。步骤衔接（M8-T3）：agent 步可声明 `produces.as: json` 出**结构化产出**（人话 draft 与结构化数据**并存**，须可溯源上游产物，解析失败一律 fail-closed 不退回文本；**「合法 JSON」按 RFC 8259 判、不按 Python `json` 的默认宽容度**——`NaN`/`Infinity`/`-Infinity` 字面量与溢出成 ±inf 的数值（`1e999`）、同一对象里的重复键（默认静默取最后一个＝猜）、超 `MAX_STRUCTURED_DEPTH`（32）层的嵌套，三口一律在**解析这一次**上拒；深度上限按下游倒推——实测最浅的下游消费者 330 层即 `RecursionError`，取其 1/10 留一个数量级余量；这把闸提在 `osca_host.jsongate`，**与执行器解析后端响应体共用同一份实现**，M8-T4）；下游步骤可用 `input.from` 把上游 `{接口ref: 回执}` 字典收窄到**那一格**（不写即取整份，既有包一字不变）——lint OSCA042/043 同判据静态咬。**结构化产出的脱敏是「一份原文、一份台账副本」**（M8-T4）：交下游写步的产物是原文（`payload_digest` 绑它、挂起快照存它），进剧集台账的那一份过 `policy.redact`——与连接器回执同权，台账里不留绕过脱敏的字段。**执行器边界**（M8-T4）：未预期异常一律在 `run_episode` 边界收束成 `failed` ＋ 人话停因，台账不留 `running` 僵尸；堆栈进 Host 日志、台账只记异常**类型名**（内文可能带连接串/密钥），关停信号（`KeyboardInterrupt`/`SystemExit`）照旧穿透 |
 | 5. Policy 拦截器 | ✅ 按步骤工具白名单（默认拒绝）、审批门（M4-W3 绑定挑战：pending → 批/驳 → 一次性 consume；**闭环限定见「M4-W3 审批挑战」节**）、预算硬顶（per-episode tool_calls + **tokens 止损顶**，`200k` 数量记法）、egress 默认全禁、数据脱敏（身份证号/手机号，agent 产出同样过脱敏）、kill switch（公理 A10，两种可求值形式：现役账本 overruled/confirmed 比率；回放红灯率 > X%）。两种条件均为 Tripped / Clear / Unavailable 三态：ratio 的 0/0 = Unavailable、overruled>0 且 confirmed=0 = Tripped；回放档案 `indexes/replay-health.json` 需通过完整 schema 校验并绑定当前 `ledger_tree`。阈值采用整数精确比较；Unavailable 保留既有 Kill 状态，不清除 Tripped，也不把既有 Clear 新触发为停机；首次装载或重启没有既有状态时保持未触发并告警。LLM、Tool、预算与审批授权均在统一授权锁内复核——全程审计留痕 |
-| 6. Connector 代理 | ✅ manifest 契约校验（接口漂移当场爆炸）、binding/secret 解析（binding 永不进包，缺失即报错）、调用回执 + 注入前脱敏；执行器按 endpoint scheme 分派——内置 mock 执行器（`mock://` 固件）+ **真实参考执行器**（sql_readonly/openapi，W6-3，测 fake 后端）；生产驱动（生产库/生产网关）由部署侧按 `Executor` 协议注入 |
+| 6. Connector 代理 | ✅ manifest 契约校验（接口漂移当场爆炸）、binding/secret 解析（binding 永不进包，缺失即报错）、调用回执 + 注入前脱敏；执行器按 endpoint scheme 分派——内置 mock 执行器（`mock://` 固件）+ **真实参考执行器**（sql_readonly/openapi，W6-3，测 fake 后端）；生产驱动（生产库/生产网关）由部署侧按 `Executor` 协议注入。HTTP 执行器解析后端**响应体**时过**与模型产出同一把 JSON 闸**（`osca_host.jsongate`，同一份实现、同一个深度上限 32，M8-T4）——读回执是下游写步 body 的原料，还要进台账、上审批卡、进挂起快照、原样上 wire；过不了闸 ＝ 取数失败 ＝ 剧集失败（与「非 2xx」「响应截断」同一条路），不半解析、不把原文当字符串回执、不回空回执 |
 | 7. 对账器 settle | ✅ 剧集完成后对 objective 型对象自动对账（受限形式 `settle: {uses: CON-xxx.接口名}`，SPEC v0.4 §6）：decision vs reality 落 `kind: outcome` 的 case（编号顺延、交蒸馏队列），不消耗剧集；自由文本 settle 保守不执行留痕。「闭店后」定时对账需部署侧营业日历，参考实现在剧集完成后立即对账 |
 
 已可演示：Host 起停、包装载 / 注销、定时布防（status 可见 next_fire）、人工发射 event、
@@ -187,13 +187,15 @@ deployment 可并行；发布段才进入短锁并复核 lifecycle/generation/to
 `STARTING → RUNNING → DRAINING → STOPPED` 保证 stop/unload 胜过迟到 load，同时
 慢 load 期间 status 仍可快速返回。
 
-`fire` 的响应在 `{ok, detail}` 之上带一个**可选** `episode_id`（M8-T3-a，契约见
-SPEC 附录 A.7）：**当且仅当这一发真的装配出剧集时才有这个字段**，值即台账里的那一条。
-闸门未唤醒 / 账本刷新失败 / kill switch 拒唤醒时 `ok=true` 但**不带**字段（detail 如实
-写明「未装配剧集」）；未布防 / 跨代失效 / Aware 停用 / Host 关停仍是 `ok=false` + 拒因。
-调用方（员工触发桥等 `requester` 身份）据此直接绑定自己这一发的剧集——按时间窗反查台账
-只作兜底，命中多条即放弃绑定并报错，不许猜。注意 `EP-xxxx` 是**进程内**短编号（重启从
-`EP-0001` 重新计号），跨重启唯一的机器身份是剧集的 `operation_id`。
+`fire` 的响应在 `{ok, detail}` 之上带两个**可选**字段 `episode_id` 与 `operation_id`
+（M8-T3-a/T3-b，契约见 SPEC 附录 A.7）：**当且仅当这一发真的装配出剧集时才有这两个字段**，
+值即台账里的那一条（`episodes` 摘要同名字段查得到）。两者**同源同生同灭**——都取自这一发
+装配出的那条剧集，要么都有、要么都没有。闸门未唤醒 / 账本刷新失败 / kill switch 拒唤醒时
+`ok=true` 但**两个字段都不带**（detail 如实写明「未装配剧集」）；未布防 / 跨代失效 / Aware
+停用 / Host 关停仍是 `ok=false` + 拒因。调用方（员工触发桥等 `requester` 身份）据此直接绑定
+自己这一发的剧集——按时间窗反查台账只作兜底，命中多条即放弃绑定并报错，不许猜。
+**绑定与轮询按 `operation_id`**：`EP-xxxx` 是**进程内**短展示编号（重启从 `EP-0001` 重新计号，
+同一个号在重启前后是两条不同剧集），`operation_id`（`EO-<uuid>`）才是跨重启唯一的机器身份。
 
 ## LLM 通道（剧集的 agent 步）
 
