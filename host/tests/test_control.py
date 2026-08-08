@@ -2045,3 +2045,70 @@ async def test_watcher_auto_fire_still_assembles_without_reading_return_value(ru
     assert [ep.fired_trigger for ep in host.episodes.values()] == ["AW-001/T3"]
     assert host.gates[(pid, "AW-001")].wakes == 1
     assert watcher.fires == 1 and host.table.watchers  # watcher 存活
+
+
+async def test_autoload_deployments_come_back_after_restart(sock_path, sample_pack, tmp_path):
+    """M8-T6：清单里 autoload 的部署，Host 一起来就装回去——重启不再让包全掉。
+
+    这是 ECS 上真发作过的那笔债：部署脚本重启三服务 → 注册表清空 → 没人补 load →
+    桥连喊 5 天「包未注册」。期望态写在清单里，Host 自己认。
+    """
+    import yaml as _yaml
+
+    manifest = tmp_path / "deployments.yaml"
+    manifest.write_text(
+        _yaml.safe_dump(
+            {
+                "auto": {"path": str(sample_pack), "bindings": _stub_bindings(sample_pack), "autoload": True},
+                "manual": {"path": str(sample_pack), "bindings": _stub_bindings(sample_pack)},  # 不标即不自动装
+            }
+        ),
+        encoding="utf-8",
+    )
+    host = Host(sock_path, deployments=None, deployments_path=manifest)
+    task = asyncio.create_task(host.run())
+    for _ in range(200):
+        if host.control.socket_path.exists() and host.registry.packages:
+            break
+        await asyncio.sleep(0.01)
+    try:
+        # autoload 那条自己装好了；没标的那条没装（清单是「可装载目录」，不是「全都装上」）
+        response = await _send({"cmd": "status"}, host)
+        assert [p["package_id"] for p in response["packages"]] == ["demo-group-oper-diagnosis"]
+
+        # 用真 deployment_id 装的：unload 认得出它，reload 也走同一条 generation
+        response = await _send({"cmd": "unload", "package_id": "demo-group-oper-diagnosis"}, host)
+        assert response["ok"]
+        response = await _send({"cmd": "load", "deployment_id": "auto"}, host)
+        assert response["ok"]  # 装回来仍是同一个部署 ID，不是「谁也管不着的孤儿」
+    finally:
+        host._stop.set()
+        await asyncio.wait_for(task, timeout=5)
+
+
+async def test_autoload_failure_does_not_block_the_others(sock_path, sample_pack, tmp_path):
+    """一条装不上不拦别人：坏包只记 error，Host 照常起来、好包照常装上。"""
+    import yaml as _yaml
+
+    manifest = tmp_path / "deployments.yaml"
+    manifest.write_text(
+        _yaml.safe_dump(
+            {
+                "broken": {"path": str(tmp_path / "nonexistent.osca"), "autoload": True},
+                "good": {"path": str(sample_pack), "bindings": _stub_bindings(sample_pack), "autoload": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    host = Host(sock_path, deployments=None, deployments_path=manifest)
+    task = asyncio.create_task(host.run())
+    for _ in range(200):
+        if host.control.socket_path.exists() and host.registry.packages:
+            break
+        await asyncio.sleep(0.01)
+    try:
+        response = await _send({"cmd": "status"}, host)
+        assert [p["package_id"] for p in response["packages"]] == ["demo-group-oper-diagnosis"]
+    finally:
+        host._stop.set()
+        await asyncio.wait_for(task, timeout=5)

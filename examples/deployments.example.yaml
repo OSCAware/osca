@@ -3,5 +3,6 @@
 # 相对路径按本清单文件所在目录解析（不随 Host 进程 cwd 漂移）。
 demo:
   path: oper-diagnosis.osca
+  autoload: true                            # 期望态：Host 启动时自动装载它（≈ systemd enable）
   # bindings: /etc/osca/bindings.yaml       # 部署环境注入的 binding 表（永不进包）
   # dest: /var/lib/osca/packs/demo          # zip 交付态的解压目录

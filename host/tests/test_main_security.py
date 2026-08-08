@@ -98,3 +98,19 @@ def test_client_rejects_lax_principal_token_file_before_connecting(tmp_path, mon
     monkeypatch.setattr("osca_host.main.send_command", forbidden_connect)
     assert _client({"cmd": "status"}, tmp_path / "missing.sock", token_file) == 1
     assert not called
+
+
+def test_autoload_only_accepts_a_real_bool(tmp_path):
+    """autoload 只收真 bool：`"true"`/`yes`/`1` 这类近似写法一律拒——看着像真的字符串
+    被静默当真，正是这条线上反复吃亏的那类猜。"""
+    import yaml
+
+    for bad in ("true", "yes", 1, None):
+        path = tmp_path / "d.yaml"
+        path.write_text(yaml.safe_dump({"d": {"path": "p.osca", "autoload": bad}}), encoding="utf-8")
+        with pytest.raises(ValueError, match="autoload"):
+            _load_deployments(str(path))
+
+    path = tmp_path / "ok.yaml"
+    path.write_text(yaml.safe_dump({"d": {"path": "p.osca", "autoload": True}}), encoding="utf-8")
+    assert _load_deployments(str(path))["d"]["autoload"] is True

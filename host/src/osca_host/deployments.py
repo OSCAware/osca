@@ -25,8 +25,11 @@ def load_deployments(path: str) -> dict[str, dict]:
     deployments: dict[str, dict] = {}
     for did, spec in data.items():
         did = clean_text(did, f"部署 ID {did!r}", max_len=200)
-        if not isinstance(spec, dict) or "path" not in spec or set(spec) - {"path", "bindings", "dest", "egress_extra"}:
-            raise ValueError(f"部署 {did} 须是 {{path[, bindings, dest, egress_extra]}}（path 必填，不收其他键）")
+        allowed = {"path", "bindings", "dest", "egress_extra", "autoload"}
+        if not isinstance(spec, dict) or "path" not in spec or set(spec) - allowed:
+            raise ValueError(
+                f"部署 {did} 须是 {{path[, bindings, dest, egress_extra, autoload]}}（path 必填，不收其他键）"
+            )
         clean: dict = {}
         for key in ("path", "bindings", "dest"):
             if key not in spec:
@@ -42,5 +45,13 @@ def load_deployments(path: str) -> dict[str, dict]:
             if not isinstance(raw, list) or any(not isinstance(h, str) or not h.strip() for h in raw):
                 raise ValueError(f"部署 {did} 的 egress_extra 须是非空字符串列表（egress 允许的 host）")
             clean["egress_extra"] = [h.strip() for h in raw]
+        # autoload（M8-T6）：**这一条声明的是期望态**——「这台机器上这个部署应当是装着的」，
+        # Host 启动时自动装载它。只收真 bool：YAML 里 `"true"`/`yes`/`1` 这类近似值一律拒，
+        # 因为「看着像 true 的字符串」被静默当真是这条线上反复吃过亏的那类猜（宁拒不猜）。
+        if "autoload" in spec:
+            raw = spec["autoload"]
+            if not isinstance(raw, bool):
+                raise ValueError(f"部署 {did} 的 autoload 须是布尔值 true/false（不接受字符串或数字的近似写法）")
+            clean["autoload"] = raw
         deployments[did] = clean
     return deployments

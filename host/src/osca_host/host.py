@@ -247,6 +247,48 @@ class Host:
             )
         self._stop.set()
 
+    async def _autoload_deployments(self) -> int:
+        """启动装载**期望态**：清单里 `autoload: true` 的部署，Host 一起来就把它们装回去（M8-T6）。
+
+        为什么需要它：注册表是内存态，**进程一重启，装着的包就全没了**——而重启是日常
+        （部署脚本重启服务、机器重启、崩溃拉起）。在这条之前，每次重启后都得有人手工补
+        `load`，没人补就是「服务活着、包一个没有」的空跑，且只有翻日志才看得见。
+
+        与 systemd 同构的语义分层（写清楚，免得下一个人把两件事混成一件）：
+        - `autoload: true` ≈ `enable`——**期望态**，声明「这台机器上它应当装着」；
+        - 控制通道 `unload` ≈ `stop`——**运行期动作**，临时停一个包；下次启动它还会回来。
+          要永久移除，改清单（`autoload: false` 或删掉这一条），不要指望 unload 记住。
+
+        一个装不上不拦别人：逐条独立，失败只记 error 并计数（返回值进退出码），
+        **不阻塞 Host 起来**——一个坏包让整机起不来，比那个包装不上糟得多。
+        """
+        # 先读一次盘：期望态以**磁盘上此刻的清单**为准（进程可能停了很久，其间清单改过）。
+        # 重读失败不是拒绝启动的理由——沿用手上这份继续（启动期的 fail-safe 与 load 命令的
+        # fail-closed 是两件事：那条挡的是「拿旧配置办新事」，这条只是把已经在册的装回去）。
+        if (reload_error := await self._refresh_deployments()) is not None:
+            log.warning(f"启动装载前重读清单失败，按手上这份继续：{reload_error}")
+        pending = [(did, spec) for did, spec in self.deployments.items() if spec.get("autoload")]
+        if not pending:
+            return 0
+        log.info(f"启动装载：清单里有 {len(pending)} 条 autoload 部署")
+        failed = 0
+        for did, spec in pending:
+            try:
+                # 用**真 deployment_id** 而非合成 id：装上之后 unload/reload/generation 全按它认人，
+                # 与管理员经控制通道装的那份一模一样（合成 id 会让重启后的包变成「谁也管不着」的孤儿）
+                response = await self._request_load(did, spec)
+            except RegistryError as e:
+                response = {"ok": False, "detail": [str(e)]}
+            if response.get("ok"):
+                continue
+            failed += 1
+            detail = response.get("detail", "")
+            for line in detail if isinstance(detail, list) else [str(detail)]:
+                log.error(line)
+            log.error(f"启动装载失败（autoload）：{did}——该部署本次未装载，其余不受影响")
+        log.info(f"启动装载完成：{len(pending) - failed}/{len(pending)} 条成功")
+        return failed
+
     async def _refresh_deployments(self) -> str | None:
         """load 前热重读部署清单（M8-T2）：新发布的部署条目免重启即可装载。
         清单来源仍是 Host 侧文件、服务端解析——控制通道只收 deployment_id，
@@ -1179,6 +1221,8 @@ class Host:
                     for line in detail if isinstance(detail, list) else [str(detail)]:
                         log.error(line)
                     log.error(f"启动装载失败：{pack['path']}")
+
+            failed += await self._autoload_deployments()
 
             await self._stop.wait()
             return 1 if failed else 0
